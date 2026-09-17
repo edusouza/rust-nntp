@@ -1,19 +1,15 @@
 # Issue backlog
 
-The GitHub issue tracker for this repository is not writable from the environment this
-code was developed in (`403 Resource not accessible by integration`), so the backlog is
-kept here, in version control, rather than being lost.
+The GitHub issue tracker is the source of truth:
+<https://github.com/edusouza/rust-nntp/issues>.
 
-Each file is a ready-to-file issue: the front matter carries the title and labels, the body
-is the issue body. When the tracker becomes available they can be filed verbatim.
+This directory existed briefly because the tracker was not writable from the environment
+the project was started in, and a backlog that lives only in someone's head is worse than
+one in an awkward place. The two issues drafted here were filed as
+[#3](https://github.com/edusouza/rust-nntp/issues/3) (roadmap) and
+[#4](https://github.com/edusouza/rust-nntp/issues/4) (validation against a real server);
+their drafts remain in the git history.
 
-| File | Title | Labels |
-| --- | --- | --- |
-| [0001](0001-roadmap.md) | Roadmap: RFC 3977 news reader (v0.1.0 → v0.3.0) | `epic` |
-
-Conventions:
-
-- **Open** means the file exists and its front matter says `status: open`.
-- **Closed** means the front matter says `status: closed` with a one-line resolution and,
-  where relevant, the commit that closed it. Files are not deleted — a closed issue is a
-  record of a decision.
+Keep new issues in the tracker. If it is ever unreachable again, drop a file here with
+front matter for `title`, `labels` and `status`, and file it later — do not let the item
+go unrecorded.

@@ -3,8 +3,8 @@
 What `rust-nntp` implements, per RFC. This file is part of the definition of done for any
 change to command coverage: if you add a command, add its row.
 
-Legend: ✅ implemented · 🟡 parsed but not surfaced in the UI · ⬜ not implemented ·
-🚫 out of scope for a reader client
+Legend: ✅ implemented end to end · 🟡 grammar implemented in `nntp-proto`, not yet driven by
+the client or surfaced in the UI · ⬜ not implemented · 🚫 out of scope for a reader client
 
 ## RFC 3977 — Network News Transfer Protocol
 
@@ -12,21 +12,21 @@ Legend: ✅ implemented · 🟡 parsed but not surfaced in the UI · ⬜ not imp
 
 | Command | Status | Notes |
 | --- | --- | --- |
-| `CAPABILITIES` | ⬜ | |
-| `MODE READER` | ⬜ | Sent when the greeting or capabilities indicate a transit server. |
-| `QUIT` | ⬜ | |
+| `CAPABILITIES` | 🟡 | Grammar and query API in `nntp-proto`; not yet issued by a client. |
+| `MODE READER` | 🟡 | Encoded; sent when capabilities advertise `MODE-READER` without `READER`. |
+| `QUIT` | 🟡 | Encoded. |
 
 ### Article posting and retrieval (§6)
 
 | Command | Status | Notes |
 | --- | --- | --- |
-| `GROUP` | ⬜ | |
-| `LISTGROUP` | ⬜ | |
-| `LAST` / `NEXT` | ⬜ | |
-| `ARTICLE` | ⬜ | |
-| `HEAD` | ⬜ | |
-| `BODY` | ⬜ | |
-| `STAT` | ⬜ | |
+| `GROUP` | 🟡 | Encoded; `211` response parsed, including the `low > high` spelling of an empty group. |
+| `LISTGROUP` | 🟡 | Encoded, including the `group range` form. |
+| `LAST` / `NEXT` | 🟡 | Encoded. |
+| `ARTICLE` | 🟡 | Encoded; response split into headers and body. |
+| `HEAD` | 🟡 | Encoded; response parsed as a headers-only article. |
+| `BODY` | 🟡 | Encoded. |
+| `STAT` | 🟡 | Encoded. |
 | `POST` | 🚫 v0.1 | Planned for v0.2. |
 | `IHAVE` | 🚫 | Transit command, not used by readers. |
 
@@ -34,25 +34,25 @@ Legend: ✅ implemented · 🟡 parsed but not surfaced in the UI · ⬜ not imp
 
 | Command | Status | Notes |
 | --- | --- | --- |
-| `DATE` | ⬜ | |
-| `HELP` | ⬜ | |
-| `NEWGROUPS` | ⬜ | |
+| `DATE` | 🟡 | Encoded; `111 yyyymmddhhmmss` parsed. |
+| `HELP` | 🟡 | Encoded. |
+| `NEWGROUPS` | 🟡 | Encoded with a four-digit year in GMT. |
 | `NEWNEWS` | ⬜ | Optional and frequently disabled by servers. |
-| `LIST ACTIVE` | ⬜ | |
-| `LIST ACTIVE.TIMES` | ⬜ | |
-| `LIST NEWSGROUPS` | ⬜ | Group descriptions. |
-| `LIST OVERVIEW.FMT` | ⬜ | Required to interpret `OVER` fields beyond the first seven. |
-| `LIST HEADERS` | ⬜ | |
+| `LIST ACTIVE` | 🟡 | Encoded; lines parsed (note: `high` precedes `low`, unlike `GROUP`). |
+| `LIST ACTIVE.TIMES` | 🟡 | Encoded; creation time and creator parsed. |
+| `LIST NEWSGROUPS` | 🟡 | Encoded; tab- and space-separated descriptions both accepted. |
+| `LIST OVERVIEW.FMT` | 🟡 | Encoded and parsed, including `:full` fields and a leading `:number`. |
+| `LIST HEADERS` | 🟡 | Encoded. |
 | `LIST DISTRIB.PATS` | 🚫 | Posting-only. |
-| `OVER` | ⬜ | |
-| `HDR` | ⬜ | |
+| `OVER` | 🟡 | Encoded (range, message-id and current forms); records parsed. |
+| `HDR` | 🟡 | Encoded. |
 
 ## RFC 2980 — Common NNTP extensions (pre-RFC-3977)
 
 | Command | Status | Notes |
 | --- | --- | --- |
-| `XOVER` | ⬜ | Fallback when `OVER` is not advertised. Still the only option on some servers. |
-| `XHDR` | ⬜ | Fallback for `HDR`. |
+| `XOVER` | 🟡 | Encoded; same record parser as `OVER`. Fallback when `OVER` is not advertised. |
+| `XHDR` | 🟡 | Encoded. |
 | `XPAT` | ⬜ | Server-side search; useful but rarely enabled. |
 | `AUTHINFO SIMPLE` | 🚫 | Obsolete and insecure. |
 | `XGTITLE`, `XINDEX`, `XTHREAD` | 🚫 | Server-specific. |
@@ -62,13 +62,13 @@ Legend: ✅ implemented · 🟡 parsed but not surfaced in the UI · ⬜ not imp
 | Feature | Status | Notes |
 | --- | --- | --- |
 | Implicit TLS (port 563) | ⬜ | |
-| `STARTTLS` on port 119 | ⬜ | Refused after authentication, per §2.2. |
+| `STARTTLS` on port 119 | 🟡 | Command encoded; the TLS upgrade itself is milestone M4. |
 
 ## RFC 4643 — Authentication
 
 | Command | Status | Notes |
 | --- | --- | --- |
-| `AUTHINFO USER` / `PASS` | ⬜ | Refused on a plaintext link unless explicitly allowed. |
+| `AUTHINFO USER` / `PASS` | 🟡 | Encoded, with the password redacted from logs. Refusal on a plaintext link is milestone M4. |
 | `AUTHINFO SASL` | ⬜ | Needed by a minority of commercial providers. |
 
 ## RFC 8054 — Compression
@@ -81,10 +81,10 @@ Legend: ✅ implemented · 🟡 parsed but not surfaced in the UI · ⬜ not imp
 
 | Feature | Status | Notes |
 | --- | --- | --- |
-| RFC 5322 header folding/unfolding | ⬜ | |
-| RFC 5322 `Date` parsing | ⬜ | Plus the malformed forms seen in practice. |
-| RFC 2047 encoded words in headers | ⬜ | `=?UTF-8?Q?...?=`; required for readable subjects. |
+| RFC 5322 header folding/unfolding | ✅ | Unfolded per §2.2.3; unparseable lines collected rather than dropped. |
+| RFC 5322 `Date` parsing | ✅ | Plus the obsolete forms of §4.3 and the malformed ones seen in practice. |
+| RFC 2047 encoded words in headers | ✅ | `B` and `Q`, adjacent-word whitespace elision, split across folds. |
 | MIME multipart bodies | ⬜ | v0.2. |
-| `quoted-printable` / `base64` body decoding | ⬜ | v0.2. |
-| Non-UTF-8 body charsets | ⬜ | Via `encoding_rs`. |
+| `quoted-printable` / `base64` body decoding | ✅ | Brought forward from v0.2: unreadable bodies were too common without it. |
+| Non-UTF-8 body charsets | ✅ | Declared charsets via `encoding_rs`; unlabelled 8-bit falls back to Windows-1252. |
 | yEnc / uuencode attachments | 🚫 v0.1 | Binary groups are out of scope for the first release. |
