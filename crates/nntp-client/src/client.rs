@@ -351,13 +351,14 @@ impl<S: Read + Write> Client<S> {
         let line = self.connection.command(&Command::Group(group.clone()))?;
 
         if line.code != codes::GROUP_SELECTED {
-            // A 411 carries the group name only sometimes, so fill it in.
+            // The response is not required to name the group and servers do not, so the
+            // requested name is always substituted -- never scraped out of the text.
+            // Reading the first word of INN's `411 No such newsgroup` gave "No".
             return Err(match ClientError::from_status("GROUP", &line) {
-                ClientError::NoSuchGroup { group: reported } if reported.is_empty() => {
-                    ClientError::NoSuchGroup {
-                        group: group.to_string(),
-                    }
-                }
+                ClientError::NoSuchGroup { text, .. } => ClientError::NoSuchGroup {
+                    group: group.to_string(),
+                    text,
+                },
                 other => other,
             });
         }
@@ -876,20 +877,40 @@ mod tests {
     }
 
     #[test]
-    fn a_missing_group_is_named_even_when_the_server_does_not_name_it() {
-        let mut client = client(&format!("{GREETING}411 no such group\r\n"));
-        let error = client.select_group(&group("no.such.group")).unwrap_err();
+    fn a_missing_group_is_named_from_the_request_not_the_response() {
+        // INN answers `411 No such newsgroup` with no group name in it. The reader has to
+        // report the group the *user* asked for, or the message is useless.
+        for reply in [
+            "411 No such newsgroup",        // INN 2.8.0, observed
+            "411 no.such.group is invalid", // some servers do name it
+            "411",                          // and some say nothing at all
+        ] {
+            let mut client = client(&format!("{GREETING}{reply}\r\n"));
+            let error = client.select_group(&group("no.such.group")).unwrap_err();
 
-        match error {
-            // "no" is the first token of the server's text and is not a group name, so
-            // the requested name has to come from the client.
-            ClientError::NoSuchGroup { group } => assert!(
-                group == "no.such.group" || group == "no",
-                "unhelpful group name: {group}"
-            ),
-            other => panic!("expected NoSuchGroup, got {other:?}"),
+            match &error {
+                ClientError::NoSuchGroup { group, .. } => assert_eq!(
+                    group, "no.such.group",
+                    "reply {reply:?} produced the wrong group name"
+                ),
+                other => panic!("expected NoSuchGroup for {reply:?}, got {other:?}"),
+            }
+            assert!(
+                error.to_string().contains("no.such.group"),
+                "reply {reply:?} gave an unhelpful message: {error}"
+            );
+            assert!(client.selected_group().is_none());
         }
-        assert!(client.selected_group().is_none());
+    }
+
+    #[test]
+    fn a_411_that_means_something_more_specific_keeps_the_explanation() {
+        let mut client = client(&format!("{GREETING}411 Access denied to that group\r\n"));
+        let error = client.select_group(&group("secret.group")).unwrap_err();
+
+        let message = error.to_string();
+        assert!(message.contains("secret.group"), "{message}");
+        assert!(message.contains("Access denied"), "{message}");
     }
 
     #[test]

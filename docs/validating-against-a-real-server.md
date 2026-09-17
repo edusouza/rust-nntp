@@ -47,7 +47,7 @@ $env:NNTP_PASSWORD = [Runtime.InteropServices.Marshal]::PtrToStringBSTR(
   --host news.eternal-september.org --tls `
   --username YOUR_USERNAME `
   --password-env NNTP_PASSWORD `
-  --group comp.lang.rust
+  --group misc.test
 ```
 
 On PowerShell 7 the first two lines can be the shorter
@@ -67,7 +67,7 @@ read -rs -p 'password: ' NNTP_PASSWORD; export NNTP_PASSWORD; echo
   --host news.eternal-september.org --tls \
   --username YOUR_USERNAME \
   --password-env NNTP_PASSWORD \
-  --group comp.lang.rust
+  --group misc.test
 ```
 
 `read -rs` keeps it off the terminal and out of the shell history.
@@ -96,7 +96,7 @@ tests read the password from `NNTP_TEST_PASS` directly, so again no shell touche
 $env:NNTP_TEST_HOST     = 'news.eternal-september.org'
 $env:NNTP_TEST_SECURITY = 'tls'            # or 'starttls'
 $env:NNTP_TEST_USER     = 'YOUR_USERNAME'
-$env:NNTP_TEST_GROUP    = 'comp.lang.rust'
+$env:NNTP_TEST_GROUP    = 'misc.test'
 $env:NNTP_TEST_SAMPLE   = '50'
 
 $secure = Read-Host 'password' -AsSecureString
@@ -116,7 +116,7 @@ writes UTF-16 by default, which is why `Tee-Object` is the better choice here.
 export NNTP_TEST_HOST=news.eternal-september.org
 export NNTP_TEST_SECURITY=tls          # or starttls
 export NNTP_TEST_USER=YOUR_USERNAME
-export NNTP_TEST_GROUP=comp.lang.rust
+export NNTP_TEST_GROUP=misc.test
 export NNTP_TEST_SAMPLE=50
 read -rs -p 'password: ' NNTP_TEST_PASS; export NNTP_TEST_PASS; echo
 
@@ -170,6 +170,11 @@ colours; the old `conhost` console will look rough.
 Worth trying deliberately: a group with a hundred thousand articles (`comp.lang.c`), an
 article with an attachment, a thread with a missing parent, a non-Latin hierarchy
 (`fido7.*`, `japan.*`) to exercise charset handling.
+
+**Pick a group the server actually carries.** `misc.test` exists nearly everywhere and is
+the default. `comp.lang.rust` does *not* exist — Rust discussion never moved to Usenet — so
+using it makes every article test fail with `no such newsgroup`. If you get that, the
+failure message lists groups the server does carry, and `nntp-tui groups` lists them all.
 
 ## Step 4 — what to do with a failure
 

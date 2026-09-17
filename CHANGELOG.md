@@ -25,6 +25,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   offline. Eight tests, the most valuable being that every line of a real `LIST ACTIVE`
   parses and that `XOVER` agrees with `OVER` record for record.
 
+### Fixed
+
+- A `411` reply no longer has the group name read out of it. RFC 3977 §6.1.1 does not
+  require the response to name the group and INN does not: it answers
+  `411 No such newsgroup`, so taking the first word produced
+  `NoSuchGroup { group: "No" }`. The requested name is now always substituted — the caller
+  is the only reliable source — and the server's own text is kept alongside it, because a
+  `411` sometimes means "access denied" rather than "no such group".
+
+  Found on the first run against a real server (INN 2.8.0 at `news.eternal-september.org`).
+  The fake server had been emitting `411 <group> is not a valid newsgroup`, which begins
+  with the group name and so *confirmed* the client's assumption instead of exposing it —
+  precisely the shared-misunderstanding failure that
+  [ADR-0004](docs/adr/0004-fake-server-for-tests.md) predicted. It now uses INN's wording,
+  and a test asserts it carries no group name.
+
 ### Changed
 
 - Password resolution takes its environment lookup and its shell as parameters, so the

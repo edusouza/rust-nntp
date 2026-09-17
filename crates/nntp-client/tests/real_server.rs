@@ -184,6 +184,69 @@ fn group_name(settings: &Settings) -> GroupName {
         .unwrap_or_else(|error| panic!("NNTP_TEST_GROUP={:?}: {error}", settings.group))
 }
 
+/// Selects the configured group, failing with something actionable if the server does not
+/// carry it.
+///
+/// The first run of these tests used `comp.lang.rust`, which Eternal September does not
+/// carry, and four tests failed with `NoSuchGroup`. That is a fixture problem rather than a
+/// finding, and the failure should say so and name groups that *do* exist rather than
+/// leaving the reader to guess.
+fn select_group(client: &mut Client<Transport>, settings: &Settings) -> nntp_proto::GroupSummary {
+    let group = group_name(settings);
+
+    match client.select_group(&group) {
+        Ok(summary) => {
+            eprintln!(
+                "{}: ~{} articles, numbers {}..{}",
+                summary.name, summary.estimated_count, summary.low, summary.high
+            );
+            summary
+        }
+        Err(nntp_client::ClientError::NoSuchGroup { .. }) => {
+            let suggestions = suggest_groups(client)
+                .iter()
+                .map(|line| format!("  {line}"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            panic!(
+                "this server does not carry {:?}.\n\
+                 Set NNTP_TEST_GROUP to a group it does carry. Some with articles:\n{suggestions}\n\
+                 `nntp-tui groups` lists them all.",
+                settings.group
+            );
+        }
+        Err(error) => panic!("GROUP {}: {error}", settings.group),
+    }
+}
+
+/// A few groups the server carries that have enough articles to test with.
+fn suggest_groups(client: &mut Client<Transport>) -> Vec<String> {
+    // Narrow wildmats rather than the whole active file: this runs inside a failure path,
+    // and a multi-megabyte LIST would make a bad error message slow as well.
+    for pattern in ["comp.lang.*", "misc.*", "news.*", "*"] {
+        let Ok(wildmat) = nntp_proto::Wildmat::parse(pattern) else {
+            continue;
+        };
+        let Ok(result) = client.list_groups(Some(&wildmat)) else {
+            continue;
+        };
+
+        let found: Vec<String> = result
+            .entries
+            .iter()
+            .filter(|entry| entry.estimated_count() >= 20)
+            .take(8)
+            .map(|entry| format!("{} ({} articles)", entry.name, entry.estimated_count()))
+            .collect();
+
+        if !found.is_empty() {
+            return found;
+        }
+    }
+
+    vec!["(could not list any; the LIST command failed too)".to_owned()]
+}
+
 #[test]
 #[ignore = "needs a real news server; see the module documentation"]
 fn the_server_clock_parses_and_is_close_to_ours() {
@@ -317,9 +380,7 @@ fn the_overview_format_starts_with_the_seven_required_fields() {
 #[ignore = "needs a real news server; see the module documentation"]
 fn overview_records_for_real_articles_parse_completely() {
     let (settings, mut client) = connect();
-    let group = group_name(&settings);
-
-    let summary = client.select_group(&group).expect("GROUP");
+    let summary = select_group(&mut client, &settings);
     eprintln!(
         "{}: ~{} articles, numbers {}..{}",
         summary.name, summary.estimated_count, summary.low, summary.high
@@ -428,7 +489,7 @@ fn xover_agrees_with_over() {
     }
 
     let group = group_name(&settings);
-    let summary = client.select_group(&group).expect("GROUP");
+    let summary = select_group(&mut client, &settings);
     let Some((low, high)) = summary.range() else {
         panic!("{} is empty", settings.group);
     };
@@ -510,9 +571,7 @@ fn xover_agrees_with_over() {
 #[ignore = "needs a real news server; see the module documentation"]
 fn real_articles_parse_and_head_agrees_with_article() {
     let (settings, mut client) = connect();
-    let group = group_name(&settings);
-
-    let summary = client.select_group(&group).expect("GROUP");
+    let summary = select_group(&mut client, &settings);
     let Some((low, high)) = summary.range() else {
         panic!("{} is empty", settings.group);
     };
@@ -596,9 +655,7 @@ fn real_articles_parse_and_head_agrees_with_article() {
 #[ignore = "needs a real news server; see the module documentation"]
 fn fetching_by_message_id_works_without_a_selected_group() {
     let (settings, mut client) = connect();
-    let group = group_name(&settings);
-
-    let summary = client.select_group(&group).expect("GROUP");
+    let summary = select_group(&mut client, &settings);
     let Some((low, high)) = summary.range() else {
         panic!("{} is empty", settings.group);
     };

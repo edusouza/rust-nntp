@@ -6,6 +6,13 @@ change to command coverage: if you add a command, add its row.
 Legend: ✅ implemented end to end · 🟡 grammar implemented in `nntp-proto`, not yet driven by
 the client or surfaced in the UI · ⬜ not implemented · 🚫 out of scope for a reader client
 
+Verified against a real server once, on 2026-09-17: **INN 2.8.0** at
+`news.eternal-september.org`, over implicit TLS with `AUTHINFO USER`/`PASS`. 26 188 groups
+from `LIST ACTIVE` and 45 102 descriptions from `LIST NEWSGROUPS` parsed with zero
+unparseable lines; `OVERVIEW.FMT` matched the assumed layout exactly; the clock skew was
+zero. One divergence found, now fixed and regression-tested: the `411` group-name
+assumption noted under `GROUP` below.
+
 ## RFC 3977 — Network News Transfer Protocol
 
 ### Session administration (§5)
@@ -20,7 +27,7 @@ the client or surfaced in the UI · ⬜ not implemented · 🚫 out of scope for
 
 | Command | Status | Notes |
 | --- | --- | --- |
-| `GROUP` | ✅ | Including the `low > high` spelling of an empty group, and filling in the group name when a `411` omits it. |
+| `GROUP` | ✅ | Including the `low > high` spelling of an empty group. A `411` never names the group (INN answers `411 No such newsgroup`), so the requested name is always substituted rather than read from the response; the server's own text is kept, since a `411` sometimes means "access denied". |
 | `LISTGROUP` | 🟡 | Encoded and served by the test server; the client has no method for it yet. |
 | `LAST` / `NEXT` | 🟡 | Encoded and served by the test server; the client has no method for it yet. |
 | `ARTICLE` | ✅ | |

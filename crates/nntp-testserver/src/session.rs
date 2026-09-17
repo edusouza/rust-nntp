@@ -402,7 +402,12 @@ impl<'a> Session<'a> {
             return self.status(output, 501, "GROUP needs a newsgroup name");
         };
         let Some(group) = self.corpus.find(name) else {
-            return self.status(output, 411, &format!("{name} is not a valid newsgroup"));
+            // INN 2.8.0's exact wording, chosen deliberately: it carries no group name.
+            // The previous message here began with the group name, which happened to match
+            // what the client's parser assumed a 411 looked like -- so the fake server was
+            // confirming the client's mistake instead of exposing it. A fake server must
+            // not be more convenient than the real one.
+            return self.status(output, 411, "No such newsgroup");
         };
 
         let (low, high) = group.watermarks();
@@ -425,7 +430,7 @@ impl<'a> Session<'a> {
         };
 
         let Some(group) = self.corpus.find(&name) else {
-            return self.status(output, 411, &format!("{name} is not a valid newsgroup"));
+            return self.status(output, 411, "No such newsgroup");
         };
 
         let (low, high) = group.watermarks();
@@ -811,7 +816,13 @@ mod tests {
     #[test]
     fn rejects_an_unknown_group() {
         let transcript = default_conversation("GROUP no.such.group\r\nQUIT\r\n");
-        assert!(transcript.contains("411 no.such.group is not a valid newsgroup"));
+        // INN's wording, which carries no group name. A client that reads the group name
+        // out of this response gets "No".
+        assert!(transcript.contains("411 No such newsgroup"), "{transcript}");
+        assert!(
+            !transcript.contains("411 no.such.group"),
+            "the fake server must not name the group in a 411, because INN does not:\n{transcript}"
+        );
     }
 
     #[test]

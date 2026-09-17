@@ -416,7 +416,13 @@ fn reports_a_group_the_server_does_not_carry() {
 
     let error = client.select_group(&group("no.such.group")).unwrap_err();
     match &error {
-        ClientError::NoSuchGroup { group } => assert_eq!(group, "no.such.group"),
+        // The server's 411 says only "No such newsgroup", as INN's does, so a correct
+        // group name here proves the client substitutes the one it asked for rather than
+        // reading a word out of the response.
+        ClientError::NoSuchGroup { group, text } => {
+            assert_eq!(group, "no.such.group");
+            assert_eq!(text, "No such newsgroup");
+        }
         other => panic!("expected NoSuchGroup, got {other}"),
     }
     assert!(!error.is_connection_fatal());

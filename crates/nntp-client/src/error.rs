@@ -81,11 +81,18 @@ pub enum ClientError {
     )]
     PlaintextAuthenticationRefused,
 
-    /// The group does not exist on this server (code 411).
-    #[error("no such newsgroup: {group}")]
+    /// The group does not exist on this server, or is not available (code 411).
+    #[error("no such newsgroup: {group}{}", server_note(text))]
     NoSuchGroup {
         /// The group that was requested.
+        ///
+        /// Filled in by the caller, not read out of the response: RFC 3977 §6.1.1 does
+        /// not require a `411` to name the group, and servers do not. INN answers
+        /// `411 No such newsgroup`, so reading the first word of the text gives "No".
         group: String,
+        /// The server's own message, which occasionally says more than "no such group" —
+        /// "access denied" and "group removed" both arrive as a `411`.
+        text: String,
     },
 
     /// A command needed a selected group and none was selected (code 412).
@@ -146,8 +153,12 @@ impl ClientError {
             codes::AUTH_REJECTED | codes::AUTH_OUT_OF_SEQUENCE => {
                 Self::AuthenticationRejected { text }
             }
+            // The group name is deliberately left blank: the response is not required
+            // to carry one, so the only reliable source is the caller, who knows what it
+            // asked for. `Client::select_group` fills it in.
             codes::NO_SUCH_GROUP => Self::NoSuchGroup {
-                group: line.args().next().unwrap_or_default().to_owned(),
+                group: String::new(),
+                text,
             },
             codes::NO_GROUP_SELECTED => Self::NoGroupSelected { command },
             codes::NO_ARTICLE_SELECTED
@@ -228,6 +239,15 @@ impl ClientError {
     }
 }
 
+/// Renders a server message as a parenthesised note, or nothing if it is empty.
+fn server_note(text: &str) -> String {
+    if text.trim().is_empty() {
+        String::new()
+    } else {
+        format!(" (the server said: {})", text.trim())
+    }
+}
+
 fn context_suffix(context: &Option<&'static str>) -> String {
     match context {
         Some(context) => format!(" while reading {context}"),
@@ -260,9 +280,37 @@ mod tests {
     }
 
     #[test]
+    fn a_411_never_guesses_the_group_name_from_the_response() {
+        // Found against INN 2.8.0, which answers `411 No such newsgroup`. Reading the
+        // first word of the text produced `NoSuchGroup { group: "No" }`. RFC 3977 §6.1.1
+        // does not require the response to name the group, so the only reliable source is
+        // the caller. `Client::select_group` fills it in.
+        let error = ClientError::from_status("GROUP", &status("411 No such newsgroup"));
+        match &error {
+            ClientError::NoSuchGroup { group, text } => {
+                assert!(
+                    group.is_empty(),
+                    "the group name must not be guessed, got {group:?}"
+                );
+                assert_eq!(text, "No such newsgroup");
+            }
+            other => panic!("expected NoSuchGroup, got {other:?}"),
+        }
+
+        // And the server's own message survives, because a 411 sometimes means something
+        // more specific than "no such group".
+        let denied = ClientError::from_status("GROUP", &status("411 Access denied"));
+        assert!(denied.to_string().contains("Access denied"), "{denied}");
+
+        // A 411 with no text at all leaves no dangling parenthetical.
+        let bare = ClientError::from_status("GROUP", &status("411"));
+        assert_eq!(bare.to_string(), "no such newsgroup: ");
+    }
+
+    #[test]
     fn maps_group_and_article_codes() {
         let error = ClientError::from_status("GROUP", &status("411 no.such.group"));
-        assert!(matches!(&error, ClientError::NoSuchGroup { group } if group == "no.such.group"));
+        assert!(matches!(&error, ClientError::NoSuchGroup { .. }));
 
         assert!(matches!(
             ClientError::from_status("OVER", &status("412 no newsgroup selected")),
