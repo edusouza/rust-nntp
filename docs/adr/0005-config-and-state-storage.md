@@ -26,6 +26,13 @@ a SQLite database in the platform data directory, one table for groups, one for 
 records keyed by `(group, number)`, one for read ranges per group in the compact
 `low-high,n` form `.newsrc` uses.
 
+> **The read-state half of that plan is superseded by
+> [ADR-0009](0009-newsrc-file-for-read-state.md)**, which stores read state as a
+> `.newsrc`-format file per server instead of a table. The reasoning: read state is the
+> one thing this program keeps that other programs already read, and it is small and
+> written rarely, so the properties that make SQLite right for a cache do not apply to it.
+> The cache half of this ADR stands.
+
 ## Consequences
 
 ### Positive
