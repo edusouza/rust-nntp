@@ -81,8 +81,13 @@ pub struct ArticleView {
     pub date: String,
     /// Header lines to show above the body, already decoded.
     pub headers: Vec<(String, String)>,
-    /// The body, split into lines.
+    /// The body, split into lines: the part chosen for display, decoded and unflowed.
     pub body: Vec<String>,
+    /// The parts that are not on screen — attachments, and the alternatives passed over —
+    /// one summary line each.
+    ///
+    /// Empty for the ordinary single-part article, which is most of Usenet.
+    pub attachments: Vec<String>,
 }
 
 impl ArticleView {
@@ -122,13 +127,26 @@ impl ArticleView {
             |date| date.format(date_format).to_string(),
         );
 
+        // `display_text` rather than `body_text`: the part a reader can read, with
+        // `format=flowed` applied, instead of the raw body with its MIME boundaries and
+        // base64 in it.
+        let mut body: Vec<String> = article.display_text().lines().map(str::to_owned).collect();
+        let attachments = article.attachments();
+
+        // An article that is nothing but an attachment would otherwise be a blank pane,
+        // which reads as a bug rather than as a fact about the article.
+        if body.is_empty() && !attachments.is_empty() {
+            body.push("(no text in this article)".to_owned());
+        }
+
         Self {
             number: article.number,
             subject: article.subject(),
             author: article.author(),
             date,
             headers,
-            body: article.body_text().lines().map(str::to_owned).collect(),
+            body,
+            attachments,
         }
     }
 }

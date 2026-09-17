@@ -9,6 +9,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **MIME multipart bodies and `format=flowed`** ([#12]). The reader used to show the raw
+  body: boundary lines, part headers, base64 and the HTML copy of a message that had also
+  arrived as plain text. Now the body is a part tree, and the reader shows the part a
+  person can read.
+
+  `multipart/alternative` shows its plain-text part — the opposite of RFC 2046 §5.1.4's
+  "prefer the last part you can handle", which was written when the last part was the
+  richest one a reader could render; in a terminal, `text/html` is not something this
+  reader renders, it is something it would dump tags from. Everything not on screen is
+  *named* above the body with its type, filename and size, because an article whose text
+  says "see the attached patch" is confusing if the reader never mentions an attachment.
+  An article that is only an attachment says so instead of showing a blank pane.
+
+  `format=flowed` (RFC 3676) joins the sender's soft line breaks, so a message written in
+  a 70-column mail client is no longer a column of short lines. Quote depth is part of the
+  line, so a reply cannot absorb the text it quotes; `delsp=yes` deletes the marker space;
+  and `-- ` stays a hard break despite ending in a space.
+
+  `nntp-tui article --raw` is unchanged and still shows exactly what arrived.
+
 - **Read and unread state, remembered between runs** ([#7] — the largest functional gap in
   v0.1.0). Stored in the `.newsrc` format, one file per server under the platform data
   directory, because article numbers are the server's own and the same group on two
@@ -270,4 +290,5 @@ records what was checked, against which server, on what date ([#4]).
 [#4]: https://github.com/edusouza/rust-nntp/issues/4
 [#7]: https://github.com/edusouza/rust-nntp/issues/7
 [#9]: https://github.com/edusouza/rust-nntp/issues/9
+[#12]: https://github.com/edusouza/rust-nntp/issues/12
 [#17]: https://github.com/edusouza/rust-nntp/issues/17

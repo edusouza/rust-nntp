@@ -250,6 +250,24 @@ fn draw_article(frame: &mut Frame<'_>, app: &App, area: Rect) {
         })
         .collect();
 
+    // Attachments go above the body, not below it: a reader who has to scroll to the end
+    // of a long article to find out something was attached has already been misled.
+    if !view.attachments.is_empty() {
+        let label = if view.attachments.len() == 1 {
+            "1 other part".to_owned()
+        } else {
+            format!("{} other parts", view.attachments.len())
+        };
+        lines.push(Line::from(
+            Span::from(format!("{label}:")).bold().fg(ACCENT),
+        ));
+        for summary in &view.attachments {
+            lines.push(Line::from(
+                Span::from(format!("  \u{2022} {summary}")).dim(),
+            ));
+        }
+    }
+
     lines.push(Line::default());
 
     for line in view.body.iter().skip(app.body_scroll) {
@@ -665,6 +683,31 @@ mod tests {
         assert!(screen.contains("plain line"), "{screen}");
         // The body position is in the pane title.
         assert!(screen.contains("of 2"), "{screen}");
+    }
+
+    #[test]
+    fn a_multipart_article_shows_the_text_and_lists_the_other_parts() {
+        let mut app = app();
+        let block = nntp_proto::DataBlock::parse(
+            b"From: a@example.net\r\nSubject: multipart\r\n\
+              Content-Type: multipart/mixed; boundary=\"b\"\r\n\r\n\
+              --b\r\nContent-Type: text/plain\r\n\r\nthe readable part\r\n\
+              --b\r\nContent-Type: text/x-patch\r\n\
+              Content-Disposition: attachment; filename=\"fix.patch\"\r\n\r\n\
+              --- a/x\r\n--b--\r\n.\r\n",
+        );
+        app.on_event(Event::Article(Box::new(nntp_proto::Article::from_block(
+            &block,
+        ))));
+
+        let screen = render(&mut app, 100, 20);
+        assert!(screen.contains("the readable part"), "{screen}");
+        // Named above the body, so a reader does not have to scroll to the end of a long
+        // article to discover that something was attached.
+        assert!(screen.contains("1 other part"), "{screen}");
+        assert!(screen.contains("fix.patch"), "{screen}");
+        // And no MIME machinery on screen.
+        assert!(!screen.contains("--b"), "{screen}");
     }
 
     #[test]

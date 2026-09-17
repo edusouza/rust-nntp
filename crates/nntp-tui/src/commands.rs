@@ -405,7 +405,17 @@ pub fn article(
                 out.write_all(&fetched.body_bytes())?;
                 writeln!(out)?;
             } else {
-                writeln!(out, "{}", fetched.body_text())?;
+                // The part a reader can read, not the raw body: `--raw` above is how to
+                // get the boundaries and the base64. Attachments are named rather than
+                // dumped, for the same reason they are in the terminal reader.
+                let attachments = fetched.attachments();
+                if !attachments.is_empty() {
+                    for summary in &attachments {
+                        writeln!(out, "[other part] {summary}")?;
+                    }
+                    writeln!(out)?;
+                }
+                writeln!(out, "{}", fetched.display_text())?;
             }
         }
     }

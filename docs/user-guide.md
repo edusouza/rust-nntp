@@ -229,6 +229,18 @@ keys.
   and red when the connection has dropped. The worker reconnects on the next request, so
   a dropped connection is a nuisance rather than the end of the session.
 - **Quoted lines are dimmed.** On Usenet most of a follow-up is quotation.
+- **"n other parts" above the body** lists what the article carried that is not on screen:
+  attachments, and the HTML copy of a message that also arrived as plain text. A
+  `multipart/alternative` from a mail-to-news gateway shows its plain-text half; anything
+  the reader cannot render is named, with its type and size, rather than dumped into the
+  pane. An article that is *only* an attachment says `(no text in this article)` instead of
+  showing a blank pane.
+- **Paragraphs wrapped by the sender are rejoined** when the article says
+  `format=flowed` (RFC 3676), so a message written in a 70-column mail client does not
+  arrive as a column of short lines. Quote depth is respected, so a reply never absorbs
+  the text it is quoting, and a `-- ` signature separator stays a break.
+- **`nntp-tui article --raw`** shows the body exactly as it arrived — boundaries, base64
+  and all — when you need to see what the sender actually sent.
 - **An error takes over the status bar** until the next keystroke; `m` shows the ones that
   have scrolled past.
 
