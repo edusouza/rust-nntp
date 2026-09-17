@@ -106,7 +106,11 @@ outbound TCP and an account on a news server — the runbook is
 
 Last run: **2026-09-17**, INN 2.8.0 (20260619 snapshot) at `news.eternal-september.org:563`,
 implicit TLS, `AUTHINFO USER`/`PASS`, `NNTP_TEST_GROUP=misc.test`. **8 passed, 0 failed**,
-on Windows (`x86_64-pc-windows-msvc`).
+on Windows (`x86_64-pc-windows-msvc`). Run twice that day: once before and once after the
+`base64` 0.23 and `toml` 1.1 bumps, with identical counts. The second run is the one that
+matters for the bump — `base64` sits in the path that decodes RFC 2047, and 1 907 of the
+descriptions below are non-ASCII, so "0 undecoded subjects" on real traffic is a better
+answer than any fixture could give.
 
 | What was checked | Result |
 | --- | --- |
@@ -120,6 +124,28 @@ on Windows (`x86_64-pc-windows-msvc`).
 | `LIST OVERVIEW.FMT` | `Subject From Date Message-ID References bytes lines Xref:full` — the RFC 3977 §8.3 prefix exactly |
 | `DATE` | `2026-09-17T16:49:27+00:00`, **0 s skew** |
 | `XOVER` vs `OVER` | 19 records each, identical field by field, 0 unparseable |
+
+### Read state, checked by hand
+
+Read state is not in the automated suite: the protocol layer does not know it exists, and
+what a real server adds is scale and the one question no test can answer — whether the
+marks a user sees match what they actually read. Step 4 of the runbook is that pass, and it
+was walked through against the same server on 2026-09-17:
+
+| What was checked | Result |
+| --- | --- |
+| Reading articles moves the counts and the marks | unread count drops per article, the bullet clears |
+| `u` hides read articles, and brings them back | works, and the cursor keeps its place |
+| `M` marks a read article unread | works |
+| Marks survive quitting and reopening the reader | works |
+| A deliberately corrupted store | **the reader opened, the fault was reported in the message pane, and the readable groups survived** |
+
+That last row is the acceptance criterion from [#7] that only a person can check: not
+refusing to start, and not silently forgetting everything.
+
+[#7]: https://github.com/edusouza/rust-nntp/issues/7
+
+### Notes on the numbers
 
 Two things are worth naming about that table. The `OVER` range asked for 50 articles and got
 44: the watermarks from `GROUP` and `LIST ACTIVE` are an estimate that counts cancelled and

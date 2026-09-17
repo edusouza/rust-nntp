@@ -33,6 +33,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   a temporary file renamed over the old one — so a crash leaves either the old state or
   the new, never half a file.
 
+  Checked by hand against INN 2.8.0, including the part no test can check: a deliberately
+  corrupted store, where the reader opened, reported the fault, and kept the readable
+  groups. Recorded in
+  [`docs/protocol-coverage.md`](docs/protocol-coverage.md#read-state-checked-by-hand).
+
 ### Changed
 
 - `nntp-tui config path` now prints the read-state file as well as the configuration and
@@ -48,6 +53,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `toml` 0.9 → 1.1 and `actions/checkout` v5 → v7. Neither needed a code change; the
   `checkout` major is a security default about `pull_request_target` and `workflow_run`,
   which this workflow does not use. Closes [#17].
+
+  The real-server suite was re-run after both bumps and is unchanged: 45 102 descriptions
+  and 26 188 groups with zero unparseable lines, and zero undecoded subjects across 44 real
+  overview records. That is the check that matters for a `base64` major, because 1 907 of
+  those descriptions are non-ASCII.
 
 ## [0.1.0] — 2026-09-17
 
