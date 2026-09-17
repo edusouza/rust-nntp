@@ -30,6 +30,10 @@
 //! | `NNTP_TEST_GROUP` | `misc.test` | A group the server carries, for the article tests. |
 //! | `NNTP_TEST_SAMPLE` | 50 | How many of the newest articles to examine. |
 //!
+//! `real_mime_articles_yield_something_to_read` is worth pointing at a group fed from a
+//! mailing list — `linux.debian.user` and its neighbours — because those carry the
+//! `multipart/alternative` and `format=flowed` traffic that a text-only group does not.
+//!
 //! # What a failure means
 //!
 //! A failure here is a *finding*, not a broken test. Each one should become a fixture in
@@ -643,6 +647,119 @@ fn real_articles_parse_and_head_agrees_with_article() {
         "{malformed_headers} header line(s) across {examined} real articles did not parse. \
          Each is a finding: add it to the nntp-testserver corpus."
     );
+
+    let _ = client.quit();
+}
+
+/// Real MIME traffic: how much of it there is, and whether the reader finds text in it.
+///
+/// The offline suite proves the part tree is built correctly from articles this project
+/// wrote. What it cannot say is what real articles look like — how many are multipart, how
+/// many are `format=flowed`, and whether every multipart article yields something a person
+/// can read. This test answers that, and prints the counts, because the counts are the
+/// finding.
+///
+/// The assertion is narrow on purpose: a multipart article must either produce text or be
+/// nothing but attachments. Anything else means the reader would show a blank pane for an
+/// article that has words in it, which is the failure this whole feature exists to prevent.
+#[test]
+#[ignore = "needs a real news server; see the module documentation"]
+fn real_mime_articles_yield_something_to_read() {
+    let (settings, mut client) = connect();
+    let summary = select_group(&mut client, &settings);
+    let Some((low, high)) = summary.range() else {
+        panic!("{} is empty", settings.group);
+    };
+
+    let mut examined = 0usize;
+    let mut multipart = 0usize;
+    let mut flowed = 0usize;
+    let mut with_attachments = 0usize;
+    let mut attachment_only = 0usize;
+    let mut blank = Vec::new();
+    let mut kinds: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
+
+    for number in (low..=high).rev().take(settings.sample as usize) {
+        let article = match client.article(ArticleSpec::Number(number)) {
+            Ok(article) => article,
+            // A gap in the numbering is normal, not a failure.
+            Err(error) if !error.is_connection_fatal() => continue,
+            Err(error) => panic!("ARTICLE {number}: {error}"),
+        };
+
+        examined += 1;
+        let content_type = article.content_type();
+        let kind = format!("{}/{}", content_type.type_, content_type.subtype);
+        *kinds.entry(kind).or_default() += 1;
+
+        if content_type
+            .param("format")
+            .is_some_and(|format| format.eq_ignore_ascii_case("flowed"))
+        {
+            flowed += 1;
+        }
+
+        if !content_type.is_multipart() {
+            continue;
+        }
+        multipart += 1;
+
+        let attachments = article.attachments();
+        if !attachments.is_empty() {
+            with_attachments += 1;
+        }
+
+        let text = article.display_text();
+        if text.trim().is_empty() {
+            if attachments.is_empty() {
+                // No text and nothing named: the reader would show an empty pane and say
+                // nothing about why. That is the bug this feature exists to prevent.
+                blank.push(number);
+            } else {
+                attachment_only += 1;
+            }
+            continue;
+        }
+
+        // Whatever was chosen, it must not be the raw container: a boundary line on
+        // screen means the split silently failed.
+        if let Some(boundary) = content_type.boundary() {
+            assert!(
+                !text.contains(&format!("--{boundary}")),
+                "article {number}: a boundary line survived into the displayed text"
+            );
+        }
+    }
+
+    eprintln!("examined {examined} article(s)");
+    eprintln!(
+        "  {multipart} multipart, {flowed} format=flowed, {with_attachments} with other \
+         parts, {attachment_only} attachment-only"
+    );
+    for (kind, count) in &kinds {
+        eprintln!("  {count:>4} × {kind}");
+    }
+
+    assert!(
+        examined > 0,
+        "no articles could be fetched from {}",
+        settings.group
+    );
+    assert!(
+        blank.is_empty(),
+        "multipart article(s) {blank:?} produced neither text nor a named part. Each is a \
+         finding: add the article to the nntp-testserver corpus and write the regression \
+         test before fixing it."
+    );
+
+    // Not an assertion, because a group can legitimately be all plain text — but worth
+    // saying out loud, since a run that saw no multipart articles has not tested much.
+    if multipart == 0 {
+        eprintln!(
+            "note: no multipart articles in this sample. Try a group fed from a mailing \
+             list (linux.debian.user, for instance) to exercise this properly."
+        );
+    }
 
     let _ = client.quit();
 }

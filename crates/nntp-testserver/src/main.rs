@@ -21,6 +21,8 @@ use nntp_testserver::{CapabilityProfile, Corpus, Quirks, ServerConfig, TestServe
 /// Parsed command-line arguments.
 struct Args {
     port: u16,
+    /// Whether to serve the MIME group as well.
+    mime: bool,
     profile: CapabilityProfile,
     credentials: Option<(String, String)>,
     quirks: Quirks,
@@ -93,7 +95,7 @@ fn main() -> ExitCode {
         );
     }
     println!("groups:");
-    for group in Corpus::sample().groups() {
+    for group in corpus_for(&args).groups() {
         let (low, high) = group.watermarks();
         println!(
             "  {:<24} {:>5} article(s)  [{low}..{high}]  {}",
@@ -111,15 +113,25 @@ fn main() -> ExitCode {
 }
 
 fn start(args: &Args, config: ServerConfig) -> std::io::Result<TestServer> {
+    let corpus = corpus_for(args);
+
     if args.tls != TlsMode::Disabled {
         // TLS servers always take an ephemeral port: the generated certificate has to be
         // written out anyway, so the port is printed with it.
-        return TestServer::with_tls(Corpus::sample(), config, args.tls);
+        return TestServer::with_tls(corpus, config, args.tls);
     }
     if args.port == 0 {
-        return TestServer::with(Corpus::sample(), config);
+        return TestServer::with(corpus, config);
     }
-    TestServer::with_port(args.port, Corpus::sample(), config)
+    TestServer::with_port(args.port, corpus, config)
+}
+
+fn corpus_for(args: &Args) -> Corpus {
+    if args.mime {
+        Corpus::sample_with_mime()
+    } else {
+        Corpus::sample()
+    }
 }
 
 fn parse_args() -> Result<Option<Args>, String> {
@@ -129,6 +141,7 @@ fn parse_args() -> Result<Option<Args>, String> {
     let mut quirks = Quirks::default();
     let mut tls = TlsMode::Disabled;
     let mut ca_out = None;
+    let mut mime = false;
 
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -172,6 +185,7 @@ fn parse_args() -> Result<Option<Args>, String> {
                 let value = args.next().ok_or("--ca-out needs a path")?;
                 ca_out = Some(std::path::PathBuf::from(value));
             }
+            "--mime" => mime = true,
             "--no-overview-fmt" => quirks.no_overview_fmt = true,
             "--reject-open-ranges" => quirks.reject_open_ended_ranges = true,
             "--bare-lf" => quirks.bare_lf = true,
@@ -181,6 +195,7 @@ fn parse_args() -> Result<Option<Args>, String> {
 
     Ok(Some(Args {
         port,
+        mime,
         profile,
         credentials,
         quirks,
@@ -206,6 +221,9 @@ OPTIONS:
         --starttls           Serve plaintext, advertising and accepting STARTTLS
         --ca-out <PATH>      Write the generated certificate authority here, so a
                              client can be told to trust it
+        --mime               Also serve news.software.readers: a mail-to-news gateway
+                             multipart, a format=flowed article, and an article that is
+                             nothing but an attachment
         --no-overview-fmt    Refuse LIST OVERVIEW.FMT, as some servers do
         --reject-open-ranges Refuse an OVER range with an open upper bound
         --bare-lf            Terminate lines with LF instead of CRLF
@@ -215,7 +233,7 @@ OPTIONS:
 The corpus is fixed and deliberately awkward: sparse article numbers, RFC 2047
 encoded subjects in both encodings, an unlabelled Latin-1 header, a body line
 beginning with a dot, a Date header no parser can read, a moderated group and an
-empty group.",
+empty group. --mime adds a group of the MIME traffic a reader has to survive.",
         version = nntp_testserver::VERSION
     );
 }

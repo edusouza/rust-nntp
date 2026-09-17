@@ -59,6 +59,7 @@
 
 pub mod article;
 pub mod block;
+pub mod body;
 pub mod capabilities;
 pub mod command;
 pub mod date;
@@ -74,6 +75,7 @@ pub mod spec;
 
 pub use article::{Article, ContentType, TransferEncoding};
 pub use block::DataBlock;
+pub use body::{BodyPart, Disposition, DispositionKind, strip_clearsign, unflow};
 pub use capabilities::Capabilities;
 pub use command::{Command, ListKeyword, Wildmat};
 pub use error::{ProtoError, Result};

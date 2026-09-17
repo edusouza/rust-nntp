@@ -119,6 +119,11 @@ fn serve(config: ServerConfig) -> TestServer {
     TestServer::with(Corpus::sample(), config).expect("start the server")
 }
 
+/// A server whose corpus also carries the MIME traffic a reader has to survive.
+fn serve_mime() -> TestServer {
+    TestServer::with(Corpus::sample_with_mime(), ServerConfig::new()).expect("start the server")
+}
+
 #[test]
 fn loads_the_group_list_on_start_up() {
     let mut harness = Harness::new(serve(ServerConfig::new()));
@@ -249,6 +254,158 @@ fn read_state_survives_a_restart() {
     assert_eq!(second.app.visible_articles().len(), unread_after);
 
     let _ = std::fs::remove_dir_all(&directory);
+}
+
+/// Opens `group`, selects the article whose subject contains `subject`, and returns the
+/// harness with that article on display.
+fn reader_showing(server: TestServer, group: &str, subject: &str) -> Harness {
+    let mut harness = Harness::new(server);
+    harness.settle("the group list", |app| !app.groups.is_empty());
+
+    harness.press(KeyCode::Char('/'));
+    harness.type_text(group);
+    harness.press(KeyCode::Enter);
+    harness.press(KeyCode::Enter);
+    harness.settle("the article list", |app| !app.articles.is_empty());
+
+    let index = harness
+        .app
+        .articles
+        .iter()
+        .position(|record| record.subject.contains(subject))
+        .unwrap_or_else(|| {
+            panic!(
+                "no article matching {subject:?} in {:?}",
+                harness
+                    .app
+                    .articles
+                    .iter()
+                    .map(|r| r.subject.clone())
+                    .collect::<Vec<_>>()
+            )
+        });
+    harness.app.article_cursor = index;
+
+    harness.press(KeyCode::Enter);
+    harness.settle("the article", |app| app.article.is_some());
+    harness
+}
+
+#[test]
+fn a_multipart_article_shows_its_text_and_names_its_other_parts() {
+    let harness = reader_showing(serve_mime(), "news.software.readers", "multipart article");
+    let view = harness.app.article.as_ref().expect("an article");
+    let body = view.body.join("\n");
+
+    // The readable alternative, decoded.
+    assert!(body.contains("The readable version"), "{body}");
+    assert!(body.contains("café"), "{body}");
+
+    // And none of what a raw body would have shown.
+    assert!(
+        !body.contains("--outer"),
+        "boundary line on screen:\n{body}"
+    );
+    assert!(
+        !body.contains("--inner"),
+        "boundary line on screen:\n{body}"
+    );
+    assert!(!body.contains("<html>"), "html tags on screen:\n{body}");
+    assert!(
+        !body.contains("Content-Type"),
+        "part headers on screen:\n{body}"
+    );
+    // The preamble and epilogue belong to no part (RFC 2046 §5.1.1).
+    assert!(!body.contains("preamble"), "{body}");
+    assert!(!body.contains("epilogue"), "{body}");
+
+    // The parts it passed over are named rather than hidden: the HTML alternative and
+    // the patch.
+    let named = view.attachments.join("\n");
+    assert!(named.contains("text/html"), "{named}");
+    assert!(named.contains("fix.patch"), "{named}");
+    assert!(named.contains("octets"), "{named}");
+}
+
+#[test]
+fn a_flowed_article_is_shown_as_paragraphs() {
+    let harness = reader_showing(serve_mime(), "news.software.readers", "format=flowed");
+    let view = harness.app.article.as_ref().expect("an article");
+    let body = view.body.join("\n");
+
+    // The sender's soft wraps are gone: one line, not three.
+    assert!(
+        body.contains(
+            "wrapped by the sender at a narrow width, and should be shown as one paragraph"
+        ),
+        "{body}"
+    );
+    // The quoted paragraph flowed too, and did not absorb the reply.
+    assert!(
+        body.contains(
+            "> The quoted part was wrapped too, and must not be joined to the reply below it."
+        ),
+        "{body}"
+    );
+    // `-- ` ends in a space and is still a hard break (RFC 3676 §4.3).
+    assert!(
+        view.body.iter().any(|line| line == "-- "),
+        "the signature separator was flowed away:\n{body}"
+    );
+}
+
+#[test]
+fn a_signed_gateway_article_shows_the_content_and_not_the_signature_machinery() {
+    // The shape a Debian `Accepted …` announcement arrives in, found by pointing the
+    // reader at linux.debian.changes on a real server: multipart/signed with a detached
+    // signature, and the content clearsigned inside the text part.
+    let harness = reader_showing(serve_mime(), "news.software.readers", "Accepted nginx");
+    let view = harness.app.article.as_ref().expect("an article");
+    let body = view.body.join("\n");
+
+    // The content.
+    assert!(body.contains("Source: nginx"), "{body}");
+    assert!(body.contains("CVE-2026-56434"), "{body}");
+    // Dash-escaping undone, so a signed patch does not read `- --- a/file`.
+    assert!(
+        body.contains("--- a/src/http/ngx_http_ssi_module.c"),
+        "{body}"
+    );
+    assert!(!body.contains("- --- a/src"), "{body}");
+
+    // None of the machinery: not the armour, not the `Hash:` header, not the base64.
+    assert!(!body.contains("BEGIN PGP"), "armour on screen:\n{body}");
+    assert!(!body.contains("END PGP"), "armour on screen:\n{body}");
+    assert!(
+        !body.contains("Hash: SHA512"),
+        "armour header on screen:\n{body}"
+    );
+    assert!(
+        !body.contains("iQIzBAAB"),
+        "signature base64 on screen:\n{body}"
+    );
+
+    // The fact is reported once, and the signature is not listed as an attachment: every
+    // article from every signing gateway would otherwise carry that line.
+    assert!(view.signed, "the article carries a signature");
+    assert!(
+        view.attachments.is_empty(),
+        "the signature was named as an attachment: {:?}",
+        view.attachments
+    );
+}
+
+#[test]
+fn an_article_that_is_only_an_attachment_says_so_rather_than_showing_nothing() {
+    let harness = reader_showing(serve_mime(), "news.software.readers", "only an attachment");
+    let view = harness.app.article.as_ref().expect("an article");
+
+    // A blank pane reads as a bug; this reads as a fact about the article.
+    assert_eq!(view.body, ["(no text in this article)"]);
+    let named = view.attachments.join("\n");
+    assert!(named.contains("application/octet-stream"), "{named}");
+    // RFC 2231's `filename*`, decoded.
+    assert!(named.contains("relatório.bin"), "{named}");
 }
 
 #[test]

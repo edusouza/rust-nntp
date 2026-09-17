@@ -390,6 +390,142 @@ impl Corpus {
             )
             .group(Group::new("empty.group").description("A group with no articles"))
     }
+
+    /// [`Self::sample`] plus a group of MIME traffic: a mail-to-news gateway multipart,
+    /// an article in `format=flowed`, and an article that is nothing but an attachment.
+    ///
+    /// Separate from `sample` so that the counts every other test asserts do not move
+    /// whenever this corpus gains an article.
+    pub fn sample_with_mime() -> Self {
+        Self::sample().group(mime_group())
+    }
+}
+
+/// A group of the MIME traffic a reader has to survive.
+///
+/// Kept out of [`Corpus::sample`] on purpose: that corpus is the shared fixture for most
+/// of the suite, and a shared fixture that grows whenever one test wants something new is
+/// a fixture whose article and group counts nobody can assert. [`Corpus::sample_with_mime`]
+/// is for the tests that need this.
+fn mime_group() -> Group {
+    Group::new("news.software.readers")
+        .description("Newsreaders, and the MIME they have to survive")
+        // A mail-to-news gateway article: the same text twice, plus an
+        // attachment. Before MIME support the reader showed all of this,
+        // boundary lines and base64 included.
+        .article(
+            Article::new("<mixed@test.invalid>")
+                .header("Message-ID", "<mixed@test.invalid>")
+                .header("From", "Gateway User <gw@example.org>")
+                .header("Subject", "A multipart article from a gateway")
+                .header("Date", "Wed, 17 Sep 2026 12:00:00 +0000")
+                .header("Newsgroups", "news.software.readers")
+                .header("Content-Type", "multipart/mixed; boundary=\"outer\"")
+                .line("This preamble belongs to no part and must not be shown.")
+                .line("--outer")
+                .line("Content-Type: multipart/alternative; boundary=\"inner\"")
+                .line("")
+                .line("--inner")
+                .line("Content-Type: text/plain; charset=UTF-8")
+                .line("")
+                .line("The readable version, with an accent: café.")
+                .line("--inner")
+                .line("Content-Type: text/html; charset=UTF-8")
+                .line("")
+                .line("<html><body><p>The noisy version.</p></body></html>")
+                .line("--inner--")
+                .line("--outer")
+                .line("Content-Type: text/x-patch; name=\"fix.patch\"")
+                .line("Content-Disposition: attachment; filename=\"fix.patch\"")
+                .line("")
+                .line("--- a/x")
+                .line("+++ b/x")
+                .line("--outer--")
+                .line("This epilogue belongs to no part either."),
+        )
+        // `format=flowed`: paragraphs wrapped by the sender, with the soft
+        // breaks marked by a trailing space. Shown one short line at a time
+        // before RFC 3676 support.
+        .article(
+            Article::new("<flowed@test.invalid>")
+                .header("Message-ID", "<flowed@test.invalid>")
+                .header("From", "Flowed Sender <flow@example.org>")
+                .header("Subject", "An article in format=flowed")
+                .header("Date", "Wed, 17 Sep 2026 12:30:00 +0000")
+                .header("Newsgroups", "news.software.readers")
+                .header("Content-Type", "text/plain; charset=UTF-8; format=flowed")
+                .line("This paragraph was wrapped by the sender at a narrow ")
+                .line("width, and should be shown as one paragraph rather ")
+                .line("than as three short lines.")
+                .line("> The quoted part was wrapped too, and must not be ")
+                .line("> joined to the reply below it.")
+                .line("A second paragraph.")
+                .line("-- ")
+                .line("The signature separator above ends in a space and is")
+                .line("still a hard break."),
+        )
+        // What a mailing-list gateway actually relays, copied from the shape of a Debian
+        // `Accepted …` announcement seen on linux.debian.changes: multipart/signed with a
+        // detached signature, and the content clearsigned *inside* the text part. Both
+        // layers of signature machinery would otherwise be on screen.
+        .article(
+            Article::new("<gateway@test.invalid>")
+                .header("Message-ID", "<gateway@test.invalid>")
+                .header("From", "FTP Masters <ftpmaster@example.org>")
+                .header("Subject", "Accepted nginx 1.26.3 (source) into proposed-updates")
+                .header("Date", "Wed, 17 Sep 2026 13:30:00 +0000")
+                .header("Newsgroups", "news.software.readers")
+                .header("Organization", "example.* mail to news gateway")
+                .header(
+                    "Content-Type",
+                    "multipart/signed; micalg=pgp-sha512;                      protocol=\"application/pgp-signature\"; boundary=\"sig\"",
+                )
+                .line("--sig")
+                .line("Content-Type: text/plain; charset=UTF-8")
+                .line("")
+                .line("-----BEGIN PGP SIGNED MESSAGE-----")
+                .line("Hash: SHA512")
+                .line("")
+                .line("Format: 1.8")
+                .line("Source: nginx")
+                .line("Version: 1.26.3-3")
+                .line("Changes:")
+                .line(" nginx (1.26.3-3) trixie-security; urgency=medium")
+                .line(" .")
+                .line("   * d/p/CVE-2026-56434.patch add")
+                .line("- --- a/src/http/ngx_http_ssi_module.c")
+                .line("- +++ b/src/http/ngx_http_ssi_module.c")
+                .line("-----BEGIN PGP SIGNATURE-----")
+                .line("")
+                .line("iQIzBAABCgAdFiEEexampleexampleexampleexampleexampleFAmbP")
+                .line("-----END PGP SIGNATURE-----")
+                .line("--sig")
+                .line("Content-Type: application/pgp-signature; name=\"signature.asc\"")
+                .line("")
+                .line("-----BEGIN PGP SIGNATURE-----")
+                .line("")
+                .line("iQIzBAABCgAdFiEEanotherexamplesignatureblockhere=")
+                .line("-----END PGP SIGNATURE-----")
+                .line("--sig--"),
+        )
+        // Nothing but an attachment: the body pane would otherwise be blank,
+        // which reads as a bug rather than as a fact about the article.
+        .article(
+            Article::new("<onlyblob@test.invalid>")
+                .header("Message-ID", "<onlyblob@test.invalid>")
+                .header("From", "Binary Poster <bin@example.org>")
+                .header("Subject", "An article that is only an attachment")
+                .header("Date", "Wed, 17 Sep 2026 13:00:00 +0000")
+                .header("Newsgroups", "news.software.readers")
+                .header("Content-Type", "multipart/mixed; boundary=\"b\"")
+                .line("--b")
+                .line("Content-Type: application/octet-stream")
+                .line("Content-Transfer-Encoding: base64")
+                .line("Content-Disposition: attachment; filename*=UTF-8''relat%C3%B3rio.bin")
+                .line("")
+                .line("AAECAwQFBgc=")
+                .line("--b--"),
+        )
 }
 
 fn trim(bytes: &[u8]) -> &[u8] {

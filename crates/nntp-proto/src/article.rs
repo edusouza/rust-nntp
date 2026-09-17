@@ -34,18 +34,10 @@ impl ContentType {
             None => (full, String::new()),
         };
 
-        let params = parts
-            .filter_map(|part| {
-                let (name, raw) = part.split_once('=')?;
-                let value = raw.trim().trim_matches('"').to_owned();
-                Some((name.trim().to_ascii_lowercase(), value))
-            })
-            .collect();
-
         Self {
             type_,
             subtype,
-            params,
+            params: parse_params(parts),
         }
     }
 
@@ -74,11 +66,27 @@ impl ContentType {
 
     /// Whether this is a multipart container.
     ///
-    /// Multipart bodies are not split apart in v0.1; the raw body is shown instead. See
-    /// the roadmap issue for MIME support.
+    /// Splitting one into its parts is [`crate::body::BodyPart`]'s job.
     pub fn is_multipart(&self) -> bool {
         self.type_ == "multipart"
     }
+}
+
+/// Parses the `; name=value` parameters shared by `Content-Type` and
+/// `Content-Disposition`.
+///
+/// Names are lowercased, values are unquoted and otherwise left as written. A piece with
+/// no `=` is skipped rather than failing the parse: the surrounding value is still usable,
+/// and these headers arrive malformed often enough that refusing them would cost more than
+/// it protects.
+pub(crate) fn parse_params<'a>(pieces: impl Iterator<Item = &'a str>) -> Vec<(String, String)> {
+    pieces
+        .filter_map(|piece| {
+            let (name, raw) = piece.split_once('=')?;
+            let value = raw.trim().trim_matches('"').to_owned();
+            Some((name.trim().to_ascii_lowercase(), value))
+        })
+        .collect()
 }
 
 impl Default for ContentType {
@@ -243,15 +251,89 @@ impl Article {
         out
     }
 
-    /// The body as displayable text.
+    /// The MIME part tree of this article, with the article itself as the root.
+    ///
+    /// A plain article is a tree of one. See [`crate::body::BodyPart`].
+    pub fn body_part(&self) -> crate::body::BodyPart {
+        crate::body::BodyPart::from_article(&self.headers, &self.body)
+    }
+
+    /// The text a reader should show: the chosen part, decoded, with `format=flowed`
+    /// applied.
+    ///
+    /// For a plain article this is [`Self::body_text`] plus flowed unfolding. For a
+    /// multipart it is the part [`crate::body::BodyPart::display_part`] picks — the plain
+    /// text of a `multipart/alternative`, or the text that precedes the attachments in a
+    /// `multipart/mixed` — rather than the raw body with its boundary lines in it.
+    ///
+    /// Returns an empty string when the article carries no text at all, which is what an
+    /// article that is only an attachment looks like. The caller is expected to say so
+    /// rather than showing a blank pane; [`Self::attachments`] is how it knows what to
+    /// say.
+    pub fn display_text(&self) -> String {
+        let root = self.body_part();
+        let Some(part) = root.display_part() else {
+            return String::new();
+        };
+
+        let text = part.text();
+        let text = if part
+            .content_type
+            .param("format")
+            .is_some_and(|format| format.eq_ignore_ascii_case("flowed"))
+        {
+            let delete_space = part
+                .content_type
+                .param("delsp")
+                .is_some_and(|value| value.eq_ignore_ascii_case("yes"));
+            crate::body::unflow(&text, delete_space)
+        } else {
+            text
+        };
+
+        // Inline clearsigned traffic is common from mailing-list gateways, and its armour
+        // costs the reader a header, a `Hash:` line and a dozen lines of base64 in the
+        // middle of the article. `is_signed` reports the fact; the armour is not content.
+        crate::body::strip_clearsign(&text).unwrap_or(text)
+    }
+
+    /// Whether the article carries a signature — detached, or inline clearsign armour.
+    ///
+    /// Reports only that one is *present*. Nothing here verifies anything: this crate does
+    /// no cryptography, and a reader implying a signature had been checked would be worse
+    /// than one that says nothing about it.
+    pub fn is_signed(&self) -> bool {
+        if self.body_part().is_signed() {
+            return true;
+        }
+        self.body
+            .iter()
+            .any(|line| line.starts_with(b"-----BEGIN PGP SIGNED MESSAGE-----"))
+    }
+
+    /// The parts a reader is not showing: attachments, and the alternatives it passed
+    /// over.
+    ///
+    /// Summarised rather than returned whole, because saving an attachment is a later
+    /// concern and naming one is not: an article whose text says "see the attached patch"
+    /// is confusing if the reader never mentions that anything was attached.
+    pub fn attachments(&self) -> Vec<String> {
+        self.body_part()
+            .other_parts()
+            .iter()
+            .map(|part| part.summary())
+            .collect()
+    }
+
+    /// The body as displayable text, ignoring MIME structure.
     ///
     /// Applies the transfer encoding, then the declared charset, then falls back to
     /// Windows-1252 for unlabelled 8-bit bytes. Lines are separated by `\n`.
     ///
-    /// Multipart bodies are returned whole, including their boundary lines: splitting them
-    /// is v0.2 work. An encoding this crate cannot decode is likewise returned as it
-    /// arrived, on the grounds that a reader showing base64 is more useful than one
-    /// showing nothing.
+    /// A multipart body is returned whole, boundary lines included — this is the raw view.
+    /// [`Self::display_text`] is what a reader should show. An encoding this crate cannot
+    /// decode is likewise returned as it arrived, on the grounds that a reader showing
+    /// base64 is more useful than one showing nothing.
     pub fn body_text(&self) -> String {
         let raw = self.body_bytes();
 

@@ -45,6 +45,10 @@ cargo run -p nntp-testserver -- --port 1119      # terminal 1
 cargo run -p nntp-tui -- --host 127.0.0.1 --port 1119 --no-tls   # terminal 2
 ```
 
+Add `--mime` to the server for a group of the MIME traffic a reader has to survive: a
+mail-to-news gateway multipart, an article in `format=flowed`, and an article that is
+nothing but an attachment.
+
 The bundled server is deliberately awkward — sparse article numbers, RFC 2047 encoded
 subjects, an unlabelled Latin-1 header, a body line beginning with a dot, a `Date` header
 no parser can read — because those are the cases that break news readers.

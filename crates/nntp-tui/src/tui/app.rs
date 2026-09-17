@@ -81,8 +81,18 @@ pub struct ArticleView {
     pub date: String,
     /// Header lines to show above the body, already decoded.
     pub headers: Vec<(String, String)>,
-    /// The body, split into lines.
+    /// The body, split into lines: the part chosen for display, decoded and unflowed.
     pub body: Vec<String>,
+    /// The parts that are not on screen — attachments, and the alternatives passed over —
+    /// one summary line each.
+    ///
+    /// Empty for the ordinary single-part article, which is most of Usenet.
+    pub attachments: Vec<String>,
+    /// Whether the article carries a signature, detached or inline.
+    ///
+    /// Only that one is *present*: nothing here verifies anything, and a reader implying
+    /// otherwise would be worse than one that stays quiet.
+    pub signed: bool,
 }
 
 impl ArticleView {
@@ -122,13 +132,27 @@ impl ArticleView {
             |date| date.format(date_format).to_string(),
         );
 
+        // `display_text` rather than `body_text`: the part a reader can read, with
+        // `format=flowed` applied, instead of the raw body with its MIME boundaries and
+        // base64 in it.
+        let mut body: Vec<String> = article.display_text().lines().map(str::to_owned).collect();
+        let attachments = article.attachments();
+
+        // An article that is nothing but an attachment would otherwise be a blank pane,
+        // which reads as a bug rather than as a fact about the article.
+        if body.is_empty() && !attachments.is_empty() {
+            body.push("(no text in this article)".to_owned());
+        }
+
         Self {
             number: article.number,
             subject: article.subject(),
             author: article.author(),
             date,
             headers,
-            body: article.body_text().lines().map(str::to_owned).collect(),
+            body,
+            attachments,
+            signed: article.is_signed(),
         }
     }
 }
@@ -611,6 +635,23 @@ impl App {
                 self.filter.pop();
                 self.group_cursor = 0;
             }
+
+            // Moving through what the filter left, without having to stop typing first.
+            // That is the whole point of an incremental filter, and leaving it out meant
+            // the arrow keys did nothing at all while the filter was open.
+            //
+            // The arrows and the page keys only: `j` and `k` are filter text here, and a
+            // filter that cannot contain the letter `j` would be a worse bug than the one
+            // this fixes.
+            KeyCode::Down => self.move_group_cursor(1),
+            KeyCode::Up => self.move_group_cursor(-1),
+            KeyCode::PageDown => self.move_group_cursor(self.page() as isize),
+            KeyCode::PageUp => self.move_group_cursor(-(self.page() as isize)),
+            KeyCode::Home => self.group_cursor = 0,
+            KeyCode::End => {
+                self.group_cursor = self.visible_groups().len().saturating_sub(1);
+            }
+
             KeyCode::Char(character) => {
                 self.filter.push(character);
                 self.group_cursor = 0;
@@ -618,6 +659,18 @@ impl App {
             _ => self.dirty = false,
         }
         Vec::new()
+    }
+
+    /// Moves the group cursor within the filtered list.
+    ///
+    /// Separate from [`Self::move_cursor`], which dispatches on the focused pane: while
+    /// the filter is open the target is always the group list, and a worker event can move
+    /// the focus — an overview reply arriving mid-typing sets it to the article pane — so
+    /// dispatching on focus here would send the arrow keys somewhere the user is not
+    /// looking.
+    fn move_group_cursor(&mut self, delta: isize) {
+        let count = self.visible_groups().len();
+        self.group_cursor = shift(self.group_cursor, delta, count);
     }
 
     /// Enter: open the group under the cursor, or the article under the cursor.
@@ -807,10 +860,7 @@ impl App {
 
     fn move_cursor(&mut self, delta: isize) {
         match self.focus {
-            Pane::Groups => {
-                let count = self.visible_groups().len();
-                self.group_cursor = shift(self.group_cursor, delta, count);
-            }
+            Pane::Groups => self.move_group_cursor(delta),
             Pane::Articles => {
                 let count = self.visible_articles().len();
                 self.article_cursor = shift(self.article_cursor, delta, count);
@@ -1217,6 +1267,114 @@ mod tests {
             app.selected_group().map(|g| g.name.as_str()),
             Some("comp.lang.rust")
         );
+    }
+
+    #[test]
+    fn the_arrows_move_through_the_filtered_list_while_still_typing() {
+        // The reported bug: with the filter open, Up and Down did nothing at all, so a
+        // filter that left several groups could not be used to pick one of them without
+        // pressing Enter first.
+        let mut app = app();
+        app.on_event(Event::Groups(some_groups()));
+
+        app.on_key(key(KeyCode::Char('/')));
+        for character in "lang".chars() {
+            app.on_key(key(KeyCode::Char(character)));
+        }
+        assert!(app.editing_filter, "still typing");
+        assert_eq!(app.visible_groups().len(), 2);
+        assert_eq!(
+            app.selected_group().map(|g| g.name.as_str()),
+            Some("comp.lang.rust")
+        );
+
+        app.on_key(key(KeyCode::Down));
+        assert_eq!(
+            app.selected_group().map(|g| g.name.as_str()),
+            Some("comp.lang.c"),
+            "Down should move within what the filter left"
+        );
+
+        app.on_key(key(KeyCode::Up));
+        assert_eq!(
+            app.selected_group().map(|g| g.name.as_str()),
+            Some("comp.lang.rust")
+        );
+
+        // And the filter itself is untouched by the movement.
+        assert_eq!(app.filter, "lang");
+        assert!(app.editing_filter);
+    }
+
+    #[test]
+    fn the_page_and_home_keys_work_while_typing_a_filter_too() {
+        let mut app = app();
+        app.on_event(Event::Groups(some_groups()));
+        app.on_key(key(KeyCode::Char('/')));
+
+        app.on_key(key(KeyCode::End));
+        assert_eq!(app.group_cursor, 3);
+        app.on_key(key(KeyCode::Home));
+        assert_eq!(app.group_cursor, 0);
+
+        app.on_key(key(KeyCode::PageDown));
+        assert_eq!(app.group_cursor, 3, "clamped at the end of the list");
+        app.on_key(key(KeyCode::PageUp));
+        assert_eq!(app.group_cursor, 0);
+
+        assert!(app.filter.is_empty(), "no movement key became filter text");
+        assert!(app.editing_filter);
+    }
+
+    #[test]
+    fn j_and_k_are_filter_text_rather_than_movement() {
+        // The other half of the fix: a filter that could not contain the letter `j` would
+        // be a worse bug than the one this replaced.
+        let mut app = app();
+        app.on_event(Event::Groups(some_groups()));
+        app.on_key(key(KeyCode::Char('/')));
+        app.on_key(key(KeyCode::Char('j')));
+        app.on_key(key(KeyCode::Char('k')));
+
+        assert_eq!(app.filter, "jk");
+        assert_eq!(app.group_cursor, 0);
+    }
+
+    #[test]
+    fn typing_more_of_the_filter_returns_the_cursor_to_the_top() {
+        // Narrowing the list can leave the cursor pointing at a different group than the
+        // one it was on, so it goes back to the top rather than somewhere arbitrary.
+        let mut app = app();
+        app.on_event(Event::Groups(some_groups()));
+        app.on_key(key(KeyCode::Char('/')));
+        app.on_key(key(KeyCode::Down));
+        assert_eq!(app.group_cursor, 1);
+
+        app.on_key(key(KeyCode::Char('m')));
+        assert_eq!(app.group_cursor, 0);
+    }
+
+    #[test]
+    fn an_overview_reply_during_filtering_does_not_steal_the_arrow_keys() {
+        // `move_cursor` dispatches on the focused pane, and an overview reply sets the
+        // focus to the article list. With the filter open the arrows must keep moving the
+        // group cursor regardless, or they would move something the user cannot see.
+        let mut app = app();
+        app.on_event(Event::Groups(some_groups()));
+        app.on_key(key(KeyCode::Char('/')));
+
+        app.on_event(Event::GroupOpened(Box::new(summary("misc.test", 1, 3, 3))));
+        app.on_event(Event::Overview {
+            group: GroupName::parse("misc.test").unwrap(),
+            records: vec![record(1, "one"), record(2, "two")],
+            skipped: 0,
+        });
+        assert_eq!(app.focus, Pane::Articles, "the reply moved the focus");
+
+        app.on_key(key(KeyCode::Down));
+
+        assert_eq!(app.group_cursor, 1, "the group cursor moved");
+        assert_eq!(app.article_cursor, 1, "and the article cursor did not");
     }
 
     #[test]

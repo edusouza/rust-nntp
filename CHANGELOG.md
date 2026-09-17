@@ -9,6 +9,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **MIME multipart bodies and `format=flowed`** ([#12]). The reader used to show the raw
+  body: boundary lines, part headers, base64 and the HTML copy of a message that had also
+  arrived as plain text. Now the body is a part tree, and the reader shows the part a
+  person can read.
+
+  `multipart/alternative` shows its plain-text part — the opposite of RFC 2046 §5.1.4's
+  "prefer the last part you can handle", which was written when the last part was the
+  richest one a reader could render; in a terminal, `text/html` is not something this
+  reader renders, it is something it would dump tags from. Everything not on screen is
+  *named* above the body with its type, filename and size, because an article whose text
+  says "see the attached patch" is confusing if the reader never mentions an attachment.
+  An article that is only an attachment says so instead of showing a blank pane.
+
+  `format=flowed` (RFC 3676) joins the sender's soft line breaks, so a message written in
+  a 70-column mail client is no longer a column of short lines. Quote depth is part of the
+  line, so a reply cannot absorb the text it quotes; `delsp=yes` deletes the marker space;
+  and `-- ` stays a hard break despite ending in a space.
+
+  `nntp-tui article --raw` is unchanged and still shows exactly what arrived.
+
+  `nntp-testserver --mime` serves a group of this traffic, so the feature can be seen
+  without a Usenet account, and the opt-in real-server suite gains a ninth test that
+  reports how much of a real group is multipart or flowed and asserts that every multipart
+  article yields either text or a named part.
+
+  **Signed articles**, found by pointing the reader at `linux.debian.changes` on a real
+  server. A mailing-list gateway signs nearly everything it relays, in two layers at once:
+  `multipart/signed` with a detached signature (RFC 3156), and the content clearsigned
+  *inside* the text part (RFC 4880 §7). Both layers were on screen — an armour header, a
+  `Hash:` line and a dozen lines of base64 in the middle of every announcement, plus
+  "1 other part: application/pgp-signature" on every one of them.
+
+  Now the armour is stripped, dash-escaping is undone so a signed patch does not read
+  `- --- a/file`, the detached signature is not listed among the attachments, and the fact
+  is reported in one line: `signed (signature not checked)`. That wording is exact —
+  nothing here verifies anything, because this project does no cryptography, and a reader
+  implying a signature had been checked would be worse than one that stays quiet.
+
 - **Read and unread state, remembered between runs** ([#7] — the largest functional gap in
   v0.1.0). Stored in the `.newsrc` format, one file per server under the platform data
   directory, because article numbers are the server's own and the same group on two
@@ -37,6 +75,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   corrupted store, where the reader opened, reported the fault, and kept the readable
   groups. Recorded in
   [`docs/protocol-coverage.md`](docs/protocol-coverage.md#read-state-checked-by-hand).
+
+### Fixed
+
+- **The arrow keys did nothing while a group filter was being typed** — so a filter that
+  left several groups could not be used to pick one of them without pressing `Enter`
+  first, which is most of the point of an incremental filter. `↑`, `↓`, `PageUp`,
+  `PageDown`, `Home` and `End` now move through what the filter left; `j` and `k`
+  deliberately do not, because they are filter text, and a filter that could not contain
+  the letter `j` would be a worse bug than the one it replaced.
+
+  Reported from real use. The fix also covers a race the report did not mention: an
+  overview reply arriving while the filter is open moves the focus to the article pane, so
+  cursor movement during filtering now targets the group list explicitly rather than
+  whichever pane happens to be focused.
 
 ### Changed
 
@@ -270,4 +322,5 @@ records what was checked, against which server, on what date ([#4]).
 [#4]: https://github.com/edusouza/rust-nntp/issues/4
 [#7]: https://github.com/edusouza/rust-nntp/issues/7
 [#9]: https://github.com/edusouza/rust-nntp/issues/9
+[#12]: https://github.com/edusouza/rust-nntp/issues/12
 [#17]: https://github.com/edusouza/rust-nntp/issues/17

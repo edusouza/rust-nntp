@@ -201,11 +201,16 @@ while something is outstanding.
 | `M` | mark the article under the cursor read, or unread if it was read |
 | `c` | catch up: mark the whole group read |
 | `/` | filter groups by name or description |
+| `↑` `↓` `PageUp` `PageDown` `Home` `End` while filtering | move through what the filter left, without leaving the filter |
 | `Esc` | clear the filter, or close an overlay |
 | `r` | reload the focused pane |
 | `m` | recent messages |
 | `?` or `F1` | help |
 | `q` or `Ctrl-C` | quit |
+
+While a filter is being typed, the arrows and the page keys move through the groups it
+left — `j` and `k` cannot, because they are filter text. `Enter` closes the filter and
+keeps it applied; a second `Enter` opens the group under the cursor.
 
 The cursor clamps at the ends of a list rather than wrapping: a list that jumps back to
 the top when you hold a key down is disorienting, and a news reader is mostly held-down
@@ -229,6 +234,26 @@ keys.
   and red when the connection has dropped. The worker reconnects on the next request, so
   a dropped connection is a nuisance rather than the end of the session.
 - **Quoted lines are dimmed.** On Usenet most of a follow-up is quotation.
+- **"n other parts" above the body** lists what the article carried that is not on screen:
+  attachments, and the HTML copy of a message that also arrived as plain text. A
+  `multipart/alternative` from a mail-to-news gateway shows its plain-text half; anything
+  the reader cannot render is named, with its type and size, rather than dumped into the
+  pane. An article that is *only* an attachment says `(no text in this article)` instead of
+  showing a blank pane.
+- **Paragraphs wrapped by the sender are rejoined** when the article says
+  `format=flowed` (RFC 3676), so a message written in a 70-column mail client does not
+  arrive as a column of short lines. Quote depth is respected, so a reply never absorbs
+  the text it is quoting, and a `-- ` signature separator stays a break.
+- **`signed (signature not checked)`** appears for an article carrying a PGP or S/MIME
+  signature — the detached kind, or inline clearsign armour. The signed text is shown
+  without the armour, the `Hash:` header or the signature block, and dash-escaping is
+  undone so a signed patch does not read `- --- a/file`. The wording is exact: **nothing
+  here verifies a signature.** This project does no cryptography, and a reader that
+  implied a signature had been checked would be worse than one that says nothing. Mailing-
+  list gateways sign nearly everything they relay, which is why the signature is reported
+  as a fact about the article rather than listed among its parts.
+- **`nntp-tui article --raw`** shows the body exactly as it arrived — boundaries, base64
+  and all — when you need to see what the sender actually sent.
 - **An error takes over the status bar** until the next keystroke; `m` shows the ones that
   have scrolled past.
 

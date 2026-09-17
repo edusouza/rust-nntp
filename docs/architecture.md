@@ -25,6 +25,7 @@
                             │ &[u8] in, parsed values out
 ┌───────────────────────────▼──────────────────────────────────────────┐
 │ nntp-proto          lib: the grammar (no IO, no clock)               │
+│   body              MIME part trees, format=flowed                    │
 │   response          status codes and classification                   │
 │   command           encoding + CRLF-injection refusal                 │
 │   block             dot-stuffing both ways, terminator detection      │

@@ -89,7 +89,9 @@ divergence it found is noted under `GROUP`.
 | RFC 5322 header folding/unfolding | ✅ | Unfolded per §2.2.3; unparseable lines collected rather than dropped. |
 | RFC 5322 `Date` parsing | ✅ | Plus the obsolete forms of §4.3 and the malformed ones seen in practice. |
 | RFC 2047 encoded words in headers | ✅ | `B` and `Q`, adjacent-word whitespace elision, split across folds. |
-| MIME multipart bodies | ⬜ | v0.2. The raw body, boundaries included, is shown meanwhile. |
+| MIME multipart bodies | ✅ | Split per RFC 2046 §5.1.1. `multipart/alternative` shows the plain-text part, other types the first text part; everything else is named rather than dumped. Depth and part-count limits bound remote input. |
+| `format=flowed` (RFC 3676) | ✅ | Soft breaks joined, quote depth respected, `delsp=yes` honoured, `-- ` still a hard break. |
+| Signed articles | ✅ display | `multipart/signed` (RFC 3156) shows the signed part and reports the signature as a fact rather than an attachment; inline clearsign armour (RFC 4880 §7) is stripped, dash-escaping undone. **Nothing is verified** — no cryptography here, and a reader implying otherwise would be worse than one that says nothing. |
 | `quoted-printable` / `base64` body decoding | ✅ | Brought forward from v0.2: unreadable bodies were too common without it. |
 | Non-UTF-8 body charsets | ✅ | Declared charsets via `encoding_rs`; unlabelled 8-bit falls back to Windows-1252. |
 | yEnc / uuencode attachments | 🚫 v0.1 | Binary groups are out of scope for the first release. |
