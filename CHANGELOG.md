@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+Nothing yet. `v0.1.0` is the current release; [#3] is the roadmap for what comes next.
+
+## [0.1.0] — 2026-09-17
+
+First release: a read-only Usenet reader. It connects, lists groups, lists articles and
+displays them, over TLS, with authentication, from a terminal.
+
+What it does **not** do yet, in order of how much it matters: read/unread state is not kept
+between sessions ([#7]), a long request cannot be cancelled ([#9]), and posting, threading
+and a disk cache are all later milestones. See [#3] for the roadmap.
+
+It also agrees with a real news server, which is the only claim here that the offline test
+suite cannot make on its own: the opt-in suite passes against INN 2.8.0, and
+[`docs/protocol-coverage.md`](docs/protocol-coverage.md#verified-against-a-real-server)
+records what was checked, against which server, on what date ([#4]).
+
 ### Added
 
 - `password_env` / `--password-env`: read the password from an environment variable, with
@@ -32,45 +48,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   record. The numbers are in
   [`docs/protocol-coverage.md`](docs/protocol-coverage.md#verified-against-a-real-server);
   this closes [#4].
-
-### Fixed
-
-- A `411` reply no longer has the group name read out of it. RFC 3977 §6.1.1 does not
-  require the response to name the group and INN does not: it answers
-  `411 No such newsgroup`, so taking the first word produced
-  `NoSuchGroup { group: "No" }`. The requested name is now always substituted — the caller
-  is the only reliable source — and the server's own text is kept alongside it, because a
-  `411` sometimes means "access denied" rather than "no such group".
-
-  Found on the first run against a real server (INN 2.8.0 at `news.eternal-september.org`).
-  The fake server had been emitting `411 <group> is not a valid newsgroup`, which begins
-  with the group name and so *confirmed* the client's assumption instead of exposing it —
-  precisely the shared-misunderstanding failure that
-  [ADR-0004](docs/adr/0004-fake-server-for-tests.md) predicted. It now uses INN's wording,
-  and a test asserts it carries no group name.
-
-### Changed
-
-- Password resolution takes its environment lookup and its shell as parameters, so the
-  precedence rules are tested without mutating process-global state. `unsafe_code` is
-  `forbid`den workspace-wide, which rules out `std::env::set_var` in a test — and that
-  turned out to be the right constraint: the tests it forced are better ones.
-
-## [0.1.0] — 2026-09-17
-
-First release: a read-only Usenet reader. It connects, lists groups, lists articles and
-displays them, over TLS, with authentication, from a terminal.
-
-What it does **not** do yet, in order of how much it matters: read/unread state is not kept
-between sessions ([#7]), a long request cannot be cancelled ([#9]), and posting, threading
-and a disk cache are all later milestones. See [#3] for the roadmap.
-
-Agreement with a real news server ([#4]) was the last open question at the time this section
-was written; it was answered before the tag, by the run recorded in
-[`docs/protocol-coverage.md`](docs/protocol-coverage.md#verified-against-a-real-server).
-
-### Added
-
 - `nntp-proto`, the IO-free protocol layer:
   - status-line parsing with response-code classification, and named codes (RFC 3977 §3.2);
   - typed commands with validated encoding — arguments containing control characters are
@@ -190,6 +167,19 @@ was written; it was answered before the tag, by the run recorded in
 
 ### Fixed
 
+- A `411` reply no longer has the group name read out of it. RFC 3977 §6.1.1 does not
+  require the response to name the group and INN does not: it answers
+  `411 No such newsgroup`, so taking the first word produced
+  `NoSuchGroup { group: "No" }`. The requested name is now always substituted — the caller
+  is the only reliable source — and the server's own text is kept alongside it, because a
+  `411` sometimes means "access denied" rather than "no such group".
+
+  Found on the first run against a real server (INN 2.8.0 at `news.eternal-september.org`).
+  The fake server had been emitting `411 <group> is not a valid newsgroup`, which begins
+  with the group name and so *confirmed* the client's assumption instead of exposing it —
+  precisely the shared-misunderstanding failure that
+  [ADR-0004](docs/adr/0004-fake-server-for-tests.md) predicted. It now uses INN's wording,
+  and a test asserts it carries no group name.
 - The network worker no longer swallows a dropped connection while fetching the optional
   group descriptions. A *refusal* of `LIST NEWSGROUPS` is fine to ignore — plenty of
   servers do not offer it — but a connection failure left the worker holding an unusable
@@ -216,6 +206,13 @@ was written; it was answered before the tag, by the run recorded in
   break is stripped instead (RFC 2045 §6.7 rule 3), and whitespace written as an explicit
   `=20` escape is never stripped — that is what keeps a `-- ` signature separator intact.
   Found by the transcript integration test, not by a unit test.
+
+### Changed
+
+- Password resolution takes its environment lookup and its shell as parameters, so the
+  precedence rules are tested without mutating process-global state. `unsafe_code` is
+  `forbid`den workspace-wide, which rules out `std::env::set_var` in a test — and that
+  turned out to be the right constraint: the tests it forced are better ones.
 
 [Unreleased]: https://github.com/edusouza/rust-nntp/compare/v0.1.0...HEAD
 [0.1.0]: https://github.com/edusouza/rust-nntp/releases/tag/v0.1.0
