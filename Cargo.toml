@@ -26,7 +26,12 @@ nntp-testserver = { path = "crates/nntp-testserver", version = "0.1.0" }
 
 # External
 anyhow = "1.0"
-base64 = "0.22"
+# 0.23 added SIMD engines behind a default-on `simd-unsafe` feature. They are declined
+# here: this crate decodes base64 that arrives from a remote peer, the decoder is nowhere
+# near a bottleneck for article-sized input, and `unsafe_code` is forbidden in our own
+# code for exactly the reason that makes a brand-new hand-written SIMD decoder a poor
+# trade at this point. Revisit once it has mileage — the scalar engine's API is identical.
+base64 = { version = "0.23", default-features = false, features = ["std"] }
 chrono = { version = "0.4", default-features = false, features = ["std", "clock", "alloc"] }
 clap = { version = "4", features = ["derive", "env"] }
 crossterm = "0.29"
@@ -39,7 +44,7 @@ rustls-pemfile = "2"
 rustls-pki-types = "1"
 serde = { version = "1", features = ["derive"] }
 thiserror = "2"
-toml = "0.9"
+toml = "1.1"
 tracing = "0.1"
 tracing-appender = "0.2"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
