@@ -926,6 +926,8 @@ dependencies = [
 name = "nntp-client"
 version = "0.1.0"
 dependencies = [
+ "chrono",
+ "memchr",
  "nntp-proto",
  "pretty_assertions",
  "rustls",

@@ -30,6 +30,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     zones, missing seconds, nested comments).
 - Validated newtypes (`MessageId`, `GroupName`, `HeaderName`, `Wildmat`) so that anything
   reaching a command line has already been checked for CRLF injection.
+- `nntp-client`, the blocking client:
+  - `Connection<S>` framing over any `Read + Write`, with per-line and per-block size
+    limits and a poisoned-connection flag so a truncated read can never be mistaken for
+    the next response;
+  - `Client<S>` with one method per command, holding the session state those commands
+    depend on: capabilities, selected group, authentication, and which overview command
+    this server actually accepts;
+  - opening negotiation that copes with transit servers (`MODE READER`) and with servers
+    that predate `CAPABILITIES`;
+  - automatic `OVER` → `XOVER` fallback, decided from capabilities where possible and
+    from a refusal where not, then remembered for the session;
+  - streaming variants of `LIST` and `OVER` so a multi-megabyte response does not have to
+    be buffered before the caller sees anything;
+  - a `ClientError` taxonomy organised by what the caller can do about it, with
+    `is_connection_fatal`, `is_transient` and `needs_authentication`;
+  - a TCP connector with connect/read/write timeouts that tries every resolved address.
 - Integration tests driving the public API with captured INN-shaped output.
 - Cargo workspace skeleton with four crates (`nntp-proto`, `nntp-client`,
   `nntp-testserver`, `nntp-tui`), shared lint configuration and dual MIT/Apache-2.0
@@ -37,6 +53,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - GitHub Actions CI running `cargo fmt --check`, `cargo clippy -D warnings`,
   `cargo test` and a release build.
 - Documentation scaffold: architecture notes, ADR directory, RFC 3977 coverage matrix.
+
+### Security
+
+- `AUTHINFO PASS` is refused on an unencrypted connection unless the caller explicitly
+  opts in. Sending a password in clear text should be a decision, not a default.
+- Passwords are redacted from command logs at the point of encoding, so no log level can
+  reveal one.
 
 ### Fixed
 

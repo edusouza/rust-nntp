@@ -16,6 +16,8 @@ default = ["tls"]
 tls = ["dep:rustls", "dep:rustls-pki-types", "dep:webpki-roots"]
 
 [dependencies]
+chrono.workspace = true
+memchr.workspace = true
 nntp-proto.workspace = true
 rustls = { workspace = true, optional = true }
 rustls-pki-types = { workspace = true, optional = true }

@@ -12,21 +12,21 @@ the client or surfaced in the UI · ⬜ not implemented · 🚫 out of scope for
 
 | Command | Status | Notes |
 | --- | --- | --- |
-| `CAPABILITIES` | 🟡 | Grammar and query API in `nntp-proto`; not yet issued by a client. |
-| `MODE READER` | 🟡 | Encoded; sent when capabilities advertise `MODE-READER` without `READER`. |
-| `QUIT` | 🟡 | Encoded. |
+| `CAPABILITIES` | ✅ | Issued during the handshake; a `500` is handled as "assume RFC 2980". |
+| `MODE READER` | ✅ | Sent when capabilities advertise `MODE-READER` without `READER`, or when there are no capabilities at all. |
+| `QUIT` | ✅ | A server that drops the socket instead of answering is not treated as an error. |
 
 ### Article posting and retrieval (§6)
 
 | Command | Status | Notes |
 | --- | --- | --- |
-| `GROUP` | 🟡 | Encoded; `211` response parsed, including the `low > high` spelling of an empty group. |
+| `GROUP` | ✅ | Including the `low > high` spelling of an empty group, and filling in the group name when a `411` omits it. |
 | `LISTGROUP` | 🟡 | Encoded, including the `group range` form. |
 | `LAST` / `NEXT` | 🟡 | Encoded. |
-| `ARTICLE` | 🟡 | Encoded; response split into headers and body. |
-| `HEAD` | 🟡 | Encoded; response parsed as a headers-only article. |
-| `BODY` | 🟡 | Encoded. |
-| `STAT` | 🟡 | Encoded. |
+| `ARTICLE` | ✅ | |
+| `HEAD` | ✅ | |
+| `BODY` | ✅ | |
+| `STAT` | ✅ | Article number `0` is reported as "not applicable" rather than as article zero. |
 | `POST` | 🚫 v0.1 | Planned for v0.2. |
 | `IHAVE` | 🚫 | Transit command, not used by readers. |
 
@@ -34,24 +34,24 @@ the client or surfaced in the UI · ⬜ not implemented · 🚫 out of scope for
 
 | Command | Status | Notes |
 | --- | --- | --- |
-| `DATE` | 🟡 | Encoded; `111 yyyymmddhhmmss` parsed. |
-| `HELP` | 🟡 | Encoded. |
+| `DATE` | ✅ | |
+| `HELP` | ✅ | |
 | `NEWGROUPS` | 🟡 | Encoded with a four-digit year in GMT. |
 | `NEWNEWS` | ⬜ | Optional and frequently disabled by servers. |
-| `LIST ACTIVE` | 🟡 | Encoded; lines parsed (note: `high` precedes `low`, unlike `GROUP`). |
+| `LIST ACTIVE` | ✅ | Streaming variant available. Note: `high` precedes `low`, unlike `GROUP`. |
 | `LIST ACTIVE.TIMES` | 🟡 | Encoded; creation time and creator parsed. |
-| `LIST NEWSGROUPS` | 🟡 | Encoded; tab- and space-separated descriptions both accepted. |
-| `LIST OVERVIEW.FMT` | 🟡 | Encoded and parsed, including `:full` fields and a leading `:number`. |
+| `LIST NEWSGROUPS` | ✅ | Tab- and space-separated descriptions both accepted. |
+| `LIST OVERVIEW.FMT` | ✅ | Fetched once per session and cached; a refusal falls back to the standard layout. |
 | `LIST HEADERS` | 🟡 | Encoded. |
 | `LIST DISTRIB.PATS` | 🚫 | Posting-only. |
-| `OVER` | 🟡 | Encoded (range, message-id and current forms); records parsed. |
+| `OVER` | ✅ | Streaming variant available; falls back to `XOVER` on refusal. |
 | `HDR` | 🟡 | Encoded. |
 
 ## RFC 2980 — Common NNTP extensions (pre-RFC-3977)
 
 | Command | Status | Notes |
 | --- | --- | --- |
-| `XOVER` | 🟡 | Encoded; same record parser as `OVER`. Fallback when `OVER` is not advertised. |
+| `XOVER` | ✅ | Chosen directly when capabilities omit `OVER`, or after `OVER` is refused; the choice is remembered. |
 | `XHDR` | 🟡 | Encoded. |
 | `XPAT` | ⬜ | Server-side search; useful but rarely enabled. |
 | `AUTHINFO SIMPLE` | 🚫 | Obsolete and insecure. |
@@ -68,7 +68,7 @@ the client or surfaced in the UI · ⬜ not implemented · 🚫 out of scope for
 
 | Command | Status | Notes |
 | --- | --- | --- |
-| `AUTHINFO USER` / `PASS` | 🟡 | Encoded, with the password redacted from logs. Refusal on a plaintext link is milestone M4. |
+| `AUTHINFO USER` / `PASS` | ✅ | Refused on a plaintext link unless explicitly allowed; password redacted from logs; capabilities re-read afterwards per RFC 4643 §2.1. |
 | `AUTHINFO SASL` | ⬜ | Needed by a minority of commercial providers. |
 
 ## RFC 8054 — Compression
