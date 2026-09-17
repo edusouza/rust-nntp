@@ -21,8 +21,8 @@ the client or surfaced in the UI · ⬜ not implemented · 🚫 out of scope for
 | Command | Status | Notes |
 | --- | --- | --- |
 | `GROUP` | ✅ | Including the `low > high` spelling of an empty group, and filling in the group name when a `411` omits it. |
-| `LISTGROUP` | 🟡 | Encoded, including the `group range` form. |
-| `LAST` / `NEXT` | 🟡 | Encoded. |
+| `LISTGROUP` | 🟡 | Encoded and served by the test server; the client has no method for it yet. |
+| `LAST` / `NEXT` | 🟡 | Encoded and served by the test server; the client has no method for it yet. |
 | `ARTICLE` | ✅ | |
 | `HEAD` | ✅ | |
 | `BODY` | ✅ | |
@@ -39,7 +39,7 @@ the client or surfaced in the UI · ⬜ not implemented · 🚫 out of scope for
 | `NEWGROUPS` | 🟡 | Encoded with a four-digit year in GMT. |
 | `NEWNEWS` | ⬜ | Optional and frequently disabled by servers. |
 | `LIST ACTIVE` | ✅ | Streaming variant available. Note: `high` precedes `low`, unlike `GROUP`. |
-| `LIST ACTIVE.TIMES` | 🟡 | Encoded; creation time and creator parsed. |
+| `LIST ACTIVE.TIMES` | 🟡 | Encoded, parsed and served; the client has no method for it yet. |
 | `LIST NEWSGROUPS` | ✅ | Tab- and space-separated descriptions both accepted. |
 | `LIST OVERVIEW.FMT` | ✅ | Fetched once per session and cached; a refusal falls back to the standard layout. |
 | `LIST HEADERS` | 🟡 | Encoded. |

@@ -26,6 +26,7 @@ tracing.workspace = true
 webpki-roots = { workspace = true, optional = true }
 
 [dev-dependencies]
+nntp-testserver.workspace = true
 pretty_assertions.workspace = true
 
 [lints]

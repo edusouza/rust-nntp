@@ -159,7 +159,13 @@ impl ClientError {
                     text
                 },
             },
-            codes::UNKNOWN_COMMAND | codes::SYNTAX_ERROR => Self::CommandNotSupported { command },
+            // Only 500 and 503 say anything about the command itself. A 501 is a
+            // complaint about *these arguments* — a server that rejects an open-ended
+            // OVER range answers 501 — so it must not be read as "this server has no
+            // OVER", or one bad request would disable the feature for the session.
+            codes::UNKNOWN_COMMAND | codes::FEATURE_NOT_SUPPORTED => {
+                Self::CommandNotSupported { command }
+            }
             code => Self::Server {
                 command,
                 code,
@@ -280,15 +286,28 @@ mod tests {
 
     #[test]
     fn maps_unimplemented_commands_so_callers_can_fall_back() {
-        // This is the signal to retry with XOVER instead of OVER.
+        // 500 and 503 are the signal to retry with XOVER instead of OVER.
         assert!(matches!(
             ClientError::from_status("OVER", &status("500 unknown command")),
             ClientError::CommandNotSupported { command: "OVER" }
         ));
         assert!(matches!(
-            ClientError::from_status("OVER", &status("501 syntax error")),
-            ClientError::CommandNotSupported { .. }
+            ClientError::from_status("OVER", &status("503 not supported")),
+            ClientError::CommandNotSupported { command: "OVER" }
         ));
+    }
+
+    #[test]
+    fn a_syntax_error_is_about_the_arguments_not_the_command() {
+        // Servers answer 501 to an OVER range with an open upper bound. Treating that as
+        // "this server has no OVER" would disable overview for the whole session over one
+        // bad request.
+        let error = ClientError::from_status("OVER", &status("501 open ranges unsupported"));
+        assert!(
+            matches!(&error, ClientError::Server { code, .. } if code.as_u16() == 501),
+            "got {error:?}"
+        );
+        assert!(!error.is_connection_fatal());
     }
 
     #[test]

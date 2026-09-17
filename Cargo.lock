@@ -929,6 +929,7 @@ dependencies = [
  "chrono",
  "memchr",
  "nntp-proto",
+ "nntp-testserver",
  "pretty_assertions",
  "rustls",
  "rustls-pki-types",

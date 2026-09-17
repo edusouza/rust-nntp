@@ -525,25 +525,27 @@ impl<S: Read + Write> Client<S> {
             return Ok(());
         }
 
-        // Some servers advertise nothing and implement only XOVER; others advertise OVER
-        // and reject it for a range. Either way, one fallback attempt is worth making.
-        let unsupported = matches!(
+        // Only 500 ("command not recognised") and 503 ("feature not supported") say
+        // anything about the command. A 501 is a complaint about *these arguments* —
+        // refusing an open-ended range is the common case — so it must leave the
+        // remembered style alone, or one awkward request would disable overview for the
+        // rest of the session.
+        let verb_unsupported = matches!(
             line.code,
-            codes::UNKNOWN_COMMAND | codes::SYNTAX_ERROR | codes::FEATURE_NOT_SUPPORTED
+            codes::UNKNOWN_COMMAND | codes::FEATURE_NOT_SUPPORTED
         );
-        if unsupported && name == "OVER" {
-            tracing::debug!("server rejected OVER; falling back to XOVER");
+
+        if verb_unsupported && name == "OVER" {
+            tracing::debug!("server does not implement OVER; falling back to XOVER");
             self.overview_style = OverviewStyle::XOver;
             return self.overview_streaming(range, fmt, on_record);
         }
-        if unsupported {
+        if verb_unsupported {
+            tracing::warn!("server implements neither OVER nor XOVER");
             self.overview_style = OverviewStyle::Unavailable;
         }
 
-        Err(ClientError::from_status(
-            if name == "OVER" { "OVER" } else { "XOVER" },
-            &line,
-        ))
+        Err(ClientError::from_status(name, &line))
     }
 
     /// Fetches a whole article with `ARTICLE`.

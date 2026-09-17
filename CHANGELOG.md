@@ -46,6 +46,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - a `ClientError` taxonomy organised by what the caller can do about it, with
     `is_connection_fatal`, `is_transient` and `needs_authentication`;
   - a TCP connector with connect/read/write timeouts that tries every resolved address.
+- `nntp-testserver`, a fake NNTP server:
+  - an in-memory corpus, deliberately awkward: sparse article numbers, RFC 2047 subjects
+    in both encodings, an unlabelled Latin-1 header, a body line beginning with `.`, a
+    `Date` no parser can read, a moderated group and an empty group;
+  - four capability profiles — modern, no-`OVER`, transit (`MODE READER` required) and
+    pre-RFC-3977 — plus optional `AUTHINFO` credentials;
+  - quirks that reproduce real misbehaviour on demand: refusing `LIST OVERVIEW.FMT`,
+    refusing open-ended `OVER` ranges, advertising `OVER` but refusing it, truncating a
+    block and hanging up, sending a line far past any limit, speaking bare LF, and
+    disappearing mid-session;
+  - a `TestServer` that binds an ephemeral loopback port so tests run in parallel, and a
+    standalone binary for driving the reader offline.
+- End-to-end tests: the real client over a real socket against that server, covering the
+  full reading session and each misbehaviour above.
 - Integration tests driving the public API with captured INN-shaped output.
 - Cargo workspace skeleton with four crates (`nntp-proto`, `nntp-client`,
   `nntp-testserver`, `nntp-tui`), shared lint configuration and dual MIT/Apache-2.0
@@ -63,6 +77,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- A `501` reply is no longer read as "this server does not implement the command". Only
+  `500` and `503` say anything about the command; `501` is a complaint about the
+  *arguments*, and servers use it to refuse an `OVER` range with an open upper bound.
+  Before this fix, one such request disabled overview fetching for the rest of the
+  session, because the client remembered "no `OVER`, no `XOVER`" and never tried again.
+  Found by pointing the client at a fake server configured to refuse open-ended ranges —
+  which is exactly what `nntp-testserver` exists for.
 - `quoted-printable` decoding no longer strips whitespace before a *soft* line break,
   which turned `this to =\r\nsay` into `this tosay`. Whitespace before a *hard* line
   break is stripped instead (RFC 2045 §6.7 rule 3), and whitespace written as an explicit
