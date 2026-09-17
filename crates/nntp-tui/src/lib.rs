@@ -13,6 +13,7 @@
 //! - [`commands`] — the command-line subcommands, including `doctor`.
 //! - [`tui`] — the terminal interface: state machine, drawing and network worker.
 //! - [`logging`] — where log records go, which differs between the two modes.
+//! - [`readstate`] — which articles have been read, and where that is remembered.
 #![cfg_attr(
     test,
     allow(
@@ -27,6 +28,7 @@ pub mod cli;
 pub mod commands;
 pub mod config;
 pub mod logging;
+pub mod readstate;
 pub mod session;
 pub mod tui;
 
