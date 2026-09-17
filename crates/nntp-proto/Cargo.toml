@@ -1,0 +1,24 @@
+[package]
+name = "nntp-proto"
+description = "IO-free NNTP (RFC 3977) protocol layer: response, command and article grammar"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[dependencies]
+base64.workspace = true
+chrono.workspace = true
+encoding_rs.workspace = true
+memchr.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+pretty_assertions.workspace = true
+
+[lints]
+workspace = true

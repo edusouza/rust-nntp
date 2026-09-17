@@ -1,0 +1,73 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+
+jobs:
+  fmt:
+    name: rustfmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Install toolchain
+        run: rustup component add rustfmt
+      - run: cargo fmt --all -- --check
+
+  clippy:
+    name: clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Install toolchain
+        run: rustup component add clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+
+  test:
+    name: test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v5
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --workspace --all-features
+      - name: Build with default features only
+        run: cargo build --workspace
+
+  docs:
+    name: rustdoc
+    runs-on: ubuntu-latest
+    env:
+      RUSTDOCFLAGS: -D warnings
+    steps:
+      - uses: actions/checkout@v5
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo doc --workspace --all-features --no-deps
+
+  msrv:
+    name: minimum supported Rust version
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Install MSRV toolchain
+        run: |
+          msrv="$(sed -n 's/^rust-version = "\(.*\)"/\1/p' Cargo.toml | head -1)"
+          echo "Pinning to $msrv"
+          rustup toolchain install "$msrv" --profile minimal
+          rustup override set "$msrv"
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo check --workspace --all-features

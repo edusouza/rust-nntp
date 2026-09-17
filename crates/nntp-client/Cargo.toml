@@ -1,0 +1,30 @@
+[package]
+name = "nntp-client"
+description = "Blocking NNTP (RFC 3977) client with optional TLS, built on nntp-proto"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[features]
+default = ["tls"]
+## Implicit TLS and STARTTLS support via rustls.
+tls = ["dep:rustls", "dep:rustls-pki-types", "dep:webpki-roots"]
+
+[dependencies]
+nntp-proto.workspace = true
+rustls = { workspace = true, optional = true }
+rustls-pki-types = { workspace = true, optional = true }
+thiserror.workspace = true
+tracing.workspace = true
+webpki-roots = { workspace = true, optional = true }
+
+[dev-dependencies]
+pretty_assertions.workspace = true
+
+[lints]
+workspace = true

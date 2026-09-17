@@ -1,0 +1,15 @@
+# Rust build artifacts
+/target/
+**/*.rs.bk
+
+# Cargo.lock is committed: this workspace produces binaries (see docs/adr/0006-commit-cargo-lock.md)
+
+# Editors / OS
+.idea/
+.vscode/
+*.swp
+.DS_Store
+
+# Local runtime state
+/.nntp-tui/
+*.log
