@@ -7,7 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-Nothing yet. `v0.1.0` is the current release; [#3] is the roadmap for what comes next.
+### Changed
+
+- `base64` 0.22 → 0.23, with `default-features = false`. 0.23 turns on a `simd-unsafe`
+  feature by default; this crate decodes base64 that arrives from a remote peer, the
+  decoder is not a bottleneck for article-sized input, and the scalar engine's API is
+  identical — so the SIMD engines are declined for now rather than inherited silently. The
+  lenient decoder still tolerates the missing padding and trailing bits that real RFC 2047
+  encoded words carry, which was the acceptance criterion.
+- `toml` 0.9 → 1.1 and `actions/checkout` v5 → v7. Neither needed a code change; the
+  `checkout` major is a security default about `pull_request_target` and `workflow_run`,
+  which this workflow does not use. Closes [#17].
 
 ## [0.1.0] — 2026-09-17
 
@@ -220,3 +230,4 @@ records what was checked, against which server, on what date ([#4]).
 [#4]: https://github.com/edusouza/rust-nntp/issues/4
 [#7]: https://github.com/edusouza/rust-nntp/issues/7
 [#9]: https://github.com/edusouza/rust-nntp/issues/9
+[#17]: https://github.com/edusouza/rust-nntp/issues/17
