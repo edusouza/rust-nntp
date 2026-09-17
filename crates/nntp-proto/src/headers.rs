@@ -301,10 +301,10 @@ pub(crate) fn split_lines(block: &[u8]) -> Vec<&[u8]> {
         start = end + 1;
     }
 
-    if let Some(tail) = block.get(start..) {
-        if !tail.is_empty() {
-            lines.push(tail.strip_suffix(b"\r").unwrap_or(tail));
-        }
+    if let Some(tail) = block.get(start..)
+        && !tail.is_empty()
+    {
+        lines.push(tail.strip_suffix(b"\r").unwrap_or(tail));
     }
 
     lines

@@ -215,11 +215,11 @@ impl<'a> Session<'a> {
 
     fn dispatch(&mut self, line: &[u8], output: &mut impl Write) -> std::io::Result<Flow> {
         self.state.commands_served += 1;
-        if let Some(limit) = self.config.quirks.close_after_commands {
-            if self.state.commands_served > limit {
-                // Vanish without a word, as an overloaded server does.
-                return Ok(Flow::Close);
-            }
+        if let Some(limit) = self.config.quirks.close_after_commands
+            && self.state.commands_served > limit
+        {
+            // Vanish without a word, as an overloaded server does.
+            return Ok(Flow::Close);
         }
 
         let text = String::from_utf8_lossy(line).into_owned();
@@ -585,15 +585,15 @@ impl<'a> Session<'a> {
         }
 
         // The message-id form works without a selected group.
-        if let Some(arg) = args.first() {
-            if arg.starts_with('<') {
-                let Some((group, number, article)) = self.corpus.find_by_id(arg) else {
-                    return self.status(output, 430, "no such article");
-                };
-                let line = article.overview_line(number, &group.name);
-                self.status(output, 224, "overview information follows")?;
-                return self.block(output, [line.as_slice()]);
-            }
+        if let Some(arg) = args.first()
+            && arg.starts_with('<')
+        {
+            let Some((group, number, article)) = self.corpus.find_by_id(arg) else {
+                return self.status(output, 430, "no such article");
+            };
+            let line = article.overview_line(number, &group.name);
+            self.status(output, 224, "overview information follows")?;
+            return self.block(output, [line.as_slice()]);
         }
 
         let Some(group) = self.selected_group().cloned() else {

@@ -78,10 +78,10 @@ impl MessageId {
             let Some(close) = after_open.find('>') else {
                 break;
             };
-            if let Some(candidate) = after_open.get(..=close) {
-                if let Ok(id) = Self::parse(candidate) {
-                    out.push(id);
-                }
+            if let Some(candidate) = after_open.get(..=close)
+                && let Ok(id) = Self::parse(candidate)
+            {
+                out.push(id);
             }
             rest = after_open.get(close + 1..).unwrap_or_default();
         }

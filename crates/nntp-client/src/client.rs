@@ -679,10 +679,11 @@ impl<S: Read + Write> Client<S> {
         command: Command,
         expected: ResponseCode,
     ) -> Result<(ArticleId, DataBlock)> {
-        if let Command::Article(spec) | Command::Head(spec) | Command::Body(spec) = &command {
-            if spec.needs_selected_group() && self.group.is_none() {
-                return Err(ClientError::NoGroupSelected { command: name });
-            }
+        if let Command::Article(spec) | Command::Head(spec) | Command::Body(spec) = &command
+            && spec.needs_selected_group()
+            && self.group.is_none()
+        {
+            return Err(ClientError::NoGroupSelected { command: name });
         }
 
         let line = self.connection.command(&command)?;

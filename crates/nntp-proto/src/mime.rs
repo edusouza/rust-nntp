@@ -122,10 +122,10 @@ fn split_encoded_words(bytes: &[u8]) -> Vec<Piece<'_>> {
 
         match parse_encoded_word(rest) {
             Some((decoded, consumed)) => {
-                if let Some(literal) = bytes.get(literal_start..cursor) {
-                    if !literal.is_empty() {
-                        pieces.push(Piece::Literal(literal));
-                    }
+                if let Some(literal) = bytes.get(literal_start..cursor)
+                    && !literal.is_empty()
+                {
+                    pieces.push(Piece::Literal(literal));
                 }
                 pieces.push(Piece::Encoded(decoded));
                 cursor += consumed;
@@ -137,10 +137,10 @@ fn split_encoded_words(bytes: &[u8]) -> Vec<Piece<'_>> {
         }
     }
 
-    if let Some(tail) = bytes.get(literal_start..) {
-        if !tail.is_empty() {
-            pieces.push(Piece::Literal(tail));
-        }
+    if let Some(tail) = bytes.get(literal_start..)
+        && !tail.is_empty()
+    {
+        pieces.push(Piece::Literal(tail));
     }
 
     pieces

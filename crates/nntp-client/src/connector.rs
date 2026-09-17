@@ -372,10 +372,10 @@ fn connect_tcp(options: &ConnectOptions) -> Result<TcpStream> {
                     .set_write_timeout(Some(options.write_timeout))
                     .map_err(ClientError::from_io)?;
                 // Failing to disable Nagle costs latency, not correctness.
-                if options.no_delay {
-                    if let Err(error) = stream.set_nodelay(true) {
-                        tracing::debug!(%error, "could not disable Nagle's algorithm");
-                    }
+                if options.no_delay
+                    && let Err(error) = stream.set_nodelay(true)
+                {
+                    tracing::debug!(%error, "could not disable Nagle's algorithm");
                 }
                 tracing::debug!(%address, "connected");
                 return Ok(stream);
