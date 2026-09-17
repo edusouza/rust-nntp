@@ -408,11 +408,18 @@ pub fn article(
                 // The part a reader can read, not the raw body: `--raw` above is how to
                 // get the boundaries and the base64. Attachments are named rather than
                 // dumped, for the same reason they are in the terminal reader.
+                // Notes about the article, then one blank line separating them from it.
+                let signed = fetched.is_signed();
+                if signed {
+                    // Present, not checked: this project does no cryptography.
+                    writeln!(out, "[signed] signature present, not checked")?;
+                }
+
                 let attachments = fetched.attachments();
-                if !attachments.is_empty() {
-                    for summary in &attachments {
-                        writeln!(out, "[other part] {summary}")?;
-                    }
+                for summary in &attachments {
+                    writeln!(out, "[other part] {summary}")?;
+                }
+                if signed || !attachments.is_empty() {
                     writeln!(out)?;
                 }
 

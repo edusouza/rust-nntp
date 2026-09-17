@@ -277,7 +277,7 @@ impl Article {
         };
 
         let text = part.text();
-        if part
+        let text = if part
             .content_type
             .param("format")
             .is_some_and(|format| format.eq_ignore_ascii_case("flowed"))
@@ -286,9 +286,29 @@ impl Article {
                 .content_type
                 .param("delsp")
                 .is_some_and(|value| value.eq_ignore_ascii_case("yes"));
-            return crate::body::unflow(&text, delete_space);
+            crate::body::unflow(&text, delete_space)
+        } else {
+            text
+        };
+
+        // Inline clearsigned traffic is common from mailing-list gateways, and its armour
+        // costs the reader a header, a `Hash:` line and a dozen lines of base64 in the
+        // middle of the article. `is_signed` reports the fact; the armour is not content.
+        crate::body::strip_clearsign(&text).unwrap_or(text)
+    }
+
+    /// Whether the article carries a signature — detached, or inline clearsign armour.
+    ///
+    /// Reports only that one is *present*. Nothing here verifies anything: this crate does
+    /// no cryptography, and a reader implying a signature had been checked would be worse
+    /// than one that says nothing about it.
+    pub fn is_signed(&self) -> bool {
+        if self.body_part().is_signed() {
+            return true;
         }
-        text
+        self.body
+            .iter()
+            .any(|line| line.starts_with(b"-----BEGIN PGP SIGNED MESSAGE-----"))
     }
 
     /// The parts a reader is not showing: attachments, and the alternatives it passed

@@ -213,7 +213,14 @@ nothing but an attachment. What to look for:
   the HTML copy, with the other two parts named above the body;
 - the flowed article shows one paragraph rather than three short lines, the quoted
   paragraph stays separate from the reply, and `-- ` stays on its own line;
-- the attachment-only article says `(no text in this article)` rather than showing nothing.
+- the attachment-only article says `(no text in this article)` rather than showing nothing;
+- the `Accepted nginx …` article — the shape a Debian announcement arrives in — shows the
+  changelog text with **no** `-----BEGIN PGP` armour, no `Hash:` header and no signature
+  base64, one `signed (signature not checked)` line, and the detached signature *not*
+  listed as an attachment.
+
+On a real server, `linux.debian.changes` is where that last one came from: nearly every
+article in it is signed in both of those ways at once.
 
 Add `--raw` to `nntp-tui article` to see what the same article looked like before any of
 this — the boundaries, the part headers and the base64 are all still there, which is the

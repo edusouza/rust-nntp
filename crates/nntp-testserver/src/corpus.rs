@@ -464,6 +464,50 @@ fn mime_group() -> Group {
                 .line("The signature separator above ends in a space and is")
                 .line("still a hard break."),
         )
+        // What a mailing-list gateway actually relays, copied from the shape of a Debian
+        // `Accepted …` announcement seen on linux.debian.changes: multipart/signed with a
+        // detached signature, and the content clearsigned *inside* the text part. Both
+        // layers of signature machinery would otherwise be on screen.
+        .article(
+            Article::new("<gateway@test.invalid>")
+                .header("Message-ID", "<gateway@test.invalid>")
+                .header("From", "FTP Masters <ftpmaster@example.org>")
+                .header("Subject", "Accepted nginx 1.26.3 (source) into proposed-updates")
+                .header("Date", "Wed, 17 Sep 2026 13:30:00 +0000")
+                .header("Newsgroups", "news.software.readers")
+                .header("Organization", "example.* mail to news gateway")
+                .header(
+                    "Content-Type",
+                    "multipart/signed; micalg=pgp-sha512;                      protocol=\"application/pgp-signature\"; boundary=\"sig\"",
+                )
+                .line("--sig")
+                .line("Content-Type: text/plain; charset=UTF-8")
+                .line("")
+                .line("-----BEGIN PGP SIGNED MESSAGE-----")
+                .line("Hash: SHA512")
+                .line("")
+                .line("Format: 1.8")
+                .line("Source: nginx")
+                .line("Version: 1.26.3-3")
+                .line("Changes:")
+                .line(" nginx (1.26.3-3) trixie-security; urgency=medium")
+                .line(" .")
+                .line("   * d/p/CVE-2026-56434.patch add")
+                .line("- --- a/src/http/ngx_http_ssi_module.c")
+                .line("- +++ b/src/http/ngx_http_ssi_module.c")
+                .line("-----BEGIN PGP SIGNATURE-----")
+                .line("")
+                .line("iQIzBAABCgAdFiEEexampleexampleexampleexampleexampleFAmbP")
+                .line("-----END PGP SIGNATURE-----")
+                .line("--sig")
+                .line("Content-Type: application/pgp-signature; name=\"signature.asc\"")
+                .line("")
+                .line("-----BEGIN PGP SIGNATURE-----")
+                .line("")
+                .line("iQIzBAABCgAdFiEEanotherexamplesignatureblockhere=")
+                .line("-----END PGP SIGNATURE-----")
+                .line("--sig--"),
+        )
         // Nothing but an attachment: the body pane would otherwise be blank,
         // which reads as a bug rather than as a fact about the article.
         .article(

@@ -250,6 +250,15 @@ fn draw_article(frame: &mut Frame<'_>, app: &App, area: Rect) {
         })
         .collect();
 
+    // A signature is a fact about the article rather than a part of it: one dim line, and
+    // deliberately not a claim that it was checked. Nothing in this project does
+    // cryptography.
+    if view.signed {
+        lines.push(Line::from(
+            Span::from("signed (signature not checked)").dim(),
+        ));
+    }
+
     // Attachments go above the body, not below it: a reader who has to scroll to the end
     // of a long article to find out something was attached has already been misled.
     if !view.attachments.is_empty() {

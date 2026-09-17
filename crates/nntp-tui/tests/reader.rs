@@ -355,6 +355,47 @@ fn a_flowed_article_is_shown_as_paragraphs() {
 }
 
 #[test]
+fn a_signed_gateway_article_shows_the_content_and_not_the_signature_machinery() {
+    // The shape a Debian `Accepted …` announcement arrives in, found by pointing the
+    // reader at linux.debian.changes on a real server: multipart/signed with a detached
+    // signature, and the content clearsigned inside the text part.
+    let harness = reader_showing(serve_mime(), "news.software.readers", "Accepted nginx");
+    let view = harness.app.article.as_ref().expect("an article");
+    let body = view.body.join("\n");
+
+    // The content.
+    assert!(body.contains("Source: nginx"), "{body}");
+    assert!(body.contains("CVE-2026-56434"), "{body}");
+    // Dash-escaping undone, so a signed patch does not read `- --- a/file`.
+    assert!(
+        body.contains("--- a/src/http/ngx_http_ssi_module.c"),
+        "{body}"
+    );
+    assert!(!body.contains("- --- a/src"), "{body}");
+
+    // None of the machinery: not the armour, not the `Hash:` header, not the base64.
+    assert!(!body.contains("BEGIN PGP"), "armour on screen:\n{body}");
+    assert!(!body.contains("END PGP"), "armour on screen:\n{body}");
+    assert!(
+        !body.contains("Hash: SHA512"),
+        "armour header on screen:\n{body}"
+    );
+    assert!(
+        !body.contains("iQIzBAAB"),
+        "signature base64 on screen:\n{body}"
+    );
+
+    // The fact is reported once, and the signature is not listed as an attachment: every
+    // article from every signing gateway would otherwise carry that line.
+    assert!(view.signed, "the article carries a signature");
+    assert!(
+        view.attachments.is_empty(),
+        "the signature was named as an attachment: {:?}",
+        view.attachments
+    );
+}
+
+#[test]
 fn an_article_that_is_only_an_attachment_says_so_rather_than_showing_nothing() {
     let harness = reader_showing(serve_mime(), "news.software.readers", "only an attachment");
     let view = harness.app.article.as_ref().expect("an article");

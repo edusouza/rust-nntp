@@ -75,7 +75,7 @@ pub mod spec;
 
 pub use article::{Article, ContentType, TransferEncoding};
 pub use block::DataBlock;
-pub use body::{BodyPart, Disposition, DispositionKind, unflow};
+pub use body::{BodyPart, Disposition, DispositionKind, strip_clearsign, unflow};
 pub use capabilities::Capabilities;
 pub use command::{Command, ListKeyword, Wildmat};
 pub use error::{ProtoError, Result};

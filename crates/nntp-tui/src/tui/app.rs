@@ -88,6 +88,11 @@ pub struct ArticleView {
     ///
     /// Empty for the ordinary single-part article, which is most of Usenet.
     pub attachments: Vec<String>,
+    /// Whether the article carries a signature, detached or inline.
+    ///
+    /// Only that one is *present*: nothing here verifies anything, and a reader implying
+    /// otherwise would be worse than one that stays quiet.
+    pub signed: bool,
 }
 
 impl ArticleView {
@@ -147,6 +152,7 @@ impl ArticleView {
             headers,
             body,
             attachments,
+            signed: article.is_signed(),
         }
     }
 }

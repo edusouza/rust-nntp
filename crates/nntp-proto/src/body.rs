@@ -196,6 +196,30 @@ impl BodyPart {
         }
     }
 
+    /// Whether this part is a detached signature rather than content.
+    ///
+    /// `multipart/signed` (RFC 3156) carries the message in one part and its signature in
+    /// another. The signature is protocol machinery: naming it alongside the attachments
+    /// a person might want would put "1 other part: application/pgp-signature" on every
+    /// article from every mailing-list gateway that signs its mail, which is most of them.
+    /// [`Self::is_signed`] reports the fact instead.
+    pub fn is_signature(&self) -> bool {
+        self.content_type.type_ == "application"
+            && matches!(
+                self.content_type.subtype.as_str(),
+                "pgp-signature" | "pkcs7-signature" | "x-pkcs7-signature"
+            )
+    }
+
+    /// Whether this part, or anything inside it, carries a detached signature.
+    ///
+    /// Says nothing about whether the signature is *valid*: this crate does no
+    /// cryptography, and a reader that implied otherwise would be worse than one that
+    /// stayed quiet.
+    pub fn is_signed(&self) -> bool {
+        self.is_signature() || self.parts.iter().any(Self::is_signed)
+    }
+
     /// The file name the sender suggested, decoded.
     ///
     /// Reads `filename` from `Content-Disposition`, then RFC 2231's `filename*`, then
@@ -301,16 +325,21 @@ impl BodyPart {
         self.parts.iter().find_map(Self::display_part)
     }
 
-    /// Every part that is not the one being displayed and is not a container: the
-    /// attachments and the alternatives the reader passed over.
+    /// Every part that is not the one being displayed, is not a container, and is not a
+    /// signature: the attachments and the alternatives the reader passed over.
     ///
     /// Listing them matters even though saving them is a later concern. An article whose
     /// text says "see the attached patch" is confusing if the reader never mentions that
     /// something was attached.
+    ///
+    /// Detached signatures are left out by [`Self::is_signature`]'s reasoning: they are
+    /// machinery, not something a reader chose to send, and every signing mailing-list
+    /// gateway would otherwise add a line to every article it relays.
     pub fn other_parts(&self) -> Vec<&Self> {
         let shown = self.display_part().map(std::ptr::from_ref);
         let mut out = Vec::new();
         self.collect_leaves(shown, &mut out);
+        out.retain(|part| !part.is_signature());
         out
     }
 
@@ -466,6 +495,57 @@ fn decode_extended_parameter(value: &str) -> String {
     } else {
         mime::decode_with_charset(&bytes, charset)
     }
+}
+
+/// The marker that opens an inline clearsigned message (RFC 4880 §7).
+const CLEARSIGN_BEGIN: &str = "-----BEGIN PGP SIGNED MESSAGE-----";
+/// The marker that ends the signed text and opens the signature.
+const CLEARSIGN_SIGNATURE: &str = "-----BEGIN PGP SIGNATURE-----";
+
+/// Strips the armour from an inline clearsigned message, returning the text that was
+/// signed.
+///
+/// Returns `None` when the text is not clearsigned, so a caller can tell "nothing to do"
+/// from "there was armour and here is what was inside it".
+///
+/// Mailing-list gateways relay a great deal of clearsigned traffic — every Debian
+/// `Accepted …` announcement, for one — and shown raw it costs the reader an armour
+/// header, a `Hash:` line and a dozen lines of base64 in the middle of the article. What
+/// the sender wrote is the part between them.
+///
+/// Two details from §7.1 that are easy to miss:
+///
+/// - **Armour headers are not content.** Everything from the `BEGIN` line to the first
+///   blank line is metadata (`Hash: SHA512`) and is dropped.
+/// - **Dash-escaping is undone.** A line of signed text beginning with `-` is transmitted
+///   with a `- ` prefix so it cannot be mistaken for a marker; leaving it in would show
+///   `- --- a/file` in every signed patch.
+///
+/// This decodes; it does not verify. No cryptography happens in this crate, and a reader
+/// that implied a signature had been checked would be worse than one that says nothing.
+pub fn strip_clearsign(text: &str) -> Option<String> {
+    let start = text.find(CLEARSIGN_BEGIN)?;
+    let after_marker = text.get(start + CLEARSIGN_BEGIN.len()..)?;
+
+    // Armour headers run to the first blank line. A malformed block with no blank line at
+    // all has no signed text to find.
+    let body = after_marker
+        .split_once("\n\n")
+        .map(|(_, body)| body)
+        .or_else(|| after_marker.split_once("\r\n\r\n").map(|(_, body)| body))?;
+
+    // A truncated article can lose the signature block. Keeping what arrived is better
+    // than showing the armour, and matches how the rest of this module treats truncation.
+    let signed = body
+        .split_once(CLEARSIGN_SIGNATURE)
+        .map_or(body, |(signed, _)| signed);
+
+    let unescaped: Vec<&str> = signed
+        .split('\n')
+        .map(|line| line.strip_prefix("- ").unwrap_or(line))
+        .collect();
+
+    Some(unescaped.join("\n").trim_end().to_owned())
 }
 
 /// Rejoins the soft line breaks of a `format=flowed` body (RFC 3676).
@@ -988,6 +1068,152 @@ mod tests {
             Disposition::parse("form-data; name=x").kind,
             DispositionKind::Other
         );
+    }
+
+    #[test]
+    fn a_detached_signature_is_machinery_rather_than_an_attachment() {
+        // The shape every signing mailing-list gateway relays: RFC 3156 multipart/signed,
+        // the message in one part and the signature in another.
+        let part = part_of(
+            "Content-Type: multipart/signed; micalg=pgp-sha512; \
+             protocol=\"application/pgp-signature\"; boundary=\"sig\"\r\n\
+             \r\n\
+             --sig\r\n\
+             Content-Type: text/plain; charset=UTF-8\r\n\
+             \r\n\
+             the announcement\r\n\
+             --sig\r\n\
+             Content-Type: application/pgp-signature\r\n\
+             \r\n\
+             -----BEGIN PGP SIGNATURE-----\r\n\
+             AAAA\r\n\
+             -----END PGP SIGNATURE-----\r\n\
+             --sig--\r\n.\r\n",
+        );
+
+        assert_eq!(
+            part.display_part().map(BodyPart::text),
+            Some("the announcement".to_owned())
+        );
+        assert!(part.is_signed());
+        // Naming it would put a line on every article from every signing gateway, which
+        // is most of the mailing-list traffic on Usenet.
+        assert!(
+            part.other_parts().is_empty(),
+            "{:?}",
+            part.other_parts()
+                .iter()
+                .map(|p| p.summary())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn an_attachment_beside_a_signature_is_still_named() {
+        let part = part_of(
+            "Content-Type: multipart/mixed; boundary=\"b\"\r\n\
+             \r\n\
+             --b\r\n\
+             Content-Type: text/plain\r\n\
+             \r\n\
+             see attached\r\n\
+             --b\r\n\
+             Content-Type: text/x-patch\r\n\
+             Content-Disposition: attachment; filename=\"fix.patch\"\r\n\
+             \r\n\
+             --- a/x\r\n\
+             --b\r\n\
+             Content-Type: application/pgp-signature\r\n\
+             \r\n\
+             AAAA\r\n\
+             --b--\r\n.\r\n",
+        );
+
+        let named: Vec<String> = part.other_parts().iter().map(|p| p.summary()).collect();
+        assert_eq!(named.len(), 1, "{named:?}");
+        assert!(
+            named.first().is_some_and(|s| s.contains("fix.patch")),
+            "{named:?}"
+        );
+        assert!(part.is_signed());
+    }
+
+    #[test]
+    fn inline_clearsign_armour_is_stripped() {
+        // What a Debian `Accepted …` announcement looks like inside.
+        let signed = "-----BEGIN PGP SIGNED MESSAGE-----\n\
+                      Hash: SHA512\n\
+                      \n\
+                      Format: 1.8\n\
+                      Source: nginx\n\
+                      -----BEGIN PGP SIGNATURE-----\n\
+                      \n\
+                      iQIzBAABCgAdFiEE...\n\
+                      -----END PGP SIGNATURE-----\n";
+
+        assert_eq!(
+            strip_clearsign(signed).as_deref(),
+            Some("Format: 1.8\nSource: nginx")
+        );
+    }
+
+    #[test]
+    fn dash_escaping_is_undone() {
+        // A signed patch has every line starting with `-` transmitted as `- -…` (§7.1).
+        // Leaving it in shows `- --- a/file` in every signed diff.
+        let signed = "-----BEGIN PGP SIGNED MESSAGE-----\n\
+                      Hash: SHA256\n\
+                      \n\
+                      - --- a/file\n\
+                      - +++ b/file\n\
+                      normal line\n\
+                      -----BEGIN PGP SIGNATURE-----\n\
+                      AAAA\n\
+                      -----END PGP SIGNATURE-----\n";
+
+        assert_eq!(
+            strip_clearsign(signed).as_deref(),
+            Some("--- a/file\n+++ b/file\nnormal line")
+        );
+    }
+
+    #[test]
+    fn a_truncated_clearsigned_message_keeps_what_arrived() {
+        let signed = "-----BEGIN PGP SIGNED MESSAGE-----\n\
+                      Hash: SHA512\n\
+                      \n\
+                      the text, and then the article was cut\n";
+
+        assert_eq!(
+            strip_clearsign(signed).as_deref(),
+            Some("the text, and then the article was cut")
+        );
+    }
+
+    #[test]
+    fn text_with_no_clearsign_armour_is_left_alone() {
+        assert_eq!(strip_clearsign("just an article"), None);
+        // An armour marker with no blank line after it has no signed text to find, so
+        // there is nothing to strip and the raw text is shown instead.
+        assert_eq!(
+            strip_clearsign("-----BEGIN PGP SIGNED MESSAGE-----\n"),
+            None
+        );
+    }
+
+    #[test]
+    fn crlf_clearsign_armour_is_stripped_too() {
+        // Bodies arrive CRLF-terminated from the wire; `BodyPart::text` normalises them,
+        // but a caller may hand over either.
+        let signed = "-----BEGIN PGP SIGNED MESSAGE-----\r\n\
+                      Hash: SHA512\r\n\
+                      \r\n\
+                      the text\r\n\
+                      -----BEGIN PGP SIGNATURE-----\r\n\
+                      AAAA\r\n\
+                      -----END PGP SIGNATURE-----\r\n";
+
+        assert_eq!(strip_clearsign(signed).as_deref(), Some("the text"));
     }
 
     #[test]

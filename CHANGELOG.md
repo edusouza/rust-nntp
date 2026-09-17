@@ -34,6 +34,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   reports how much of a real group is multipart or flowed and asserts that every multipart
   article yields either text or a named part.
 
+  **Signed articles**, found by pointing the reader at `linux.debian.changes` on a real
+  server. A mailing-list gateway signs nearly everything it relays, in two layers at once:
+  `multipart/signed` with a detached signature (RFC 3156), and the content clearsigned
+  *inside* the text part (RFC 4880 §7). Both layers were on screen — an armour header, a
+  `Hash:` line and a dozen lines of base64 in the middle of every announcement, plus
+  "1 other part: application/pgp-signature" on every one of them.
+
+  Now the armour is stripped, dash-escaping is undone so a signed patch does not read
+  `- --- a/file`, the detached signature is not listed among the attachments, and the fact
+  is reported in one line: `signed (signature not checked)`. That wording is exact —
+  nothing here verifies anything, because this project does no cryptography, and a reader
+  implying a signature had been checked would be worse than one that stays quiet.
+
 - **Read and unread state, remembered between runs** ([#7] — the largest functional gap in
   v0.1.0). Stored in the `.newsrc` format, one file per server under the platform data
   directory, because article numbers are the server's own and the same group on two

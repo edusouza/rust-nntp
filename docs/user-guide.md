@@ -239,6 +239,14 @@ keys.
   `format=flowed` (RFC 3676), so a message written in a 70-column mail client does not
   arrive as a column of short lines. Quote depth is respected, so a reply never absorbs
   the text it is quoting, and a `-- ` signature separator stays a break.
+- **`signed (signature not checked)`** appears for an article carrying a PGP or S/MIME
+  signature — the detached kind, or inline clearsign armour. The signed text is shown
+  without the armour, the `Hash:` header or the signature block, and dash-escaping is
+  undone so a signed patch does not read `- --- a/file`. The wording is exact: **nothing
+  here verifies a signature.** This project does no cryptography, and a reader that
+  implied a signature had been checked would be worse than one that says nothing. Mailing-
+  list gateways sign nearly everything they relay, which is why the signature is reported
+  as a fact about the article rather than listed among its parts.
 - **`nntp-tui article --raw`** shows the body exactly as it arrived — boundaries, base64
   and all — when you need to see what the sender actually sent.
 - **An error takes over the status bar** until the next keystroke; `m` shows the ones that
