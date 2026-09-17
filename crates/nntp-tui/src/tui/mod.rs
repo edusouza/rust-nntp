@@ -1,0 +1,150 @@
+//! The terminal user interface.
+//!
+//! Three parts, deliberately separated:
+//!
+//! - [`app`] is the state machine. It takes key events and worker events and produces
+//!   requests. It touches neither the terminal nor the network, so the whole behaviour of
+//!   the reader is testable as plain functions.
+//! - [`ui`] draws whatever the state machine holds, and decides nothing.
+//! - [`worker`] owns the client and does every blocking thing on its own thread.
+//!
+//! The loop below is the only part that needs a real terminal, and it is deliberately
+//! thin. See
+//! [ADR-0003](https://github.com/edusouza/rust-nntp/blob/main/docs/adr/0003-blocking-io-on-a-worker-thread.md).
+
+pub mod app;
+pub mod protocol;
+pub mod ui;
+pub mod worker;
+
+use std::sync::mpsc::{self, Sender, TryRecvError};
+use std::time::Duration;
+
+use anyhow::Context as _;
+use ratatui::crossterm::event::{self, Event as TerminalEvent, KeyEventKind};
+
+use crate::config::Config;
+use crate::session::Target;
+use crate::tui::app::App;
+use crate::tui::protocol::{Event, Request};
+
+/// How long to wait for a terminal event before ticking the spinner.
+const TICK: Duration = Duration::from_millis(120);
+
+/// How long to wait for the worker to finish after the interface exits.
+const SHUTDOWN_GRACE: Duration = Duration::from_millis(750);
+
+/// Runs the terminal interface until the user quits.
+///
+/// # Errors
+///
+/// Returns an error if the terminal cannot be set up, if drawing fails, or if the worker
+/// thread cannot be spawned. Network failures are shown in the interface instead: a
+/// dropped connection should not end the session.
+pub fn run(config: &Config, target: Target) -> anyhow::Result<()> {
+    let (request_tx, request_rx) = mpsc::channel::<Request>();
+    let (event_tx, event_rx) = mpsc::channel::<Event>();
+
+    let worker = worker::spawn(target, config.ui.overview_chunk, request_rx, event_tx)
+        .context("starting the network worker")?;
+
+    // `init` enables raw mode, switches to the alternate screen, and installs a panic
+    // hook that restores both. Without that hook a panic leaves the user with an
+    // unusable terminal and no error message.
+    let mut terminal = ratatui::try_init().context("setting up the terminal")?;
+
+    let mut app = App::new(&config.ui);
+    let outcome = event_loop(&mut terminal, &mut app, &request_tx, &event_rx);
+
+    // Restore the terminal before reporting anything, so an error message is readable.
+    let restored = ratatui::try_restore();
+
+    // Ask the worker to stop, then give it a moment. A worker blocked in a read on a
+    // dead socket would otherwise hold the process open until its read timeout expires.
+    let _ = request_tx.send(Request::Shutdown);
+    drop(request_tx);
+    let deadline = std::time::Instant::now() + SHUTDOWN_GRACE;
+    while !worker.is_finished() && std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    if worker.is_finished() {
+        if worker.join().is_err() {
+            tracing::error!("the network worker panicked");
+        }
+    } else {
+        // Joining now would block until the socket's read timeout expires, which is a
+        // minute of a hung terminal for no benefit. The process is exiting anyway.
+        tracing::warn!("the network worker did not stop in time; leaving it to the process exit");
+    }
+
+    outcome?;
+    restored.context("restoring the terminal")?;
+    Ok(())
+}
+
+/// The render loop: drain worker events, poll the terminal, draw if anything changed.
+fn event_loop(
+    terminal: &mut ratatui::DefaultTerminal,
+    app: &mut App,
+    requests: &Sender<Request>,
+    events: &std::sync::mpsc::Receiver<Event>,
+) -> anyhow::Result<()> {
+    for request in app.initial_requests() {
+        send(requests, app, request);
+    }
+
+    loop {
+        // Every pending event first: a burst of them should cost one redraw, not one
+        // redraw each.
+        loop {
+            match events.try_recv() {
+                Ok(event) => app.on_event(event),
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => {
+                    app.on_event(Event::Stopped);
+                    break;
+                }
+            }
+        }
+
+        if app.dirty {
+            terminal
+                .draw(|frame| ui::draw(frame, app))
+                .context("drawing")?;
+            app.dirty = false;
+        }
+
+        if app.should_quit {
+            return Ok(());
+        }
+
+        // A timeout rather than a blocking read, so the spinner turns and a worker event
+        // that arrives while the user is idle is still picked up promptly.
+        if event::poll(TICK).context("polling for terminal events")? {
+            match event::read().context("reading a terminal event")? {
+                // Only key *presses*: on Windows crossterm also reports releases, and
+                // acting on both would move the cursor two rows per keystroke.
+                TerminalEvent::Key(key) if key.kind == KeyEventKind::Press => {
+                    for request in app.on_key(key) {
+                        send(requests, app, request);
+                    }
+                }
+                TerminalEvent::Resize(_, _) => app.dirty = true,
+                _ => {}
+            }
+        } else {
+            app.tick();
+        }
+    }
+}
+
+/// Sends a request, noting in the interface if the worker has gone.
+fn send(requests: &Sender<Request>, app: &mut App, request: Request) {
+    let shutting_down = matches!(request, Request::Shutdown);
+
+    if requests.send(request).is_err() && !shutting_down {
+        app.on_event(Event::Disconnected(
+            "the network worker is no longer running".to_owned(),
+        ));
+    }
+}

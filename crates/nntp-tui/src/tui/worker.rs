@@ -1,0 +1,331 @@
+//! The network worker thread.
+//!
+//! Owns the client and does every blocking thing, so the render loop never waits on a
+//! socket. It reconnects on demand: the interface stays usable after a dropped
+//! connection, and the next request re-establishes it rather than the user having to
+//! restart.
+
+use std::sync::mpsc::{Receiver, Sender};
+use std::thread::JoinHandle;
+
+use nntp_client::{Client, ClientError, Transport};
+use nntp_proto::{ActiveEntry, GroupName, Range};
+
+use crate::session::{self, Target};
+use crate::tui::protocol::{Event, GroupRow, Request};
+
+/// Starts the worker.
+///
+/// # Errors
+///
+/// Returns an error only if the thread cannot be spawned.
+pub fn spawn(
+    target: Target,
+    overview_chunk: u64,
+    requests: Receiver<Request>,
+    events: Sender<Event>,
+) -> std::io::Result<JoinHandle<()>> {
+    std::thread::Builder::new()
+        .name("nntp-worker".to_owned())
+        .spawn(move || {
+            Worker {
+                target,
+                overview_chunk: overview_chunk.max(1),
+                client: None,
+                events,
+            }
+            .run(&requests);
+        })
+}
+
+struct Worker {
+    target: Target,
+    overview_chunk: u64,
+    client: Option<Client<Transport>>,
+    events: Sender<Event>,
+}
+
+impl Worker {
+    fn run(&mut self, requests: &Receiver<Request>) {
+        // The render loop has gone if the channel closes, so there is nothing left to do.
+        while let Ok(request) = requests.recv() {
+            if matches!(request, Request::Shutdown) {
+                break;
+            }
+            self.handle(request);
+        }
+
+        if let Some(client) = self.client.take() {
+            let _ = client.quit();
+        }
+        let _ = self.events.send(Event::Stopped);
+        tracing::debug!("worker stopped");
+    }
+
+    fn handle(&mut self, request: Request) {
+        let outcome = match &request {
+            Request::LoadGroups => self.load_groups(),
+            Request::OpenGroup { group, count } => self.open_group(group, *count),
+            Request::LoadOverview { group, range } => self.load_overview(group, *range),
+            Request::LoadArticle { group, spec } => self.load_article(group.as_ref(), spec.clone()),
+            Request::Shutdown => Ok(()),
+        };
+
+        if let Err(error) = outcome {
+            let fatal = error.is_connection_fatal();
+            let context = describe(&request);
+            tracing::warn!(%context, %error, fatal, "request failed");
+
+            self.send(Event::Failed {
+                context,
+                message: error.to_string(),
+            });
+
+            if fatal {
+                // The connection is unusable; drop it so the next request reconnects.
+                self.client = None;
+                self.send(Event::Disconnected(error.to_string()));
+            }
+        }
+    }
+
+    /// Returns a connected client, establishing the connection if necessary.
+    fn client(&mut self) -> Result<&mut Client<Transport>, ClientError> {
+        if self.client.is_none() {
+            self.send(Event::Progress(format!(
+                "connecting to {}…",
+                self.target.authority()
+            )));
+
+            let client = session::connect(&self.target).map_err(|error| {
+                // session::connect returns anyhow for its context chain; the interface
+                // wants one flat message, and `{:#}` is what produces it.
+                ClientError::Tls(format!("{error:#}"))
+            })?;
+
+            self.send(Event::Connected {
+                server: self.target.authority(),
+                greeting: client.greeting().text.clone(),
+                encrypted: client.is_encrypted(),
+            });
+            self.client = Some(client);
+        }
+
+        // Just assigned above if it was absent.
+        self.client
+            .as_mut()
+            .ok_or(ClientError::ConnectionClosed(Some(
+                "a connection that vanished",
+            )))
+    }
+
+    fn load_groups(&mut self) -> Result<(), ClientError> {
+        self.send(Event::Progress("fetching the group list…".to_owned()));
+
+        let mut active: Vec<ActiveEntry> = Vec::new();
+        {
+            let client = self.client()?;
+            client.list_groups_streaming(None, |entry| {
+                if let Ok(entry) = entry {
+                    active.push(entry);
+                }
+            })?;
+        }
+
+        // Descriptions come from a second command and are optional: a server that refuses
+        // LIST NEWSGROUPS is still perfectly usable, just less informative.
+        //
+        // A *refusal* is optional; a dropped connection is not. Swallowing the latter
+        // would leave the worker holding an unusable client and the interface believing
+        // it was still connected, so the group list would arrive and every command after
+        // it would fail for no visible reason.
+        let descriptions = match self.client()?.list_group_descriptions(None) {
+            Ok(result) => result
+                .entries
+                .into_iter()
+                .map(|entry| (entry.name, entry.description))
+                .collect::<std::collections::BTreeMap<_, _>>(),
+            Err(error) if error.is_connection_fatal() => return Err(error),
+            Err(error) => {
+                tracing::debug!(%error, "no group descriptions available");
+                std::collections::BTreeMap::new()
+            }
+        };
+
+        let rows = active
+            .into_iter()
+            .map(|entry| GroupRow {
+                description: descriptions.get(&entry.name).cloned(),
+                name: entry.name,
+                low: entry.low,
+                high: entry.high,
+                status: entry.status,
+            })
+            .collect();
+
+        self.send(Event::Groups(rows));
+        Ok(())
+    }
+
+    fn open_group(&mut self, group: &GroupName, count: u64) -> Result<(), ClientError> {
+        self.send(Event::Progress(format!("selecting {group}…")));
+
+        let summary = self.client()?.select_group(group)?;
+        self.send(Event::GroupOpened(Box::new(summary.clone())));
+
+        let Some((low, high)) = summary.range() else {
+            // An empty group is not an error; it just has nothing to list.
+            self.send(Event::Overview {
+                group: group.clone(),
+                records: Vec::new(),
+                skipped: 0,
+            });
+            return Ok(());
+        };
+
+        let first = high.saturating_sub(count.saturating_sub(1)).max(low);
+        self.fetch_overview(group, Range::between(first, high))
+    }
+
+    fn load_overview(&mut self, group: &GroupName, range: Range) -> Result<(), ClientError> {
+        // The client tracks which group is selected, but the worker may have reconnected
+        // since, so select it again rather than assuming.
+        let selected = self
+            .client()?
+            .selected_group()
+            .map(|summary| summary.name.clone());
+        if selected.as_ref() != Some(group) {
+            self.client()?.select_group(group)?;
+        }
+
+        self.fetch_overview(group, range)
+    }
+
+    /// Fetches a range in chunks, reporting progress, and sends one event at the end.
+    ///
+    /// Chunking keeps any single response bounded and lets the status bar move, which
+    /// matters on a group with a hundred thousand articles. The records are sent as one
+    /// event because the interface replaces its list rather than appending to it.
+    fn fetch_overview(&mut self, group: &GroupName, range: Range) -> Result<(), ClientError> {
+        let chunks = range.chunks(self.overview_chunk);
+        let total = chunks.len();
+        let fmt = self.client()?.overview_format()?;
+
+        let mut records = Vec::new();
+        let mut skipped = 0usize;
+
+        for (index, chunk) in chunks.iter().enumerate() {
+            if total > 1 {
+                self.send(Event::Progress(format!(
+                    "{group}: fetching {} of {total}…",
+                    index + 1
+                )));
+            }
+
+            let client = self.client()?;
+            let mut chunk_skipped = 0usize;
+            client.overview_streaming(*chunk, &fmt, |record| match record {
+                Ok(record) => records.push(record),
+                Err(_) => chunk_skipped += 1,
+            })?;
+            skipped += chunk_skipped;
+        }
+
+        records.sort_by_key(|record| record.number);
+        self.send(Event::Overview {
+            group: group.clone(),
+            records,
+            skipped,
+        });
+        Ok(())
+    }
+
+    fn load_article(
+        &mut self,
+        group: Option<&GroupName>,
+        spec: nntp_proto::ArticleSpec,
+    ) -> Result<(), ClientError> {
+        if let Some(group) = group {
+            let selected = self
+                .client()?
+                .selected_group()
+                .map(|summary| summary.name.clone());
+            if selected.as_ref() != Some(group) {
+                self.client()?.select_group(group)?;
+            }
+        }
+
+        self.send(Event::Progress("fetching the article…".to_owned()));
+        let article = self.client()?.article(spec)?;
+        self.send(Event::Article(Box::new(article)));
+        Ok(())
+    }
+
+    /// Sends an event, ignoring a closed channel.
+    ///
+    /// A closed channel means the interface has exited; the worker will notice on its
+    /// next `recv` and stop. Treating it as an error here would produce a flurry of
+    /// unsendable error events on the way out.
+    fn send(&self, event: Event) {
+        let _ = self.events.send(event);
+    }
+}
+
+/// Describes a request, for an error message.
+fn describe(request: &Request) -> String {
+    match request {
+        Request::LoadGroups => "fetching the group list".to_owned(),
+        Request::OpenGroup { group, .. } => format!("opening {group}"),
+        Request::LoadOverview { group, range } => {
+            format!("listing {group} {}", range.to_argument())
+        }
+        Request::LoadArticle { spec, .. } => match spec {
+            nntp_proto::ArticleSpec::Number(number) => format!("fetching article {number}"),
+            nntp_proto::ArticleSpec::MessageId(id) => format!("fetching {id}"),
+            nntp_proto::ArticleSpec::Current => "fetching the current article".to_owned(),
+        },
+        Request::Shutdown => "shutting down".to_owned(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn describes_every_request_for_an_error_message() {
+        let group = GroupName::parse("misc.test").unwrap();
+
+        assert_eq!(describe(&Request::LoadGroups), "fetching the group list");
+        assert_eq!(
+            describe(&Request::OpenGroup {
+                group: group.clone(),
+                count: 10
+            }),
+            "opening misc.test"
+        );
+        assert_eq!(
+            describe(&Request::LoadOverview {
+                group: group.clone(),
+                range: Range::between(1, 5)
+            }),
+            "listing misc.test 1-5"
+        );
+        assert_eq!(
+            describe(&Request::LoadArticle {
+                group: Some(group),
+                spec: nntp_proto::ArticleSpec::Number(7)
+            }),
+            "fetching article 7"
+        );
+        assert_eq!(
+            describe(&Request::LoadArticle {
+                group: None,
+                spec: nntp_proto::ArticleSpec::MessageId(
+                    nntp_proto::MessageId::parse("<a@b>").unwrap()
+                )
+            }),
+            "fetching <a@b>"
+        );
+    }
+}

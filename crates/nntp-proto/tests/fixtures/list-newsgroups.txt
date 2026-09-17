@@ -1,0 +1,5 @@
+comp.lang.rust	Discussion of the Rust programming language
+comp.lang.c	Discussion about C
+de.comp.os.unix.linux.misc	Linux: Verschiedenes
+misc.test	For testing purposes only
+.

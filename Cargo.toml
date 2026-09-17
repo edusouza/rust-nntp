@@ -10,7 +10,7 @@ resolver = "3"
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.88"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/edusouza/rust-nntp"
 authors = ["rust-nntp contributors"]
@@ -20,7 +20,8 @@ categories = ["command-line-utilities", "network-programming"]
 [workspace.dependencies]
 # Internal crates
 nntp-proto = { path = "crates/nntp-proto", version = "0.1.0" }
-nntp-client = { path = "crates/nntp-client", version = "0.1.0" }
+# default-features = false so that each consumer opts into TLS explicitly.
+nntp-client = { path = "crates/nntp-client", version = "0.1.0", default-features = false }
 nntp-testserver = { path = "crates/nntp-testserver", version = "0.1.0" }
 
 # External
@@ -34,6 +35,7 @@ encoding_rs = "0.8"
 memchr = "2"
 ratatui = "0.30"
 rustls = { version = "0.23", default-features = false, features = ["std", "tls12", "ring", "logging"] }
+rustls-pemfile = "2"
 rustls-pki-types = "1"
 serde = { version = "1", features = ["derive"] }
 thiserror = "2"
@@ -45,6 +47,7 @@ webpki-roots = "1"
 
 # Dev
 insta = "1"
+rcgen = "0.14"
 pretty_assertions = "1"
 
 # Lints applied to every crate in the workspace via `[lints] workspace = true`.

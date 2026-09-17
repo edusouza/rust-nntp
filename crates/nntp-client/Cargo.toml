@@ -13,17 +13,21 @@ categories.workspace = true
 [features]
 default = ["tls"]
 ## Implicit TLS and STARTTLS support via rustls.
-tls = ["dep:rustls", "dep:rustls-pki-types", "dep:webpki-roots"]
+tls = ["dep:rustls", "dep:rustls-pemfile", "dep:rustls-pki-types", "dep:webpki-roots"]
 
 [dependencies]
+chrono.workspace = true
+memchr.workspace = true
 nntp-proto.workspace = true
 rustls = { workspace = true, optional = true }
+rustls-pemfile = { workspace = true, optional = true }
 rustls-pki-types = { workspace = true, optional = true }
 thiserror.workspace = true
 tracing.workspace = true
 webpki-roots = { workspace = true, optional = true }
 
 [dev-dependencies]
+nntp-testserver.workspace = true
 pretty_assertions.workspace = true
 
 [lints]
