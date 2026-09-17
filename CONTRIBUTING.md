@@ -16,6 +16,12 @@ There is no network in CI and no real news server is used by the test suite: int
 tests spin up [`nntp-testserver`](crates/nntp-testserver) on `127.0.0.1:0`. Any test that
 needs a real server must be `#[ignore]`d and documented.
 
+The `#[ignore]`d ones live in
+[`crates/nntp-client/tests/real_server.rs`](crates/nntp-client/tests/real_server.rs), and
+running them is the only way to find out whether this client agrees with a real server
+rather than with our reading of the RFCs. If you have a news account, please do:
+[`docs/validating-against-a-real-server.md`](docs/validating-against-a-real-server.md).
+
 ## Lint policy
 
 The workspace denies `unsafe_code` and warns on `clippy::unwrap_used`,

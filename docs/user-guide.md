@@ -132,6 +132,14 @@ nntp-tui article '<abc123@example.org>' --raw
 `groups` counts are shown as `≤6` on purpose: `LIST ACTIVE` reports watermarks, and
 expiry and cancellation leave gaps, so the span is an upper bound rather than a count.
 
+## Validating against a real server
+
+Every automated test here runs against the bundled fake server, so nothing proves the
+client agrees with a real one. If you have a news account, the runbook for closing that gap
+is [`docs/validating-against-a-real-server.md`](validating-against-a-real-server.md): the
+`doctor` probe, then an opt-in test suite that checks real `LIST` output, real overview
+records, real articles, and that `XOVER` agrees with `OVER`.
+
 ## Logs
 
 Nothing is logged above `warn` by default. To see the conversation with the server:
