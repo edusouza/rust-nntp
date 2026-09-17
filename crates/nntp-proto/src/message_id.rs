@@ -91,7 +91,10 @@ impl MessageId {
 
 impl core::fmt::Display for MessageId {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.write_str(&self.0)
+        // `pad` rather than `write_str`, so that `{:<40}` in a caller's format string
+        // actually pads. A manual `Display` that ignores the width silently breaks every
+        // aligned column a caller tries to build.
+        f.pad(&self.0)
     }
 }
 
@@ -112,6 +115,12 @@ mod tests {
         let id = MessageId::parse("<abc123@example.org>").unwrap();
         assert_eq!(id.as_str(), "<abc123@example.org>");
         assert_eq!(id.inner(), "abc123@example.org");
+    }
+
+    #[test]
+    fn display_honours_field_width() {
+        let id = MessageId::parse("<a@b>").unwrap();
+        assert_eq!(format!("[{id:<10}]"), "[<a@b>     ]");
     }
 
     #[test]

@@ -1,0 +1,778 @@
+//! Configuration: a TOML file, deserialised with serde.
+//!
+//! One hand-editable file, in the platform configuration directory. The shape and the
+//! reasoning behind not using a database for this are in [ADR-0005].
+//!
+//! Every field has a default, so an empty file is valid and a missing file is not an
+//! error — the reader still works with nothing but a `--host` on the command line.
+//!
+//! [ADR-0005]: https://github.com/edusouza/rust-nntp/blob/main/docs/adr/0005-config-and-state-storage.md
+
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
+use std::time::Duration;
+
+use anyhow::{Context as _, bail};
+use nntp_client::{ConnectOptions, Limits, Security};
+use serde::{Deserialize, Serialize};
+
+/// The application name, used for the configuration and log directories.
+pub const APP_NAME: &str = "nntp-tui";
+
+/// The whole configuration file.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct Config {
+    /// Which server to use when none is named on the command line.
+    ///
+    /// If unset and exactly one server is defined, that one is used.
+    pub default_server: Option<String>,
+
+    /// Named servers.
+    pub servers: BTreeMap<String, ServerConfig>,
+
+    /// Response size limits.
+    pub limits: LimitsConfig,
+
+    /// User interface preferences.
+    pub ui: UiConfig,
+}
+
+/// One server definition.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct ServerConfig {
+    /// Host name or address.
+    pub host: String,
+
+    /// Port. Defaults to the port conventional for [`Self::security`].
+    pub port: Option<u16>,
+
+    /// Whether and how to encrypt the connection.
+    pub security: SecurityConfig,
+
+    /// Username for `AUTHINFO USER`.
+    pub username: Option<String>,
+
+    /// Password for `AUTHINFO PASS`.
+    ///
+    /// Prefer [`Self::password_command`]: a password in a configuration file is a
+    /// password in every backup of that file.
+    pub password: Option<String>,
+
+    /// A command whose first line of output is the password.
+    ///
+    /// Lets the password live in a password manager rather than in this file, for example
+    /// `password_command = "pass show news/eternal-september"`.
+    pub password_command: Option<String>,
+
+    /// Allow `AUTHINFO PASS` over an unencrypted connection.
+    ///
+    /// Off by default, and worth leaving off: the password crosses the network in clear
+    /// text.
+    pub allow_plaintext_auth: bool,
+
+    /// A PEM bundle of extra certificate authorities, for a server signed by a private CA.
+    pub extra_ca_file: Option<PathBuf>,
+
+    /// Verify the certificate against this name rather than [`Self::host`].
+    pub tls_server_name: Option<String>,
+
+    /// Seconds to wait for the TCP handshake.
+    pub connect_timeout_secs: u64,
+
+    /// Seconds to wait for data once connected.
+    pub read_timeout_secs: u64,
+
+    /// Seconds to wait for a write to complete.
+    pub write_timeout_secs: u64,
+}
+
+impl Default for ServerConfig {
+    fn default() -> Self {
+        Self {
+            host: String::new(),
+            port: None,
+            security: SecurityConfig::default(),
+            username: None,
+            password: None,
+            password_command: None,
+            allow_plaintext_auth: false,
+            extra_ca_file: None,
+            tls_server_name: None,
+            connect_timeout_secs: 20,
+            read_timeout_secs: 60,
+            write_timeout_secs: 30,
+        }
+    }
+}
+
+/// How a connection is protected, as written in the configuration file.
+///
+/// The spellings accept the aliases people actually type: `tls` for implicit TLS and
+/// `starttls` — the command's own name — rather than only the kebab-cased variant names.
+/// Rejecting `starttls` in a configuration file because the enum variant is `StartTls`
+/// would be a needless papercut.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SecurityConfig {
+    /// No encryption, port 119.
+    #[serde(rename = "plain", alias = "none", alias = "cleartext")]
+    Plain,
+    /// TLS from the first byte, port 563. The default, because it should be.
+    #[default]
+    #[serde(rename = "implicit-tls", alias = "tls", alias = "implicit_tls")]
+    ImplicitTls,
+    /// Plaintext then `STARTTLS`, port 119.
+    #[serde(rename = "starttls", alias = "start-tls", alias = "start_tls")]
+    StartTls,
+}
+
+impl From<SecurityConfig> for Security {
+    fn from(value: SecurityConfig) -> Self {
+        match value {
+            SecurityConfig::Plain => Self::Plain,
+            SecurityConfig::ImplicitTls => Self::ImplicitTls,
+            SecurityConfig::StartTls => Self::StartTls,
+        }
+    }
+}
+
+/// Response size limits, in the configuration file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct LimitsConfig {
+    /// Largest single response line, in octets.
+    pub max_line_bytes: usize,
+    /// Largest multi-line block, in octets.
+    pub max_block_bytes: usize,
+    /// Largest number of lines in a multi-line block.
+    pub max_block_lines: usize,
+}
+
+impl Default for LimitsConfig {
+    fn default() -> Self {
+        let defaults = Limits::DEFAULT;
+        Self {
+            max_line_bytes: defaults.max_line_len,
+            max_block_bytes: defaults.max_block_bytes,
+            max_block_lines: defaults.max_block_lines,
+        }
+    }
+}
+
+impl From<LimitsConfig> for Limits {
+    fn from(value: LimitsConfig) -> Self {
+        Self {
+            max_line_len: value.max_line_bytes,
+            max_block_bytes: value.max_block_bytes,
+            max_block_lines: value.max_block_lines,
+        }
+    }
+}
+
+/// User interface preferences.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct UiConfig {
+    /// How many overview records to request per round trip.
+    ///
+    /// Smaller values make a large group appear sooner and cost more round trips.
+    pub overview_chunk: u64,
+
+    /// How many of a group's newest articles to load when it is opened.
+    pub initial_articles: u64,
+
+    /// `strftime` format for dates in the article list.
+    pub date_format: String,
+}
+
+impl Default for UiConfig {
+    fn default() -> Self {
+        Self {
+            overview_chunk: 500,
+            initial_articles: 300,
+            date_format: "%Y-%m-%d %H:%M".to_owned(),
+        }
+    }
+}
+
+impl Config {
+    /// The path the configuration is read from, unless overridden.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the platform has no configuration directory.
+    pub fn default_path() -> anyhow::Result<PathBuf> {
+        let directories = directories::ProjectDirs::from("", "", APP_NAME)
+            .context("this platform has no configuration directory")?;
+        Ok(directories.config_dir().join("config.toml"))
+    }
+
+    /// Loads the configuration from `path`, or the default path if `path` is `None`.
+    ///
+    /// A missing file yields the defaults: the reader is usable with command-line
+    /// arguments alone, and refusing to start without a configuration file would be
+    /// gratuitous.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the file exists but cannot be read or parsed, or if the parsed
+    /// configuration is inconsistent. A configuration file that is present and wrong is
+    /// always an error: silently ignoring it would be worse than refusing to start.
+    pub fn load(path: Option<&Path>) -> anyhow::Result<Self> {
+        let path = match path {
+            Some(path) => path.to_path_buf(),
+            None => match Self::default_path() {
+                Ok(path) => path,
+                // No config directory is not fatal; it just means no config file.
+                Err(_) => return Ok(Self::default()),
+            },
+        };
+
+        if !path.exists() {
+            tracing::debug!(path = %path.display(), "no configuration file; using defaults");
+            return Ok(Self::default());
+        }
+
+        let text = std::fs::read_to_string(&path)
+            .with_context(|| format!("reading {}", path.display()))?;
+        let config: Self =
+            toml::from_str(&text).with_context(|| format!("parsing {}", path.display()))?;
+
+        config
+            .validate()
+            .with_context(|| format!("in {}", path.display()))?;
+        tracing::debug!(path = %path.display(), servers = config.servers.len(), "configuration loaded");
+        Ok(config)
+    }
+
+    /// Checks the configuration for contradictions.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a server has no host, if `default_server` names a server that
+    /// does not exist, or if a server sets both `password` and `password_command`.
+    pub fn validate(&self) -> anyhow::Result<()> {
+        if let Some(name) = &self.default_server
+            && !self.servers.contains_key(name)
+        {
+            bail!("default_server = {name:?} but no server by that name is defined");
+        }
+
+        for (name, server) in &self.servers {
+            if server.host.trim().is_empty() {
+                bail!("server {name:?} has no host");
+            }
+            if server.password.is_some() && server.password_command.is_some() {
+                bail!(
+                    "server {name:?} sets both password and password_command; \
+                     pick one so it is clear which applies"
+                );
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Looks up a server by name, or the default server if `name` is `None`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error naming the servers that *are* defined, which is more useful than
+    /// "not found".
+    pub fn server<'a>(&'a self, name: Option<&str>) -> anyhow::Result<(&'a str, &'a ServerConfig)> {
+        if let Some(name) = name {
+            // The key is returned rather than the argument, so the borrow is tied to the
+            // configuration rather than to the caller's string.
+            let (key, server) = self.servers.get_key_value(name).with_context(|| {
+                format!(
+                    "no server named {name:?}; defined servers: {}",
+                    self.server_names()
+                )
+            })?;
+            return Ok((key.as_str(), server));
+        }
+
+        if let Some(default) = &self.default_server {
+            let server = self
+                .servers
+                .get(default)
+                .context("default_server names a server that is not defined")?;
+            return Ok((default.as_str(), server));
+        }
+
+        // Exactly one server needs no naming.
+        let mut iter = self.servers.iter();
+        match (iter.next(), iter.next()) {
+            (Some((name, server)), None) => Ok((name.as_str(), server)),
+            (None, _) => bail!(
+                "no servers are configured; pass --host, or add a [servers.<name>] \
+                 section to the configuration file (see `nntp-tui config init`)"
+            ),
+            _ => bail!(
+                "several servers are configured; pass --server <name> or set \
+                 default_server. Defined: {}",
+                self.server_names()
+            ),
+        }
+    }
+
+    fn server_names(&self) -> String {
+        if self.servers.is_empty() {
+            return "(none)".to_owned();
+        }
+        self.servers
+            .keys()
+            .map(String::as_str)
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+
+    /// A commented example configuration, for `nntp-tui config init`.
+    pub fn example_toml() -> String {
+        // Written by hand rather than serialised, so it can carry comments. The values
+        // match the defaults in this module; the test below keeps them honest.
+        format!(
+            r#"# Configuration for nntp-tui.
+#
+# Every setting has a default, so you can delete anything you do not need.
+
+# Which server to use when --server is not given. Optional if only one is defined.
+default_server = "eternal-september"
+
+[servers.eternal-september]
+host = "news.eternal-september.org"
+# Defaults to 563 for implicit-tls and 119 otherwise.
+port = 563
+# plain | implicit-tls | starttls.  Prefer implicit-tls.
+security = "implicit-tls"
+username = "your-username"
+# Prefer password_command: a password written here is a password in every backup.
+# password = "..."
+password_command = "pass show news/eternal-september"
+# Only set this if you understand that the password crosses the network in clear text.
+allow_plaintext_auth = false
+# For a server signed by a private certificate authority.
+# extra_ca_file = "/etc/ssl/private-ca.pem"
+# If the certificate names a host other than the one you connect to.
+# tls_server_name = "news.example.org"
+connect_timeout_secs = 20
+read_timeout_secs = 60
+write_timeout_secs = 30
+
+# A second server, to show that several can coexist.
+[servers.local-test]
+host = "127.0.0.1"
+port = 1119
+security = "plain"
+
+[limits]
+# Guards against a server that never terminates a line or a block.
+max_line_bytes = {max_line_bytes}
+max_block_bytes = {max_block_bytes}
+max_block_lines = {max_block_lines}
+
+[ui]
+# Overview records fetched per round trip: smaller shows the list sooner.
+overview_chunk = {overview_chunk}
+# How many of a group's newest articles to load when it is opened.
+initial_articles = {initial_articles}
+date_format = "{date_format}"
+"#,
+            max_line_bytes = LimitsConfig::default().max_line_bytes,
+            max_block_bytes = LimitsConfig::default().max_block_bytes,
+            max_block_lines = LimitsConfig::default().max_block_lines,
+            overview_chunk = UiConfig::default().overview_chunk,
+            initial_articles = UiConfig::default().initial_articles,
+            date_format = UiConfig::default().date_format,
+        )
+    }
+}
+
+impl ServerConfig {
+    /// Builds connection options from this server definition.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the host is empty.
+    pub fn connect_options(&self, limits: Limits) -> anyhow::Result<ConnectOptions> {
+        if self.host.trim().is_empty() {
+            bail!("no host configured");
+        }
+
+        let security: Security = self.security.into();
+        let mut options = ConnectOptions::new(self.host.trim())
+            .security(security)
+            .connect_timeout(Duration::from_secs(self.connect_timeout_secs))
+            .read_timeout(Duration::from_secs(self.read_timeout_secs))
+            .write_timeout(Duration::from_secs(self.write_timeout_secs))
+            .limits(limits);
+
+        // security() resets the port to that mode's default, so an explicit port is
+        // applied afterwards.
+        if let Some(port) = self.port {
+            options = options.port(port);
+        }
+
+        #[cfg(feature = "tls")]
+        {
+            let mut tls = nntp_client::TlsOptions::new();
+            if let Some(path) = &self.extra_ca_file {
+                tls = tls.extra_ca_file(path);
+            }
+            if let Some(name) = &self.tls_server_name {
+                tls = tls.server_name(name);
+            }
+            options = options.tls_options(tls);
+        }
+
+        Ok(options)
+    }
+
+    /// The password, running [`Self::password_command`] if that is how it is supplied.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the command cannot be run, exits non-zero, or produces no
+    /// output. A password command that fails must not be mistaken for "no password":
+    /// that would send an empty password to the server.
+    pub fn resolve_password(&self) -> anyhow::Result<Option<String>> {
+        if let Some(password) = &self.password {
+            return Ok(Some(password.clone()));
+        }
+
+        let Some(command) = &self.password_command else {
+            return Ok(None);
+        };
+
+        tracing::debug!("running password_command");
+        let output =
+            run_shell(command).with_context(|| format!("running password_command {command:?}"))?;
+
+        let first_line = output
+            .lines()
+            .next()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .with_context(|| format!("password_command {command:?} produced no output"))?;
+
+        Ok(Some(first_line.to_owned()))
+    }
+}
+
+/// Runs a command through the platform shell and returns its standard output.
+fn run_shell(command: &str) -> anyhow::Result<String> {
+    let output = if cfg!(windows) {
+        std::process::Command::new("cmd")
+            .args(["/C", command])
+            .output()
+    } else {
+        std::process::Command::new("sh")
+            .args(["-c", command])
+            .output()
+    }
+    .context("could not start the shell")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        bail!("command failed with {}: {}", output.status, stderr.trim());
+    }
+
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse(text: &str) -> anyhow::Result<Config> {
+        let config: Config = toml::from_str(text)?;
+        config.validate()?;
+        Ok(config)
+    }
+
+    #[test]
+    fn an_empty_file_is_valid() {
+        let config = parse("").unwrap();
+        assert_eq!(config, Config::default());
+        assert!(config.servers.is_empty());
+        assert_eq!(config.ui.overview_chunk, 500);
+    }
+
+    #[test]
+    fn parses_a_realistic_file() {
+        let config = parse(
+            r#"
+            default_server = "es"
+
+            [servers.es]
+            host = "news.eternal-september.org"
+            security = "implicit-tls"
+            username = "bob"
+            password_command = "pass show news"
+
+            [servers.local]
+            host = "127.0.0.1"
+            port = 1119
+            security = "plain"
+
+            [ui]
+            overview_chunk = 50
+            "#,
+        )
+        .unwrap();
+
+        assert_eq!(config.servers.len(), 2);
+        assert_eq!(config.ui.overview_chunk, 50);
+        // Unset UI fields keep their defaults.
+        assert_eq!(config.ui.initial_articles, 300);
+
+        let (name, server) = config.server(None).unwrap();
+        assert_eq!(name, "es");
+        assert_eq!(server.security, SecurityConfig::ImplicitTls);
+        assert!(!server.allow_plaintext_auth);
+    }
+
+    #[test]
+    fn accepts_the_spellings_people_type() {
+        for (text, expected) in [
+            ("plain", SecurityConfig::Plain),
+            ("none", SecurityConfig::Plain),
+            ("implicit-tls", SecurityConfig::ImplicitTls),
+            ("tls", SecurityConfig::ImplicitTls),
+            ("starttls", SecurityConfig::StartTls),
+            ("start-tls", SecurityConfig::StartTls),
+        ] {
+            let config = parse(&format!("[servers.a]\nhost=\"x\"\nsecurity=\"{text}\"\n"))
+                .unwrap_or_else(|error| panic!("{text:?} should parse: {error}"));
+            assert_eq!(config.server(None).unwrap().1.security, expected, "{text}");
+        }
+
+        // A spelling nobody uses is still an error, with the accepted ones listed.
+        let error = parse("[servers.a]\nhost=\"x\"\nsecurity=\"ssl\"\n")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("starttls") || error.contains("plain"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn serialises_back_to_the_canonical_spelling() {
+        // `config show` must not print something the parser would reject.
+        let config = parse("[servers.a]\nhost=\"x\"\nsecurity=\"tls\"\n").unwrap();
+        let text = toml::to_string(&config).unwrap();
+        assert!(text.contains("implicit-tls"), "{text}");
+        assert_eq!(parse(&text).unwrap(), config);
+    }
+
+    #[test]
+    fn defaults_to_tls_when_security_is_not_stated() {
+        let config = parse("[servers.a]\nhost = \"x\"\n").unwrap();
+        let (_, server) = config.server(None).unwrap();
+        assert_eq!(server.security, SecurityConfig::ImplicitTls);
+    }
+
+    #[test]
+    fn a_single_server_needs_no_naming() {
+        let config = parse("[servers.only]\nhost = \"x\"\n").unwrap();
+        assert_eq!(config.server(None).unwrap().0, "only");
+    }
+
+    #[test]
+    fn several_servers_without_a_default_is_an_error_that_lists_them() {
+        let config = parse("[servers.a]\nhost=\"x\"\n[servers.b]\nhost=\"y\"\n").unwrap();
+        let error = config.server(None).unwrap_err().to_string();
+        assert!(error.contains("--server"), "{error}");
+        assert!(error.contains('a') && error.contains('b'), "{error}");
+    }
+
+    #[test]
+    fn no_servers_points_at_the_way_out() {
+        let error = Config::default().server(None).unwrap_err().to_string();
+        assert!(error.contains("--host"), "{error}");
+        assert!(error.contains("config init"), "{error}");
+    }
+
+    #[test]
+    fn an_unknown_server_name_lists_the_known_ones() {
+        let config = parse("[servers.a]\nhost=\"x\"\n").unwrap();
+        let error = config.server(Some("b")).unwrap_err().to_string();
+        assert!(error.contains("\"b\""), "{error}");
+        assert!(error.contains('a'), "{error}");
+    }
+
+    #[test]
+    fn rejects_a_default_server_that_does_not_exist() {
+        let error = parse("default_server = \"ghost\"\n")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("ghost"), "{error}");
+    }
+
+    #[test]
+    fn rejects_a_server_with_no_host() {
+        let error = parse("[servers.a]\nhost = \"\"\n").unwrap_err().to_string();
+        assert!(error.contains("no host"), "{error}");
+    }
+
+    #[test]
+    fn rejects_both_password_and_password_command() {
+        let error = parse("[servers.a]\nhost=\"x\"\npassword=\"p\"\npassword_command=\"c\"\n")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("pick one"), "{error}");
+    }
+
+    #[test]
+    fn rejects_an_unknown_key_rather_than_ignoring_it() {
+        // A typo in a configuration file should be reported, not silently dropped.
+        let error = parse("[servers.a]\nhost=\"x\"\nsecurty=\"plain\"\n")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("secur"), "{error}");
+    }
+
+    #[test]
+    fn security_picks_the_conventional_port_unless_one_is_given() {
+        let tls = ServerConfig {
+            host: "x".to_owned(),
+            security: SecurityConfig::ImplicitTls,
+            ..ServerConfig::default()
+        };
+        assert_eq!(
+            tls.connect_options(Limits::DEFAULT).unwrap().port,
+            nntp_client::DEFAULT_TLS_PORT
+        );
+
+        let plain = ServerConfig {
+            host: "x".to_owned(),
+            security: SecurityConfig::Plain,
+            ..ServerConfig::default()
+        };
+        assert_eq!(
+            plain.connect_options(Limits::DEFAULT).unwrap().port,
+            nntp_client::DEFAULT_PORT
+        );
+
+        let explicit = ServerConfig {
+            host: "x".to_owned(),
+            security: SecurityConfig::ImplicitTls,
+            port: Some(5563),
+            ..ServerConfig::default()
+        };
+        assert_eq!(
+            explicit.connect_options(Limits::DEFAULT).unwrap().port,
+            5563
+        );
+    }
+
+    #[test]
+    fn connect_options_refuse_an_empty_host() {
+        assert!(
+            ServerConfig::default()
+                .connect_options(Limits::DEFAULT)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn limits_round_trip_through_the_config_types() {
+        let limits: Limits = LimitsConfig::default().into();
+        assert_eq!(limits, Limits::DEFAULT);
+    }
+
+    #[test]
+    fn resolves_a_password_from_a_command() {
+        let server = ServerConfig {
+            host: "x".to_owned(),
+            password_command: Some(if cfg!(windows) {
+                "echo hunter2".to_owned()
+            } else {
+                "printf 'hunter2\\nignored\\n'".to_owned()
+            }),
+            ..ServerConfig::default()
+        };
+        assert_eq!(
+            server.resolve_password().unwrap().as_deref(),
+            Some("hunter2")
+        );
+    }
+
+    #[test]
+    fn a_failing_password_command_is_an_error_not_an_empty_password() {
+        let server = ServerConfig {
+            host: "x".to_owned(),
+            password_command: Some("exit 3".to_owned()),
+            ..ServerConfig::default()
+        };
+        assert!(server.resolve_password().is_err());
+    }
+
+    #[test]
+    fn a_silent_password_command_is_an_error() {
+        let server = ServerConfig {
+            host: "x".to_owned(),
+            password_command: Some("true".to_owned()),
+            ..ServerConfig::default()
+        };
+        assert!(server.resolve_password().is_err());
+    }
+
+    #[test]
+    fn a_literal_password_is_used_as_is() {
+        let server = ServerConfig {
+            host: "x".to_owned(),
+            password: Some("literal".to_owned()),
+            ..ServerConfig::default()
+        };
+        assert_eq!(
+            server.resolve_password().unwrap().as_deref(),
+            Some("literal")
+        );
+    }
+
+    #[test]
+    fn no_password_configured_yields_none() {
+        let server = ServerConfig {
+            host: "x".to_owned(),
+            ..ServerConfig::default()
+        };
+        assert_eq!(server.resolve_password().unwrap(), None);
+    }
+
+    #[test]
+    fn the_example_configuration_is_valid_and_matches_the_defaults() {
+        // The example is hand-written so it can carry comments, which means it can drift
+        // from the defaults it claims to show. This test is what stops that.
+        let config = parse(&Config::example_toml()).unwrap();
+        assert_eq!(config.limits, LimitsConfig::default());
+        assert_eq!(config.ui, UiConfig::default());
+        assert_eq!(config.servers.len(), 2);
+        assert_eq!(config.server(None).unwrap().0, "eternal-september");
+    }
+
+    #[test]
+    fn a_missing_file_yields_the_defaults() {
+        let path = std::env::temp_dir().join("nntp-tui-does-not-exist.toml");
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(Config::load(Some(&path)).unwrap(), Config::default());
+    }
+
+    #[test]
+    fn a_present_but_broken_file_is_an_error() {
+        let path = std::env::temp_dir().join("nntp-tui-broken-config.toml");
+        std::fs::write(&path, b"this is not toml {{{").unwrap();
+        let error = Config::load(Some(&path)).unwrap_err().to_string();
+        assert!(error.contains("parsing"), "{error}");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_config_that_round_trips_through_serialisation_is_unchanged() {
+        let config = parse(&Config::example_toml()).unwrap();
+        let text = toml::to_string(&config).unwrap();
+        assert_eq!(parse(&text).unwrap(), config);
+    }
+}

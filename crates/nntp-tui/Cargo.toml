@@ -11,12 +11,18 @@ keywords.workspace = true
 categories.workspace = true
 default-run = "nntp-tui"
 
+[features]
+default = ["tls"]
+## TLS support, forwarded to nntp-client.
+tls = ["nntp-client/tls"]
+
 [[bin]]
 name = "nntp-tui"
 path = "src/main.rs"
 
 [dependencies]
 anyhow.workspace = true
+chrono.workspace = true
 clap.workspace = true
 crossterm.workspace = true
 directories.workspace = true

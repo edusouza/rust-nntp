@@ -69,6 +69,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - TLS in `nntp-testserver`: a certificate authority and server certificate generated at
   start-up, exposed as PEM so a client can be told to trust them, plus `--tls`,
   `--starttls` and `--ca-out` on the binary.
+- `nntp-tui`, the executable, with a command-line surface:
+  - `doctor` — probes a server and reports greeting, capabilities, reader mode,
+    authentication, overview command, clock skew and overview layout, optionally selecting
+    a group and fetching an article from it. A probe that fails is reported rather than
+    fatal. This is the only practical way to find out what a real server does, since the
+    test suite runs against a fake one;
+  - `groups`, `overview`, `article` — a usable reader before the terminal UI exists;
+  - `config path | show | init` — writes a commented example configuration and reports
+    where it and the log file live;
+  - TOML configuration with named servers, `password_command` so the password can live in
+    a password manager, per-server TLS settings, and field-by-field overrides from the
+    command line;
+  - logging to standard error for the command line and to a file for the terminal UI,
+    which owns the terminal.
+- End-to-end tests of the built binary as a subprocess, covering argument parsing, the
+  configuration merge, connection set-up and output formatting together.
 - End-to-end tests: the real client over a real socket against that server, covering the
   full reading session, each misbehaviour above, and the TLS paths — including the two
   failures that matter, an untrusted certificate and a certificate for the wrong name.
@@ -96,6 +112,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `GroupName`, `MessageId` and `HeaderName` now honour field width in `Display`
+  (`f.pad` rather than `f.write_str`), so `{:<40}` in a caller's format string actually
+  pads. Every aligned column built from these types was silently ragged; the group listing
+  is what made it visible.
 - A `501` reply is no longer read as "this server does not implement the command". Only
   `500` and `503` say anything about the command; `501` is a complaint about the
   *arguments*, and servers use it to refuse an `OVER` range with an open upper bound.

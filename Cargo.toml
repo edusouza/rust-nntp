@@ -20,7 +20,8 @@ categories = ["command-line-utilities", "network-programming"]
 [workspace.dependencies]
 # Internal crates
 nntp-proto = { path = "crates/nntp-proto", version = "0.1.0" }
-nntp-client = { path = "crates/nntp-client", version = "0.1.0" }
+# default-features = false so that each consumer opts into TLS explicitly.
+nntp-client = { path = "crates/nntp-client", version = "0.1.0", default-features = false }
 nntp-testserver = { path = "crates/nntp-testserver", version = "0.1.0" }
 
 # External

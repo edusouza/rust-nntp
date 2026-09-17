@@ -54,7 +54,10 @@ impl core::hash::Hash for HeaderName {
 
 impl core::fmt::Display for HeaderName {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.write_str(&self.0)
+        // `pad` rather than `write_str`, so that `{:<40}` in a caller's format string
+        // actually pads. A manual `Display` that ignores the width silently breaks every
+        // aligned column a caller tries to build.
+        f.pad(&self.0)
     }
 }
 
@@ -354,6 +357,12 @@ mod tests {
         assert!(headers.contains("Message-Id"));
         let (name, _) = headers.iter().next().unwrap();
         assert_eq!(name.as_str(), "mEsSaGe-ID");
+    }
+
+    #[test]
+    fn header_name_display_honours_field_width() {
+        let name = HeaderName::parse("Subject").unwrap();
+        assert_eq!(format!("[{name:<10}]"), "[Subject   ]");
     }
 
     #[test]

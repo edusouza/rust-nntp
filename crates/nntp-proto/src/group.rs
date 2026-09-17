@@ -57,7 +57,10 @@ impl GroupName {
 
 impl core::fmt::Display for GroupName {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.write_str(&self.0)
+        // `pad` rather than `write_str`, so that `{:<40}` in a caller's format string
+        // actually pads. A manual `Display` that ignores the width silently breaks every
+        // aligned column a caller tries to build.
+        f.pad(&self.0)
     }
 }
 
@@ -181,6 +184,19 @@ impl PostingStatus {
     pub const fn allows_posting(&self) -> bool {
         matches!(self, Self::Permitted | Self::Moderated)
     }
+
+    /// A short human-readable description, for a group listing.
+    pub fn describe(&self) -> String {
+        match self {
+            Self::Permitted => "posting allowed".to_owned(),
+            Self::Prohibited => "read only".to_owned(),
+            Self::Moderated => "moderated".to_owned(),
+            Self::Junked => "postings junked".to_owned(),
+            Self::Disabled => "locally disabled".to_owned(),
+            Self::AliasFor(target) => format!("alias for {target}"),
+            Self::Other(flag) => format!("status {flag:?}"),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -215,6 +231,16 @@ mod tests {
             assert!(GroupName::parse(bad).is_err(), "expected {bad:?} rejected");
         }
         assert!(GroupName::parse(&"a".repeat(MAX_GROUP_NAME_LEN + 1)).is_err());
+    }
+
+    #[test]
+    fn display_honours_field_width() {
+        // Callers build aligned listings with `{:<20}`; a Display that ignored the width
+        // would leave every column ragged.
+        let name = GroupName::parse("misc.test").unwrap();
+        assert_eq!(format!("[{name:<20}]"), "[misc.test           ]");
+        assert_eq!(format!("[{name:>20}]"), "[           misc.test]");
+        assert_eq!(format!("[{name}]"), "[misc.test]");
     }
 
     #[test]
@@ -288,5 +314,16 @@ mod tests {
         assert!(PostingStatus::parse("m").allows_posting());
         assert!(!PostingStatus::parse("n").allows_posting());
         assert!(!PostingStatus::parse("weird").allows_posting());
+    }
+
+    #[test]
+    fn describes_every_posting_status() {
+        assert_eq!(PostingStatus::parse("y").describe(), "posting allowed");
+        assert_eq!(PostingStatus::parse("n").describe(), "read only");
+        assert_eq!(PostingStatus::parse("m").describe(), "moderated");
+        assert_eq!(PostingStatus::parse("j").describe(), "postings junked");
+        assert_eq!(PostingStatus::parse("x").describe(), "locally disabled");
+        assert_eq!(PostingStatus::parse("=other").describe(), "alias for other");
+        assert_eq!(PostingStatus::parse("q").describe(), "status \"q\"");
     }
 }
