@@ -11,12 +11,21 @@ keywords.workspace = true
 categories.workspace = true
 publish = false
 
+[features]
+default = ["tls"]
+## Serve over TLS with a self-signed certificate generated at start-up.
+tls = ["dep:rcgen", "dep:rustls", "dep:rustls-pemfile", "dep:rustls-pki-types"]
+
 [[bin]]
 name = "nntp-testserver"
 path = "src/main.rs"
 
 [dependencies]
 nntp-proto.workspace = true
+rcgen = { workspace = true, optional = true }
+rustls = { workspace = true, optional = true }
+rustls-pemfile = { workspace = true, optional = true }
+rustls-pki-types = { workspace = true, optional = true }
 tracing.workspace = true
 tracing-subscriber.workspace = true
 

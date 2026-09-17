@@ -61,15 +61,15 @@ the client or surfaced in the UI · ⬜ not implemented · 🚫 out of scope for
 
 | Feature | Status | Notes |
 | --- | --- | --- |
-| Implicit TLS (port 563) | ⬜ | |
-| `STARTTLS` on port 119 | 🟡 | Command encoded; the TLS upgrade itself is milestone M4. |
+| Implicit TLS (port 563) | ✅ | rustls with the Mozilla root set; verification cannot be disabled from the configuration. |
+| `STARTTLS` on port 119 | ✅ | Refused after authentication and on an already-encrypted link; the capability list read in the clear is discarded afterwards, per §2.2. Data buffered after the `382` aborts the upgrade. |
 
 ## RFC 4643 — Authentication
 
 | Command | Status | Notes |
 | --- | --- | --- |
 | `AUTHINFO USER` / `PASS` | ✅ | Refused on a plaintext link unless explicitly allowed; password redacted from logs; capabilities re-read afterwards per RFC 4643 §2.1. |
-| `AUTHINFO SASL` | ⬜ | Needed by a minority of commercial providers. |
+| `AUTHINFO SASL` | ⬜ | Needed by a minority of commercial providers. Tracked as an issue. |
 
 ## RFC 8054 — Compression
 

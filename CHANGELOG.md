@@ -58,8 +58,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     disappearing mid-session;
   - a `TestServer` that binds an ephemeral loopback port so tests run in parallel, and a
     standalone binary for driving the reader offline.
+- TLS, behind a default-on `tls` feature:
+  - implicit TLS on port 563 and `STARTTLS` on 119 (RFC 4642), with the handshake driven
+    to completion at connect time so a certificate problem is reported by the connection
+    attempt rather than by whichever command happened to be first;
+  - `TlsOptions` for a private certificate authority (`extra_ca_file`) and for verifying
+    against a name other than the host connected to;
+  - `Security::{Plain, ImplicitTls, StartTls}`, where choosing a mode also selects that
+    mode's conventional port.
+- TLS in `nntp-testserver`: a certificate authority and server certificate generated at
+  start-up, exposed as PEM so a client can be told to trust them, plus `--tls`,
+  `--starttls` and `--ca-out` on the binary.
 - End-to-end tests: the real client over a real socket against that server, covering the
-  full reading session and each misbehaviour above.
+  full reading session, each misbehaviour above, and the TLS paths — including the two
+  failures that matter, an untrusted certificate and a certificate for the wrong name.
 - Integration tests driving the public API with captured INN-shaped output.
 - Cargo workspace skeleton with four crates (`nntp-proto`, `nntp-client`,
   `nntp-testserver`, `nntp-tui`), shared lint configuration and dual MIT/Apache-2.0
@@ -74,6 +86,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   opts in. Sending a password in clear text should be a decision, not a default.
 - Passwords are redacted from command logs at the point of encoding, so no log level can
   reveal one.
+- Certificate verification is always on. There is no `accept_invalid_certs` flag anywhere
+  in the crate, and none can be reached from the configuration file; a private CA is
+  supported instead.
+- `STARTTLS` follows RFC 4642 §2.2 rather than treating it as an optional nicety: the
+  upgrade is refused after authentication, the capability list learned in the clear is
+  discarded once encrypted, and any data buffered between the `382` response and the
+  handshake aborts the connection instead of being handed to the TLS layer.
 
 ### Fixed
 

@@ -9,14 +9,49 @@ use std::net::{TcpStream, ToSocketAddrs};
 use std::time::Duration;
 
 use crate::client::{Client, ClientOptions};
+#[cfg(feature = "tls")]
+use crate::connection::Connection;
 use crate::error::{ClientError, Result};
 use crate::limits::Limits;
+#[cfg(feature = "tls")]
+use crate::tls::{self, TlsOptions};
 
 /// The default NNTP port (RFC 3977 §9.3).
 pub const DEFAULT_PORT: u16 = 119;
 
 /// The default port for implicit TLS (RFC 4642).
 pub const DEFAULT_TLS_PORT: u16 = 563;
+
+/// How the connection is protected.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Security {
+    /// No encryption. The default port is 119.
+    #[default]
+    Plain,
+    /// TLS from the first byte. The default port is 563 (RFC 4642).
+    ImplicitTls,
+    /// Start in the clear, then upgrade with `STARTTLS` (RFC 4642 §2).
+    ///
+    /// Prefer [`Self::ImplicitTls`] where the server offers it: `STARTTLS` exposes the
+    /// greeting and the capability list to anyone on the path, and a downgrade attack has
+    /// to be detected rather than prevented.
+    StartTls,
+}
+
+impl Security {
+    /// The conventional port for this mode.
+    pub const fn default_port(self) -> u16 {
+        match self {
+            Self::Plain | Self::StartTls => DEFAULT_PORT,
+            Self::ImplicitTls => DEFAULT_TLS_PORT,
+        }
+    }
+
+    /// Whether traffic is encrypted once the connection is established.
+    pub const fn is_encrypted(self) -> bool {
+        matches!(self, Self::ImplicitTls | Self::StartTls)
+    }
+}
 
 /// How to reach a server.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -37,6 +72,11 @@ pub struct ConnectOptions {
     pub write_timeout: Duration,
     /// Response size limits.
     pub limits: Limits,
+    /// Whether and how to encrypt the connection.
+    pub security: Security,
+    /// How to verify the server's certificate.
+    #[cfg(feature = "tls")]
+    pub tls: TlsOptions,
     /// Disable Nagle's algorithm.
     ///
     /// On by default: NNTP is a request/response protocol with small commands, and
@@ -54,8 +94,31 @@ impl ConnectOptions {
             read_timeout: Duration::from_secs(60),
             write_timeout: Duration::from_secs(30),
             limits: Limits::default(),
+            security: Security::Plain,
+            #[cfg(feature = "tls")]
+            tls: TlsOptions::new(),
             no_delay: true,
         }
+    }
+
+    /// Sets the security mode, and the port to that mode's default.
+    ///
+    /// Call this before [`Self::port`] if both are being set: changing the mode resets the
+    /// port, on the grounds that asking for TLS and silently keeping port 119 is a worse
+    /// surprise than the reverse.
+    #[must_use]
+    pub fn security(mut self, security: Security) -> Self {
+        self.security = security;
+        self.port = security.default_port();
+        self
+    }
+
+    /// Sets the TLS verification options.
+    #[cfg(feature = "tls")]
+    #[must_use]
+    pub fn tls_options(mut self, options: TlsOptions) -> Self {
+        self.tls = options;
+        self
     }
 
     /// Sets the port.
@@ -103,12 +166,20 @@ impl ConnectOptions {
 pub enum Transport {
     /// An unencrypted TCP connection.
     Plain(TcpStream),
+    /// A TLS connection.
+    ///
+    /// Boxed because a rustls session is around 1.5 KiB and would otherwise make every
+    /// `Transport` — including the plaintext one — that large.
+    #[cfg(feature = "tls")]
+    Tls(Box<tls::TlsStream>),
 }
 
 impl Read for Transport {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         match self {
             Self::Plain(stream) => stream.read(buf),
+            #[cfg(feature = "tls")]
+            Self::Tls(stream) => stream.read(buf),
         }
     }
 }
@@ -117,12 +188,16 @@ impl Write for Transport {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
         match self {
             Self::Plain(stream) => stream.write(buf),
+            #[cfg(feature = "tls")]
+            Self::Tls(stream) => stream.write(buf),
         }
     }
 
     fn flush(&mut self) -> std::io::Result<()> {
         match self {
             Self::Plain(stream) => stream.flush(),
+            #[cfg(feature = "tls")]
+            Self::Tls(stream) => stream.flush(),
         }
     }
 }
@@ -132,25 +207,66 @@ impl Transport {
     pub fn is_encrypted(&self) -> bool {
         match self {
             Self::Plain(_) => false,
+            #[cfg(feature = "tls")]
+            Self::Tls(_) => true,
+        }
+    }
+
+    /// The underlying TCP socket, for setting socket options.
+    pub fn socket(&self) -> &TcpStream {
+        match self {
+            Self::Plain(stream) => stream,
+            #[cfg(feature = "tls")]
+            Self::Tls(stream) => &stream.sock,
         }
     }
 }
 
-/// Opens a TCP connection and reads the server's greeting.
+/// Opens a connection and reads the server's greeting.
 ///
-/// Does not negotiate capabilities; call [`Client::handshake`] next.
+/// For [`Security::StartTls`] this also performs the upgrade, so the returned client is
+/// already encrypted and its capability list has been re-read.
+///
+/// Does not negotiate reader mode; call [`Client::handshake`] next.
 ///
 /// # Errors
 ///
 /// Returns [`ClientError::Io`] if the host cannot be resolved or connected to,
-/// [`ClientError::Timeout`] if the handshake takes too long, and the errors of
-/// [`Client::new`] if the greeting is missing or is a refusal.
+/// [`ClientError::Timeout`] if the handshake takes too long, [`ClientError::Tls`] if TLS
+/// negotiation or certificate verification fails, and the errors of [`Client::new`] if the
+/// greeting is missing or is a refusal.
 pub fn connect(options: &ConnectOptions) -> Result<Client<Transport>> {
-    let stream = connect_tcp(options)?;
-    let encrypted = stream.is_encrypted();
+    match options.security {
+        Security::Plain => {
+            let transport = Transport::Plain(connect_tcp(options)?);
+            build(transport, options, false)
+        }
+        #[cfg(feature = "tls")]
+        Security::ImplicitTls => {
+            let socket = connect_tcp(options)?;
+            let config = tls::client_config(&options.tls)?;
+            let stream = tls::handshake(socket, &options.host, config, &options.tls)?;
+            build(Transport::Tls(Box::new(stream)), options, true)
+        }
+        #[cfg(feature = "tls")]
+        Security::StartTls => {
+            let transport = Transport::Plain(connect_tcp(options)?);
+            let client = build(transport, options, false)?;
+            upgrade_with_starttls(client, options)
+        }
+        #[cfg(not(feature = "tls"))]
+        Security::ImplicitTls | Security::StartTls => Err(ClientError::FeatureNotCompiled("TLS")),
+    }
+}
 
+/// Wraps a transport in a client, reading the greeting.
+fn build(
+    transport: Transport,
+    options: &ConnectOptions,
+    encrypted: bool,
+) -> Result<Client<Transport>> {
     Client::with_options(
-        stream,
+        transport,
         ClientOptions {
             limits: options.limits,
             encrypted,
@@ -158,8 +274,76 @@ pub fn connect(options: &ConnectOptions) -> Result<Client<Transport>> {
     )
 }
 
+/// Performs the `STARTTLS` exchange and hands back an encrypted client.
+///
+/// # Errors
+///
+/// Returns [`ClientError::Tls`] if the server does not offer `STARTTLS`, refuses it, or
+/// sends anything after the `382` response, and the errors of [`tls::handshake`] if the
+/// handshake itself fails.
+#[cfg(feature = "tls")]
+pub fn upgrade_with_starttls(
+    mut client: Client<Transport>,
+    options: &ConnectOptions,
+) -> Result<Client<Transport>> {
+    // Ask first. A server that does not offer STARTTLS will reject the command, and
+    // knowing that before sending it keeps the error message honest.
+    let capabilities = client.refresh_capabilities()?;
+    if !capabilities.is_empty() && !capabilities.has_starttls() {
+        return Err(ClientError::Tls(
+            "the server does not offer STARTTLS; use implicit TLS on port 563,              or connect in the clear if that is really what you want"
+                .to_owned(),
+        ));
+    }
+
+    let line = client
+        .connection_mut()
+        .command(&nntp_proto::Command::StartTls)?;
+    if line.code != nntp_proto::response::codes::TLS_CONTINUE {
+        return Err(ClientError::Tls(format!(
+            "the server refused STARTTLS: {} {}",
+            line.code, line.text
+        )));
+    }
+
+    // RFC 4642 §2.2: the server must send nothing between the 382 and the handshake.
+    // Anything buffered here was either injected by someone on the path or sent by a
+    // broken server; either way it must not be fed to the TLS layer.
+    if client.connection_mut().has_buffered_data() {
+        return Err(ClientError::Tls(
+            "the server sent data after its STARTTLS response, which RFC 4642 forbids;              refusing to continue"
+                .to_owned(),
+        ));
+    }
+
+    let greeting = client.greeting().clone();
+    let transport = client.into_connection().into_inner();
+
+    let socket = match transport {
+        Transport::Plain(socket) => socket,
+        // Upgrading an already-encrypted connection is a caller bug, and RFC 4642 §2.2
+        // forbids a second STARTTLS in any case.
+        Transport::Tls(_) => {
+            return Err(ClientError::Tls(
+                "this connection is already using TLS".to_owned(),
+            ));
+        }
+    };
+
+    let config = tls::client_config(&options.tls)?;
+    let stream = tls::handshake(socket, &options.host, config, &options.tls)?;
+    let connection = Connection::with_limits(Transport::Tls(Box::new(stream)), options.limits);
+
+    // from_parts discards the capability list read in the clear, as §2.2 requires.
+    let mut client = Client::from_parts(connection, greeting, true);
+    client.refresh_capabilities()?;
+    tracing::debug!("connection upgraded to TLS with STARTTLS");
+
+    Ok(client)
+}
+
 /// Opens the TCP socket and applies the socket options.
-fn connect_tcp(options: &ConnectOptions) -> Result<Transport> {
+fn connect_tcp(options: &ConnectOptions) -> Result<TcpStream> {
     let authority = options.authority();
     tracing::debug!(server = %authority, "connecting");
 
@@ -194,7 +378,7 @@ fn connect_tcp(options: &ConnectOptions) -> Result<Transport> {
                     }
                 }
                 tracing::debug!(%address, "connected");
-                return Ok(Transport::Plain(stream));
+                return Ok(stream);
             }
             Err(error) => {
                 tracing::debug!(%address, %error, "connection attempt failed");

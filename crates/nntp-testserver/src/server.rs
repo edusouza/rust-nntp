@@ -1,6 +1,5 @@
 //! The listener: accepts connections and runs a [`Session`] on each.
 
-use std::io::BufReader;
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -9,7 +8,9 @@ use std::time::Duration;
 
 use crate::config::ServerConfig;
 use crate::corpus::Corpus;
-use crate::session::Session;
+use crate::session::{Outcome, Session};
+#[cfg(feature = "tls")]
+use crate::tls::SelfSignedIdentity;
 
 /// How often the accept loop checks whether it has been asked to stop.
 const ACCEPT_POLL: Duration = Duration::from_millis(10);
@@ -23,6 +24,20 @@ pub struct TestServer {
     address: SocketAddr,
     stop: Arc<AtomicBool>,
     accept_loop: Option<JoinHandle<()>>,
+    #[cfg(feature = "tls")]
+    identity: Option<SelfSignedIdentity>,
+}
+
+/// How a server protects its connections.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TlsMode {
+    /// Plaintext only.
+    #[default]
+    Disabled,
+    /// TLS from the first byte.
+    Implicit,
+    /// Plaintext until the client sends `STARTTLS`.
+    StartTls,
 }
 
 impl TestServer {
@@ -55,6 +70,80 @@ impl TestServer {
     /// Returns an error if the port is in use, or if the socket cannot be put into
     /// non-blocking mode.
     pub fn with_port(port: u16, corpus: Corpus, config: ServerConfig) -> std::io::Result<Self> {
+        #[cfg(feature = "tls")]
+        return Self::build(port, corpus, config, None);
+        #[cfg(not(feature = "tls"))]
+        return Self::build(port, corpus, config);
+    }
+
+    /// Starts a server that serves over TLS, using a certificate generated at start-up.
+    ///
+    /// The certificate names `localhost`, and [`Self::ca_pem`] returns the authority a
+    /// client must be told to trust. Verification on the client side stays on: this is a
+    /// way to test the TLS path, not a way to skip it.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the socket cannot be bound or the certificate cannot be
+    /// generated.
+    #[cfg(feature = "tls")]
+    pub fn with_tls(corpus: Corpus, config: ServerConfig, mode: TlsMode) -> std::io::Result<Self> {
+        let identity = SelfSignedIdentity::generate("localhost").map_err(|error| {
+            std::io::Error::other(format!("could not generate a test certificate: {error}"))
+        })?;
+
+        let config = match mode {
+            TlsMode::StartTls => config.starttls(true),
+            TlsMode::Disabled | TlsMode::Implicit => config,
+        };
+
+        Self::build(0, corpus, config, Some((identity, mode)))
+    }
+
+    /// The PEM-encoded certificate authority a client must trust, for a TLS server.
+    #[cfg(feature = "tls")]
+    pub fn ca_pem(&self) -> Option<&str> {
+        self.identity
+            .as_ref()
+            .map(|identity| identity.ca_pem.as_str())
+    }
+
+    /// Writes [`Self::ca_pem`] to a file and returns the path, for clients that take a
+    /// path rather than bytes.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if there is no TLS identity or the file cannot be written.
+    #[cfg(feature = "tls")]
+    pub fn write_ca_pem(&self, path: &std::path::Path) -> std::io::Result<()> {
+        let identity = self
+            .identity
+            .as_ref()
+            .ok_or_else(|| std::io::Error::other("this server is not using TLS"))?;
+        identity.write_ca_pem(path)
+    }
+
+    #[cfg(not(feature = "tls"))]
+    fn build(port: u16, corpus: Corpus, config: ServerConfig) -> std::io::Result<Self> {
+        Self::spawn(port, corpus, config)
+    }
+
+    #[cfg(feature = "tls")]
+    fn build(
+        port: u16,
+        corpus: Corpus,
+        config: ServerConfig,
+        tls: Option<(SelfSignedIdentity, TlsMode)>,
+    ) -> std::io::Result<Self> {
+        Self::spawn(port, corpus, config, tls)
+    }
+
+    fn spawn(
+        port: u16,
+        corpus: Corpus,
+        config: ServerConfig,
+        #[cfg(feature = "tls")] tls: Option<(SelfSignedIdentity, TlsMode)>,
+    ) -> std::io::Result<Self> {
         let listener = TcpListener::bind(("127.0.0.1", port))?;
         let address = listener.local_addr()?;
         // Non-blocking accept so the loop can notice the stop flag; a blocking accept
@@ -62,9 +151,26 @@ impl TestServer {
         listener.set_nonblocking(true)?;
 
         let stop = Arc::new(AtomicBool::new(false));
+
+        #[cfg(feature = "tls")]
+        let (identity, mode, tls_config) = match tls {
+            None => (None, TlsMode::Disabled, None),
+            Some((identity, mode)) => {
+                let config = identity.server_config().map_err(std::io::Error::other)?;
+                (Some(identity), mode, Some(config))
+            }
+        };
+
         let accept_loop = {
             let stop = Arc::clone(&stop);
-            let shared = Arc::new((corpus, config));
+            let shared = Arc::new(Shared {
+                corpus,
+                config,
+                #[cfg(feature = "tls")]
+                mode,
+                #[cfg(feature = "tls")]
+                tls_config,
+            });
             std::thread::Builder::new()
                 .name("nntp-testserver".to_owned())
                 .spawn(move || accept_loop(listener, &stop, &shared))?
@@ -75,6 +181,8 @@ impl TestServer {
             address,
             stop,
             accept_loop: Some(accept_loop),
+            #[cfg(feature = "tls")]
+            identity,
         })
     }
 
@@ -116,7 +224,17 @@ impl Drop for TestServer {
     }
 }
 
-fn accept_loop(listener: TcpListener, stop: &AtomicBool, shared: &Arc<(Corpus, ServerConfig)>) {
+/// What every session thread needs.
+struct Shared {
+    corpus: Corpus,
+    config: ServerConfig,
+    #[cfg(feature = "tls")]
+    mode: TlsMode,
+    #[cfg(feature = "tls")]
+    tls_config: Option<Arc<rustls::ServerConfig>>,
+}
+
+fn accept_loop(listener: TcpListener, stop: &AtomicBool, shared: &Arc<Shared>) {
     let mut sessions: Vec<JoinHandle<()>> = Vec::new();
 
     while !stop.load(Ordering::Relaxed) {
@@ -150,25 +268,82 @@ fn accept_loop(listener: TcpListener, stop: &AtomicBool, shared: &Arc<(Corpus, S
     }
 }
 
-fn serve(stream: TcpStream, shared: &Arc<(Corpus, ServerConfig)>) {
-    let (corpus, config) = (&shared.0, &shared.1);
-
+fn serve(mut stream: TcpStream, shared: &Arc<Shared>) {
     // A test that hangs is worse than a test that fails.
     let _ = stream.set_read_timeout(Some(Duration::from_secs(30)));
     let _ = stream.set_write_timeout(Some(Duration::from_secs(30)));
     let _ = stream.set_nodelay(true);
 
-    let Ok(write_half) = stream.try_clone() else {
+    let mut session = Session::new(&shared.corpus, &shared.config);
+
+    #[cfg(feature = "tls")]
+    if shared.mode == TlsMode::Implicit {
+        let Some(config) = shared.tls_config.clone() else {
+            tracing::error!("implicit TLS was requested with no TLS configuration");
+            return;
+        };
+        let mut tls = match accept_tls(stream, config) {
+            Ok(tls) => tls,
+            Err(error) => {
+                tracing::debug!(%error, "TLS handshake failed");
+                return;
+            }
+        };
+        session.set_encrypted(true);
+        if let Err(error) = session.run_duplex(&mut tls) {
+            tracing::debug!(%error, "test server session ended");
+        }
+        return;
+    }
+
+    match session.run_duplex(&mut stream) {
+        Ok(Outcome::Closed) => {}
+        Ok(Outcome::UpgradeToTls) => upgrade(stream, &mut session, shared),
+        Err(error) => {
+            // A client that disconnects abruptly is normal in tests, not a failure.
+            tracing::debug!(%error, "test server session ended");
+        }
+    }
+}
+
+/// Completes a `STARTTLS` upgrade and resumes the session over the encrypted stream.
+#[cfg(feature = "tls")]
+fn upgrade(stream: TcpStream, session: &mut Session<'_>, shared: &Arc<Shared>) {
+    let Some(config) = shared.tls_config.clone() else {
+        tracing::error!("STARTTLS was accepted with no TLS configuration");
         return;
     };
-    let mut reader = BufReader::new(stream);
-    let mut writer = write_half;
 
-    let mut session = Session::new(corpus, config);
-    if let Err(error) = session.run(&mut reader, &mut writer) {
-        // A client that disconnects abruptly is normal in tests, not a failure.
-        tracing::debug!(%error, "test server session ended");
+    let mut tls = match accept_tls(stream, config) {
+        Ok(tls) => tls,
+        Err(error) => {
+            tracing::debug!(%error, "STARTTLS handshake failed");
+            return;
+        }
+    };
+
+    session.set_encrypted(true);
+    // No second greeting: RFC 4642 §2.2.
+    if let Err(error) = session.resume_duplex(&mut tls) {
+        tracing::debug!(%error, "test server session ended after STARTTLS");
     }
+}
+
+#[cfg(not(feature = "tls"))]
+fn upgrade(_stream: TcpStream, _session: &mut Session<'_>, _shared: &Arc<Shared>) {
+    tracing::error!("STARTTLS was accepted in a build without TLS support");
+}
+
+/// Performs the server side of a TLS handshake, driving it to completion so that a failure
+/// is reported here rather than as a confusing read error later.
+#[cfg(feature = "tls")]
+fn accept_tls(
+    mut stream: TcpStream,
+    config: Arc<rustls::ServerConfig>,
+) -> std::io::Result<rustls::StreamOwned<rustls::ServerConnection, TcpStream>> {
+    let mut connection = rustls::ServerConnection::new(config).map_err(std::io::Error::other)?;
+    connection.complete_io(&mut stream)?;
+    Ok(rustls::StreamOwned::new(connection, stream))
 }
 
 #[cfg(test)]

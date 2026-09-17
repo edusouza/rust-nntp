@@ -3,7 +3,7 @@
 //! Written against `BufRead + Write` rather than `TcpStream` so the server's own logic can
 //! be tested over in-memory buffers, the same trick the client uses.
 
-use std::io::{BufRead, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 
 use crate::config::{CapabilityProfile, GreetingMode, ServerConfig};
 use crate::corpus::{Corpus, Group};
@@ -15,6 +15,18 @@ pub enum Flow {
     Continue,
     /// Close the connection.
     Close,
+    /// The client sent `STARTTLS` and has been told to proceed; the caller must now
+    /// perform the handshake and start a fresh command phase over the encrypted stream.
+    UpgradeToTls,
+}
+
+/// Why a session stopped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Outcome {
+    /// The client quit, or the connection ended.
+    Closed,
+    /// A `STARTTLS` upgrade is pending.
+    UpgradeToTls,
 }
 
 /// Per-connection state.
@@ -27,6 +39,7 @@ struct State {
     current_article: Option<u64>,
     commands_served: usize,
     truncate_next_block: bool,
+    encrypted: bool,
     /// Set when a quirk has left the stream in a state the session cannot continue from,
     /// such as a block written without its terminator.
     close_requested: bool,
@@ -55,7 +68,18 @@ impl<'a> Session<'a> {
         }
     }
 
-    /// Runs the session to completion: greeting, then commands until `QUIT` or EOF.
+    /// Whether this session is running over an encrypted transport.
+    pub fn is_encrypted(&self) -> bool {
+        self.state.encrypted
+    }
+
+    /// Records that the transport is encrypted, so `STARTTLS` is no longer offered.
+    pub fn set_encrypted(&mut self, encrypted: bool) {
+        self.state.encrypted = encrypted;
+    }
+
+    /// Runs the session over separate read and write halves: greeting, then commands
+    /// until `QUIT` or end of input.
     ///
     /// # Errors
     ///
@@ -66,22 +90,84 @@ impl<'a> Session<'a> {
         &mut self,
         input: &mut impl BufRead,
         output: &mut impl Write,
-    ) -> std::io::Result<()> {
+    ) -> std::io::Result<Outcome> {
         if self.greet(output)? == Flow::Close {
-            return Ok(());
+            return Ok(Outcome::Closed);
         }
 
         let mut line = Vec::new();
         loop {
             line.clear();
-            let read = input.read_until(b'\n', &mut line)?;
-            if read == 0 {
-                return Ok(());
+            if input.read_until(b'\n', &mut line)? == 0 {
+                return Ok(Outcome::Closed);
             }
 
             let command = trim_eol(&line).to_vec();
-            if self.handle(&command, output)? == Flow::Close {
-                return Ok(());
+            match self.handle(&command, output)? {
+                Flow::Continue => {}
+                Flow::Close => return Ok(Outcome::Closed),
+                Flow::UpgradeToTls => return Ok(Outcome::UpgradeToTls),
+            }
+        }
+    }
+
+    /// Runs the session over a single duplex stream, such as a socket or a TLS stream.
+    ///
+    /// A TLS stream cannot be split into independent halves, so the buffered reader and
+    /// the writer share one handle.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::run`].
+    pub fn run_duplex<S: Read + Write>(&mut self, stream: &mut S) -> std::io::Result<Outcome> {
+        let mut reader = BufReader::new(stream);
+        if self.greet(reader.get_mut())? == Flow::Close {
+            return Ok(Outcome::Closed);
+        }
+        self.command_loop_duplex(&mut reader)
+    }
+
+    /// Runs the command loop over a duplex stream *without* sending a greeting.
+    ///
+    /// Used for the phase after a `STARTTLS` handshake: RFC 4642 §2.2 says the server does
+    /// not repeat its greeting, so sending one would desynchronise every client that
+    /// follows the specification.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::run`].
+    pub fn resume_duplex<S: Read + Write>(&mut self, stream: &mut S) -> std::io::Result<Outcome> {
+        let mut reader = BufReader::new(stream);
+        self.command_loop_duplex(&mut reader)
+    }
+
+    fn command_loop_duplex<S: Read + Write>(
+        &mut self,
+        reader: &mut BufReader<&mut S>,
+    ) -> std::io::Result<Outcome> {
+        let mut line = Vec::new();
+        loop {
+            line.clear();
+            if reader.read_until(b'\n', &mut line)? == 0 {
+                return Ok(Outcome::Closed);
+            }
+
+            let command = trim_eol(&line).to_vec();
+            match self.handle(&command, reader.get_mut())? {
+                Flow::Continue => {}
+                Flow::Close => return Ok(Outcome::Closed),
+                Flow::UpgradeToTls => {
+                    // RFC 4642 §2.2 forbids the client from sending anything between the
+                    // 382 and the handshake. Anything buffered here would be thrown away
+                    // by the upgrade, so refuse rather than lose it silently.
+                    if !reader.buffer().is_empty() {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            "client sent data after STARTTLS before the handshake",
+                        ));
+                    }
+                    return Ok(Outcome::UpgradeToTls);
+                }
             }
         }
     }
@@ -154,6 +240,7 @@ impl<'a> Session<'a> {
             "AUTHINFO" => self.authinfo(output, &args).map(|()| Flow::Continue),
             "DATE" => self.date(output).map(|()| Flow::Continue),
             "HELP" => self.help(output).map(|()| Flow::Continue),
+            "STARTTLS" => self.starttls(output),
             _ if self.needs_auth() => self
                 .status(output, 480, "authentication required")
                 .map(|()| Flow::Continue),
@@ -169,6 +256,30 @@ impl<'a> Session<'a> {
                 .status(output, 500, &format!("command {other} not recognised"))
                 .map(|()| Flow::Continue),
         }
+    }
+
+    fn starttls(&mut self, output: &mut impl Write) -> std::io::Result<Flow> {
+        if !self.config.starttls {
+            self.status(output, 500, "command not recognised")?;
+            return Ok(Flow::Continue);
+        }
+        if self.state.encrypted {
+            // RFC 4642 §2.2: a second STARTTLS on the same connection is an error.
+            self.status(output, 502, "TLS is already active")?;
+            return Ok(Flow::Continue);
+        }
+        if self.state.authenticated {
+            // §2.2 again: the upgrade must not be attempted after authentication.
+            self.status(
+                output,
+                502,
+                "STARTTLS is not permitted after authentication",
+            )?;
+            return Ok(Flow::Continue);
+        }
+
+        self.status(output, 382, "continue with TLS negotiation")?;
+        Ok(Flow::UpgradeToTls)
     }
 
     fn needs_auth(&self) -> bool {
@@ -203,6 +314,9 @@ impl<'a> Session<'a> {
             CapabilityProfile::Legacy => {}
         }
         lines.push("LIST ACTIVE ACTIVE.TIMES NEWSGROUPS OVERVIEW.FMT".to_owned());
+        if self.config.starttls && !self.state.encrypted {
+            lines.push("STARTTLS".to_owned());
+        }
         if self.config.credentials.is_some() {
             lines.push("AUTHINFO USER".to_owned());
         }

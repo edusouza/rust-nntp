@@ -7,7 +7,8 @@
 //!
 //! # Layers
 //!
-//! - [`connector`] — sockets: address resolution, timeouts, transports.
+//! - [`connector`] — sockets: address resolution, timeouts, transports, `STARTTLS`.
+//! - [`tls`] — rustls configuration and the handshake (feature `tls`, on by default).
 //! - [`connection`] — framing: status lines and multi-line blocks, with size limits.
 //! - [`client`] — the conversation: one method per command, plus the session state they
 //!   depend on (capabilities, selected group, authentication, which overview command
@@ -57,12 +58,16 @@ pub mod connection;
 pub mod connector;
 pub mod error;
 pub mod limits;
+#[cfg(feature = "tls")]
+pub mod tls;
 
 pub use client::{ArticleId, Client, ClientOptions, Greeting};
 pub use connection::Connection;
-pub use connector::{ConnectOptions, DEFAULT_PORT, DEFAULT_TLS_PORT, Transport};
+pub use connector::{ConnectOptions, DEFAULT_PORT, DEFAULT_TLS_PORT, Security, Transport};
 pub use error::{ClientError, Result};
 pub use limits::Limits;
+#[cfg(feature = "tls")]
+pub use tls::TlsOptions;
 
 /// Everything this crate needs from `nntp-proto`, re-exported so callers do not have to
 /// depend on it directly.

@@ -50,11 +50,15 @@ pub mod config;
 pub mod corpus;
 pub mod server;
 pub mod session;
+#[cfg(feature = "tls")]
+pub mod tls;
 
 pub use config::{CapabilityProfile, Credentials, GreetingMode, Quirks, ServerConfig};
 pub use corpus::{Article, Corpus, Group, Posting};
-pub use server::TestServer;
-pub use session::{Flow, Session};
+pub use server::{TestServer, TlsMode};
+pub use session::{Flow, Outcome, Session};
+#[cfg(feature = "tls")]
+pub use tls::SelfSignedIdentity;
 
 /// The crate version, so the server can report it in `IMPLEMENTATION`.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

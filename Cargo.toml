@@ -34,6 +34,7 @@ encoding_rs = "0.8"
 memchr = "2"
 ratatui = "0.30"
 rustls = { version = "0.23", default-features = false, features = ["std", "tls12", "ring", "logging"] }
+rustls-pemfile = "2"
 rustls-pki-types = "1"
 serde = { version = "1", features = ["derive"] }
 thiserror = "2"
@@ -45,6 +46,7 @@ webpki-roots = "1"
 
 # Dev
 insta = "1"
+rcgen = "0.14"
 pretty_assertions = "1"
 
 # Lints applied to every crate in the workspace via `[lints] workspace = true`.

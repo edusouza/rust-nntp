@@ -79,6 +79,12 @@ pub struct ServerConfig {
     pub quirks: Quirks,
     /// The server name used in the greeting.
     pub server_name: String,
+    /// Whether to advertise and accept `STARTTLS` (RFC 4642).
+    ///
+    /// Set by [`crate::TestServer`] when it is given a TLS identity; setting it by hand
+    /// makes the server advertise an upgrade it cannot perform, which is itself a useful
+    /// thing to test.
+    pub starttls: bool,
 }
 
 /// A username and password the server will accept.
@@ -99,6 +105,7 @@ impl Default for ServerConfig {
             require_auth: false,
             quirks: Quirks::default(),
             server_name: "test.invalid".to_owned(),
+            starttls: false,
         }
     }
 }
@@ -141,6 +148,13 @@ impl ServerConfig {
         self
     }
 
+    /// Advertises and accepts `STARTTLS`.
+    #[must_use]
+    pub fn starttls(mut self, starttls: bool) -> Self {
+        self.starttls = starttls;
+        self
+    }
+
     /// The line terminator this configuration uses.
     pub fn terminator(&self) -> &'static [u8] {
         if self.quirks.bare_lf { b"\n" } else { b"\r\n" }
@@ -157,6 +171,7 @@ mod tests {
         assert_eq!(config.capabilities, CapabilityProfile::Modern);
         assert_eq!(config.greeting, GreetingMode::PostingAllowed);
         assert!(!config.require_auth);
+        assert!(!config.starttls);
         assert_eq!(config.quirks, Quirks::default());
         assert_eq!(config.terminator(), b"\r\n");
     }

@@ -141,6 +141,27 @@ impl<S: Read + Write> Client<S> {
         })
     }
 
+    /// Rebuilds a client around an existing connection, without reading a greeting.
+    ///
+    /// Used by the `STARTTLS` upgrade: RFC 4642 §2.2 says the server does *not* repeat its
+    /// greeting after the handshake, so a client that tried to read one would block until
+    /// its read timeout. The session state is deliberately reset — the same section
+    /// requires the client to discard everything it learned before the handshake,
+    /// including the capability list, because that list was delivered in the clear and
+    /// could have been tampered with.
+    pub fn from_parts(connection: Connection<S>, greeting: Greeting, encrypted: bool) -> Self {
+        Self {
+            connection,
+            greeting,
+            capabilities: Capabilities::new(),
+            encrypted,
+            authenticated: false,
+            group: None,
+            overview_fmt: None,
+            overview_style: OverviewStyle::Unknown,
+        }
+    }
+
     /// The greeting received on connection.
     pub fn greeting(&self) -> &Greeting {
         &self.greeting
