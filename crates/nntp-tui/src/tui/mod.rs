@@ -24,6 +24,7 @@ use anyhow::Context as _;
 use ratatui::crossterm::event::{self, Event as TerminalEvent, KeyEventKind};
 
 use crate::config::Config;
+use crate::readstate::ReadStore;
 use crate::session::Target;
 use crate::tui::app::App;
 use crate::tui::protocol::{Event, Request};
@@ -45,6 +46,18 @@ pub fn run(config: &Config, target: Target) -> anyhow::Result<()> {
     let (request_tx, request_rx) = mpsc::channel::<Request>();
     let (event_tx, event_rx) = mpsc::channel::<Event>();
 
+    // Read state is per server, because article numbers are the server's own. Loading it
+    // before the terminal is taken over keeps any problem with it on ordinary stderr, and
+    // loading never fails: a missing or corrupt store means "everything unread", never a
+    // reader that will not start (ADR-0009).
+    let (read_state, read_problems) = match ReadStore::default_path(&target.server.host) {
+        Ok(path) => ReadStore::load(path),
+        Err(error) => {
+            tracing::warn!(%error, "no data directory; read state will not be saved");
+            (ReadStore::empty(std::path::PathBuf::new()), Vec::new())
+        }
+    };
+
     let worker = worker::spawn(target, config.ui.overview_chunk, request_rx, event_tx)
         .context("starting the network worker")?;
 
@@ -53,8 +66,21 @@ pub fn run(config: &Config, target: Target) -> anyhow::Result<()> {
     // unusable terminal and no error message.
     let mut terminal = ratatui::try_init().context("setting up the terminal")?;
 
-    let mut app = App::new(&config.ui);
+    let mut app = App::new(&config.ui, read_state);
+    for problem in read_problems {
+        app.note(problem.to_string());
+        tracing::warn!(%problem, "read state");
+    }
+
     let outcome = event_loop(&mut terminal, &mut app, &request_tx, &event_rx);
+
+    // Read state is saved here rather than inside the state machine, which has no IO by
+    // design (ADR-0008). Before the terminal is restored so that a failure to save is
+    // reported the same way as any other, and unconditionally: the session is over, and
+    // a save that only happens on a clean exit is the one that loses a day's reading.
+    if let Err(error) = app.read.save_if_dirty() {
+        tracing::error!(%error, "could not save read state");
+    }
 
     // Restore the terminal before reporting anything, so an error message is readable.
     let restored = ratatui::try_restore();

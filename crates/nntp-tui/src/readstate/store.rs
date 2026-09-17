@@ -18,7 +18,7 @@ use crate::config::APP_NAME;
 /// thousands of groups for years. The limit exists because this file is parsed at startup
 /// and can have been edited by hand or copied from anywhere, and a parser that will read
 /// an arbitrarily large file into memory is a denial of service waiting for an accident.
-const MAX_STORE_BYTES: u64 = 8 * 1024 * 1024;
+pub const MAX_STORE_BYTES: u64 = 8 * 1024 * 1024;
 
 /// Read state for every group on one server, and the file it is stored in.
 ///

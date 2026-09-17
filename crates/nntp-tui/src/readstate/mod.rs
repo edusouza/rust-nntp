@@ -14,4 +14,4 @@ mod set;
 mod store;
 
 pub use set::ReadSet;
-pub use store::{Problem, ReadStore};
+pub use store::{MAX_STORE_BYTES, Problem, ReadStore};

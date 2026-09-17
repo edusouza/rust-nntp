@@ -26,7 +26,7 @@ use std::fmt;
 /// number — `1-5` and `6-9` are stored as `1-9`. Every stored bound is at least 1, since
 /// article numbering starts at 1 and `0` means "no article" in RFC 3977 §6. Nothing
 /// outside this module can construct a value that breaks those invariants, so
-/// [`Self::contains`] can binary-search and [`Self::to_string`] can print the ranges
+/// [`Self::contains`] can binary-search and the [`fmt::Display`] impl can print the ranges
 /// directly.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ReadSet {
