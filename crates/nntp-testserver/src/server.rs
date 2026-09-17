@@ -269,6 +269,16 @@ fn accept_loop(listener: TcpListener, stop: &AtomicBool, shared: &Arc<Shared>) {
 }
 
 fn serve(mut stream: TcpStream, shared: &Arc<Shared>) {
+    // The listener is non-blocking so the accept loop can notice the stop flag. On Windows
+    // and on the BSDs — macOS included — an accepted socket *inherits* that flag, while on
+    // Linux it does not. Without this line the session's first read returns `WouldBlock`
+    // immediately, the thread gives up, and the client sees the connection reset before
+    // the greeting arrives. It passes on Linux and fails everywhere else.
+    if let Err(error) = stream.set_nonblocking(false) {
+        tracing::error!(%error, "could not put the accepted socket into blocking mode");
+        return;
+    }
+
     // A test that hangs is worse than a test that fails.
     let _ = stream.set_read_timeout(Some(Duration::from_secs(30)));
     let _ = stream.set_write_timeout(Some(Duration::from_secs(30)));
@@ -398,6 +408,24 @@ mod tests {
         let second = TestServer::start().expect("start");
         assert_ne!(first.port(), second.port());
         assert!(first.authority().starts_with("127.0.0.1:"));
+    }
+
+    #[test]
+    fn an_accepted_socket_is_blocking() {
+        // The listener is non-blocking; the accepted socket must not be. Windows and the
+        // BSDs inherit the flag, Linux does not, so this invariant is invisible on Linux
+        // and fatal everywhere else. The delay is what makes it observable: a
+        // non-blocking server would have given up long before the command arrives.
+        let server = TestServer::start().expect("start");
+        let mut probe = Probe::connect(&server);
+        assert!(probe.read_line().starts_with("200 "));
+
+        std::thread::sleep(Duration::from_millis(250));
+        probe.send("DATE");
+        assert!(
+            probe.read_line().starts_with("111 "),
+            "the session did not survive an idle client"
+        );
     }
 
     #[test]
