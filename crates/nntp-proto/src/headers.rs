@@ -91,6 +91,8 @@ pub mod names {
     pub const CONTENT_TYPE: &str = "Content-Type";
     /// `Content-Transfer-Encoding`
     pub const CONTENT_TRANSFER_ENCODING: &str = "Content-Transfer-Encoding";
+    /// `Content-Disposition`
+    pub const CONTENT_DISPOSITION: &str = "Content-Disposition";
     /// `Lines`
     pub const LINES: &str = "Lines";
     /// `Xref`
