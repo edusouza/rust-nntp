@@ -91,9 +91,14 @@ Notes worth reading once:
 - **`security` defaults to `implicit-tls`.** Connecting to a plaintext server needs
   `security = "plain"` or `--no-tls`. That is deliberate: the default should be the safe
   one.
-- **Prefer `password_command` to `password`.** A password in a configuration file is a
-  password in every backup of that file. The command's first line of output is used, so
-  any password manager works. A command that fails is an error, never an empty password.
+- **Do not put the password in the file.** A password in a configuration file is a
+  password in every backup of that file. Two better options, and at most one may be set:
+  `password_env = "NNTP_PASSWORD"` reads an environment variable, and
+  `password_command = "pass show news"` runs a command and uses its first line. Prefer
+  `password_env`: it has no shell in the path, whereas `password_command` goes through
+  `sh -c` or `cmd /C` — and on Windows `cmd` re-parses what `%VAR%` expands to, so `&`,
+  `|`, `<` and `>` in a password get interpreted rather than passed on. Either way, a
+  source that fails is an error, never an empty password.
 - **`allow_plaintext_auth` is off.** `AUTHINFO PASS` sends the password in clear text, so
   it has to be asked for, with `--allow-plaintext-auth` or the configuration key.
 - **A private certificate authority** goes in `extra_ca_file`. There is no way to disable

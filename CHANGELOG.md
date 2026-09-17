@@ -7,7 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-Nothing yet.
+### Added
+
+- `password_env` / `--password-env`: read the password from an environment variable, with
+  no shell in the path. `password_command` runs through `sh -c` or `cmd /C`, which brings
+  two hazards: a password written literally into the command has to be quoted correctly
+  for that shell, and on Windows `cmd` expands `%VAR%` during parsing and then continues
+  parsing the result, so `&`, `|`, `<` and `>` are interpreted rather than passed on. (A
+  POSIX shell does not re-parse an expansion, so `sh -c 'printf %s "$VAR"'` is safe
+  there.) At most one password source may be configured, and an unset or empty variable is
+  an error rather than an empty password.
+- Opt-in tests against a real news server
+  ([`crates/nntp-client/tests/real_server.rs`](crates/nntp-client/tests/real_server.rs)),
+  with a runbook at
+  [`docs/validating-against-a-real-server.md`](docs/validating-against-a-real-server.md)
+  covering PowerShell as well as POSIX shells. They stay `#[ignore]`d, so CI remains
+  offline. Eight tests, the most valuable being that every line of a real `LIST ACTIVE`
+  parses and that `XOVER` agrees with `OVER` record for record.
+
+### Changed
+
+- Password resolution takes its environment lookup and its shell as parameters, so the
+  precedence rules are tested without mutating process-global state. `unsafe_code` is
+  `forbid`den workspace-wide, which rules out `std::env::set_var` in a test — and that
+  turned out to be the right constraint: the tests it forced are better ones.
 
 ## [0.1.0] — 2026-09-17
 

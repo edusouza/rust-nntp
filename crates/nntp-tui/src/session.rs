@@ -69,10 +69,18 @@ pub fn resolve(config: &Config, args: &ServerArgs) -> anyhow::Result<Target> {
     if let Some(username) = &args.username {
         server.username = Some(username.clone());
     }
+    // Either password flag replaces whatever the configuration supplied, rather than
+    // competing with it: a flag is a deliberate override, and leaving two sources in play
+    // would make it unclear which one is in force.
     if let Some(command) = &args.password_command {
         server.password_command = Some(command.clone());
-        // An explicit command replaces a literal password rather than competing with it.
         server.password = None;
+        server.password_env = None;
+    }
+    if let Some(variable) = &args.password_env {
+        server.password_env = Some(variable.clone());
+        server.password = None;
+        server.password_command = None;
     }
     if args.allow_plaintext_auth {
         server.allow_plaintext_auth = true;
@@ -173,6 +181,7 @@ mod tests {
             no_tls: false,
             username: None,
             password_command: None,
+            password_env: None,
             allow_plaintext_auth: false,
             ca_file: None,
             tls_server_name: None,
@@ -253,6 +262,22 @@ mod tests {
 
         assert_eq!(target.server.port, None);
         assert_eq!(target.authority(), "b.example:563");
+    }
+
+    #[test]
+    fn a_password_env_flag_replaces_every_configured_source() {
+        let target = resolve(
+            &config("[servers.a]\nhost=\"x\"\npassword_command=\"pass show news\"\n"),
+            &ServerArgs {
+                password_env: Some("NNTP_PASSWORD".to_owned()),
+                ..args()
+            },
+        )
+        .unwrap();
+
+        assert_eq!(target.server.password_env.as_deref(), Some("NNTP_PASSWORD"));
+        assert_eq!(target.server.password_command, None);
+        assert_eq!(target.server.password, None);
     }
 
     #[test]

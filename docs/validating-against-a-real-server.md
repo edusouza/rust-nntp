@@ -22,31 +22,57 @@ runbook. It is the outstanding item in
 Start here. It is one round of commands and it reports every input that changes how the
 reader behaves.
 
+The password goes in an environment variable and is read straight out of it with
+`--password-env`, which has no shell in the path. `--password-command` runs through
+`sh -c` or `cmd /C`, and on Windows `cmd` expands `%VAR%` during parsing and then keeps
+parsing the result — so a password containing `&`, `|`, `<` or `>` gets interpreted rather
+than passed on. (A POSIX shell does not re-parse an expansion, so
+`sh -c 'printf %s "$VAR"'` is fine there; the hazard on Unix is only a password written
+literally into the command string.)
+
+### Windows (PowerShell)
+
+The `Read-Host`/`Marshal` dance below works on both Windows PowerShell 5.1 — the one
+Windows ships — and PowerShell 7. It keeps the password out of your command history and
+out of the process argument list.
+
+```powershell
+cargo build --release -p nntp-tui
+
+$secure = Read-Host 'password' -AsSecureString
+$env:NNTP_PASSWORD = [Runtime.InteropServices.Marshal]::PtrToStringBSTR(
+    [Runtime.InteropServices.Marshal]::SecureStringToBSTR($secure))
+
+.\target\release\nntp-tui.exe doctor `
+  --host news.eternal-september.org --tls `
+  --username YOUR_USERNAME `
+  --password-env NNTP_PASSWORD `
+  --group comp.lang.rust
+```
+
+On PowerShell 7 the first two lines can be the shorter
+`$env:NNTP_PASSWORD = Read-Host 'password' -MaskInput`.
+
+The variable lives only in that PowerShell session; closing the window clears it. To clear
+it sooner: `Remove-Item Env:\NNTP_PASSWORD`.
+
+### Linux and macOS
+
 ```sh
 cargo build --release -p nntp-tui
 
-# Keep the password out of your shell history and out of the argument list.
-read -rs -p 'password: ' ES_PASS; export ES_PASS; echo
+read -rs -p 'password: ' NNTP_PASSWORD; export NNTP_PASSWORD; echo
 
 ./target/release/nntp-tui doctor \
   --host news.eternal-september.org --tls \
   --username YOUR_USERNAME \
-  --password-command 'printf %s "$ES_PASS"' \
+  --password-env NNTP_PASSWORD \
   --group comp.lang.rust
 ```
 
-On Windows PowerShell:
+`read -rs` keeps it off the terminal and out of the shell history.
 
-```powershell
-$env:ES_PASS = Read-Host -AsSecureString | ConvertFrom-SecureString -AsPlainText
-.\target\release\nntp-tui.exe doctor `
-  --host news.eternal-september.org --tls `
-  --username YOUR_USERNAME `
-  --password-command 'echo %ES_PASS%' `
-  --group comp.lang.rust
-```
-
-Read the output against these expectations:
+### Reading the output
 
 | Line | What it should say | If it does not |
 | --- | --- | --- |
@@ -54,36 +80,62 @@ Read the output against these expectations:
 | `reader mode` | `yes` | The server wants `MODE READER`; the handshake should have sent it. |
 | `overview` | `OVER, including by message-id` or `OVER, by range only` | `not advertised` means the reader will fall back to `XOVER` — fine, but note it. |
 | `AUTHINFO` | `USER/PASS` | `SASL only` is not supported yet; that is a known gap. |
-| `auth` | `accepted` | The credentials or the `password_command` are wrong. |
+| `auth` | `accepted` | The credentials are wrong, or `NNTP_PASSWORD` is not set in the shell that launched the program. |
 | `server date` | a skew of a few seconds | A large skew breaks `NEWGROUPS`, which the disk cache will rely on. |
 | `overview fmt` | begins `Subject, From, Date, Message-ID, References, bytes, lines` | A different order is handled by name-based mapping, but it is worth a fixture. |
 | the group probe | records listed, an article fetched | Any `failed` line here is the interesting part. |
 
 ## Step 2 — the automated suite
 
-This is the part worth doing, because it turns "it looked fine" into pass or fail:
+This is the part worth doing, because it turns "it looked fine" into pass or fail. The
+tests read the password from `NNTP_TEST_PASS` directly, so again no shell touches it.
+
+### Windows (PowerShell)
+
+```powershell
+$env:NNTP_TEST_HOST     = 'news.eternal-september.org'
+$env:NNTP_TEST_SECURITY = 'tls'            # or 'starttls'
+$env:NNTP_TEST_USER     = 'YOUR_USERNAME'
+$env:NNTP_TEST_GROUP    = 'comp.lang.rust'
+$env:NNTP_TEST_SAMPLE   = '50'
+
+$secure = Read-Host 'password' -AsSecureString
+$env:NNTP_TEST_PASS = [Runtime.InteropServices.Marshal]::PtrToStringBSTR(
+    [Runtime.InteropServices.Marshal]::SecureStringToBSTR($secure))
+
+cargo test -p nntp-client --test real_server -- --ignored --nocapture --test-threads=1
+```
+
+To keep a copy of the output — the counts are the evidence — append
+`2>&1 | Tee-Object -FilePath real-server.log` to the `cargo test` line. PowerShell's `>`
+writes UTF-16 by default, which is why `Tee-Object` is the better choice here.
+
+### Linux and macOS
 
 ```sh
 export NNTP_TEST_HOST=news.eternal-september.org
 export NNTP_TEST_SECURITY=tls          # or starttls
 export NNTP_TEST_USER=YOUR_USERNAME
-read -rs -p 'password: ' NNTP_TEST_PASS; export NNTP_TEST_PASS; echo
 export NNTP_TEST_GROUP=comp.lang.rust
 export NNTP_TEST_SAMPLE=50
+read -rs -p 'password: ' NNTP_TEST_PASS; export NNTP_TEST_PASS; echo
 
 cargo test -p nntp-client --test real_server -- \
-  --ignored --nocapture --test-threads=1
+  --ignored --nocapture --test-threads=1 2>&1 | tee real-server.log
 ```
 
-`--nocapture` matters: the tests print the counts, and the counts are the evidence.
+### Why those flags
+
+`--ignored` is what runs them at all; they are `#[ignore]`d so that CI stays offline.
+`--nocapture` matters because the tests print the counts, and the counts are the evidence.
 `--test-threads=1` matters too — a public server will refuse a handful of simultaneous
 connections from one address.
 
 Eight tests, each asserting something the offline suite cannot:
 
 1. **the server clock parses** and is close to ours.
-2. **every line of `LIST ACTIVE` parses** — over a hundred thousand lines written by
-   decades of different software. This is the headline test.
+2. **every line of `LIST ACTIVE` parses** — tens of thousands of lines written by decades
+   of different software. This is the headline test.
 3. **every line of `LIST NEWSGROUPS` parses**, and reports how many descriptions are
    non-ASCII.
 4. **`OVERVIEW.FMT` starts with the seven required fields.**
@@ -99,10 +151,21 @@ Eight tests, each asserting something the offline suite cannot:
 
 ## Step 3 — drive the reader
 
+```powershell
+# Windows
+.\target\release\nntp-tui.exe config init     # prints where it wrote the file
+.\target\release\nntp-tui.exe                 # opens the reader
+```
+
 ```sh
-./target/release/nntp-tui config init      # then edit it with your server
+# Linux and macOS
+./target/release/nntp-tui config init      # prints where it wrote the file
 ./target/release/nntp-tui                  # opens the reader
 ```
+
+In the configuration file, use `password_env = "NNTP_PASSWORD"` for the same reason as
+above. Windows Terminal or any modern terminal handles the box-drawing characters and the
+colours; the old `conhost` console will look rough.
 
 Worth trying deliberately: a group with a hundred thousand articles (`comp.lang.c`), an
 article with an attachment, a thread with a missing parent, a non-Latin hierarchy
@@ -114,10 +177,20 @@ article with an attachment, a thread with a missing parent, a non-Latin hierarch
 
 1. Capture the wire conversation:
 
+   ```powershell
+   # Windows
+   $env:RUST_LOG = 'nntp_client=trace'
+   .\target\release\nntp-tui.exe doctor `
+     --host news.eternal-september.org --tls `
+     --username YOUR_USERNAME --password-env NNTP_PASSWORD `
+     2>&1 | Tee-Object -FilePath trace.log
+   ```
+
    ```sh
+   # Linux and macOS
    RUST_LOG=nntp_client=trace ./target/release/nntp-tui doctor \
-     --host news.eternal-september.org --tls --username YOUR_USERNAME \
-     --password-command 'printf %s "$ES_PASS"' 2> trace.log
+     --host news.eternal-september.org --tls \
+     --username YOUR_USERNAME --password-env NNTP_PASSWORD 2> trace.log
    ```
 
    Passwords are redacted at the point of encoding, so no log level reveals one. The

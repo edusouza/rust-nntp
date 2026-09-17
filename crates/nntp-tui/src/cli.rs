@@ -189,8 +189,20 @@ pub struct ServerArgs {
     pub username: Option<String>,
 
     /// Read the password from this command's first line of output
-    #[arg(long, value_name = "COMMAND")]
+    ///
+    /// The command runs through a shell, which has to be quoted correctly for that
+    /// shell. On Windows `cmd` also re-parses what `%VAR%` expands to, so `&`, `|`, `<`
+    /// and `>` in a password are interpreted rather than passed on. Prefer
+    /// --password-env, which has no shell in the path.
+    #[arg(long, value_name = "COMMAND", conflicts_with = "password_env")]
     pub password_command: Option<String>,
+
+    /// Read the password from this environment variable
+    ///
+    /// The password never passes through a shell, so no quoting can mangle it. An unset
+    /// or empty variable is an error rather than an empty password.
+    #[arg(long, value_name = "VARIABLE")]
+    pub password_env: Option<String>,
 
     /// Send the password over an unencrypted connection
     ///
@@ -287,6 +299,39 @@ mod tests {
                 assert!(group.is_none());
             }
             other => panic!("expected Doctor, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_two_password_sources_are_mutually_exclusive() {
+        // Supplying both leaves it ambiguous which one is in force, and getting that wrong
+        // means a login failure with no explanation.
+        assert!(
+            Cli::try_parse_from([
+                "nntp-tui",
+                "doctor",
+                "--host",
+                "x",
+                "--password-command",
+                "c",
+                "--password-env",
+                "E",
+            ])
+            .is_err()
+        );
+
+        for args in [
+            vec!["nntp-tui", "doctor", "--host", "x", "--password-env", "E"],
+            vec![
+                "nntp-tui",
+                "doctor",
+                "--host",
+                "x",
+                "--password-command",
+                "c",
+            ],
+        ] {
+            assert!(Cli::try_parse_from(&args).is_ok(), "{args:?}");
         }
     }
 

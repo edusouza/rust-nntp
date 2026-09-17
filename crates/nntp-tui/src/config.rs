@@ -66,6 +66,18 @@ pub struct ServerConfig {
     /// `password_command = "pass show news/eternal-september"`.
     pub password_command: Option<String>,
 
+    /// The name of an environment variable holding the password.
+    ///
+    /// The most robust of the three, because it is the only one with no shell in the path.
+    /// `password_command` runs through `sh -c` or `cmd /C`, which brings two hazards: a
+    /// password written literally into the command string has to be quoted correctly for
+    /// that shell, and on Windows `cmd` expands `%VAR%` during parsing and then continues
+    /// parsing the result, so a value containing `&`, `|`, `<` or `>` is interpreted
+    /// rather than passed through. (A POSIX shell does not re-parse an expansion, so
+    /// `sh -c 'printf %s "$VAR"'` is safe there.) Reading the variable directly avoids
+    /// the question entirely.
+    pub password_env: Option<String>,
+
     /// Allow `AUTHINFO PASS` over an unencrypted connection.
     ///
     /// Off by default, and worth leaving off: the password crosses the network in clear
@@ -97,6 +109,7 @@ impl Default for ServerConfig {
             username: None,
             password: None,
             password_command: None,
+            password_env: None,
             allow_plaintext_auth: false,
             extra_ca_file: None,
             tls_server_name: None,
@@ -263,10 +276,18 @@ impl Config {
             if server.host.trim().is_empty() {
                 bail!("server {name:?} has no host");
             }
-            if server.password.is_some() && server.password_command.is_some() {
+            let sources = [
+                server.password.as_ref().map(|_| "password"),
+                server.password_env.as_ref().map(|_| "password_env"),
+                server.password_command.as_ref().map(|_| "password_command"),
+            ]
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>();
+            if sources.len() > 1 {
                 bail!(
-                    "server {name:?} sets both password and password_command; \
-                     pick one so it is clear which applies"
+                    "server {name:?} sets {}; pick one so it is clear which applies",
+                    sources.join(" and ")
                 );
             }
         }
@@ -347,9 +368,15 @@ port = 563
 # plain | implicit-tls | starttls.  Prefer implicit-tls.
 security = "implicit-tls"
 username = "your-username"
-# Prefer password_command: a password written here is a password in every backup.
+# Three ways to supply the password; set at most one.
+#   password_env     — read from an environment variable. The most robust: the password
+#                      never passes through a shell, so no quoting can mangle it.
+#   password_command — run a command and use its first line. Good with a password manager.
+#   password         — written here in plain text. A password in a configuration file is a
+#                      password in every backup of that file.
+password_env = "NNTP_PASSWORD"
+# password_command = "pass show news/eternal-september"
 # password = "..."
-password_command = "pass show news/eternal-september"
 # Only set this if you understand that the password crosses the network in clear text.
 allow_plaintext_auth = false
 # For a server signed by a private certificate authority.
@@ -437,8 +464,39 @@ impl ServerConfig {
     /// output. A password command that fails must not be mistaken for "no password":
     /// that would send an empty password to the server.
     pub fn resolve_password(&self) -> anyhow::Result<Option<String>> {
+        self.resolve_password_with(|name| std::env::var(name).ok(), run_shell)
+    }
+
+    /// The password resolution logic, with its two sources of outside data injected.
+    ///
+    /// Taking the environment lookup and the shell as parameters keeps the precedence
+    /// rules testable without mutating process-global state — which also means the tests
+    /// can run in parallel, and that none of them needs `unsafe` to call
+    /// `std::env::set_var`.
+    fn resolve_password_with(
+        &self,
+        lookup_env: impl Fn(&str) -> Option<String>,
+        run: impl Fn(&str) -> anyhow::Result<String>,
+    ) -> anyhow::Result<Option<String>> {
         if let Some(password) = &self.password {
             return Ok(Some(password.clone()));
+        }
+
+        if let Some(variable) = &self.password_env {
+            tracing::debug!(variable, "reading the password from the environment");
+            // An unset variable must not be mistaken for an empty password: sending an
+            // empty password to a server is worse than not trying.
+            let value = lookup_env(variable).with_context(|| {
+                format!("password_env names {variable:?}, which is not set in the environment")
+            })?;
+            // Only the line ending is trimmed. Leading and trailing spaces can be part of
+            // a password, and stripping them silently would produce a login failure with
+            // no explanation.
+            let value = value.trim_end_matches(['\r', '\n']);
+            if value.is_empty() {
+                bail!("the environment variable {variable:?} is empty");
+            }
+            return Ok(Some(value.to_owned()));
         }
 
         let Some(command) = &self.password_command else {
@@ -447,7 +505,7 @@ impl ServerConfig {
 
         tracing::debug!("running password_command");
         let output =
-            run_shell(command).with_context(|| format!("running password_command {command:?}"))?;
+            run(command).with_context(|| format!("running password_command {command:?}"))?;
 
         let first_line = output
             .lines()
@@ -618,11 +676,28 @@ mod tests {
     }
 
     #[test]
-    fn rejects_both_password_and_password_command() {
-        let error = parse("[servers.a]\nhost=\"x\"\npassword=\"p\"\npassword_command=\"c\"\n")
-            .unwrap_err()
-            .to_string();
-        assert!(error.contains("pick one"), "{error}");
+    fn rejects_more_than_one_password_source() {
+        for keys in [
+            "password=\"p\"\npassword_command=\"c\"",
+            "password=\"p\"\npassword_env=\"E\"",
+            "password_env=\"E\"\npassword_command=\"c\"",
+            "password=\"p\"\npassword_env=\"E\"\npassword_command=\"c\"",
+        ] {
+            let error = parse(&format!("[servers.a]\nhost=\"x\"\n{keys}\n"))
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("pick one"), "{keys}: {error}");
+        }
+
+        // Exactly one of each is fine.
+        for key in [
+            "password=\"p\"",
+            "password_env=\"E\"",
+            "password_command=\"c\"",
+        ] {
+            parse(&format!("[servers.a]\nhost=\"x\"\n{key}\n"))
+                .unwrap_or_else(|error| panic!("{key} should be valid: {error}"));
+        }
     }
 
     #[test]
@@ -697,6 +772,141 @@ mod tests {
         assert_eq!(
             server.resolve_password().unwrap().as_deref(),
             Some("hunter2")
+        );
+    }
+
+    /// An environment that contains exactly one variable.
+    fn env_with(name: &'static str, value: &'static str) -> impl Fn(&str) -> Option<String> {
+        move |asked| (asked == name).then(|| value.to_owned())
+    }
+
+    /// A shell that always fails, for the paths that must not reach it.
+    fn no_shell(command: &str) -> anyhow::Result<String> {
+        panic!("the shell should not have been used, but got {command:?}")
+    }
+
+    fn server_with(server: ServerConfig) -> ServerConfig {
+        ServerConfig {
+            host: "x".to_owned(),
+            ..server
+        }
+    }
+
+    #[test]
+    fn resolves_a_password_from_an_environment_variable() {
+        let server = server_with(ServerConfig {
+            password_env: Some("NNTP_PASSWORD".to_owned()),
+            ..ServerConfig::default()
+        });
+
+        assert_eq!(
+            server
+                .resolve_password_with(env_with("NNTP_PASSWORD", "hunter2"), no_shell)
+                .unwrap()
+                .as_deref(),
+            Some("hunter2")
+        );
+    }
+
+    #[test]
+    fn a_password_from_the_environment_arrives_byte_for_byte() {
+        // Every character here is special to some shell, which is the reason to have a
+        // path with no shell in it: on Windows `cmd` expands `%VAR%` and then keeps
+        // parsing the result, so `&`, `|`, `<` and `>` are interpreted rather than passed
+        // on. This test asserts only what it can: that nothing alters the value.
+        const AWKWARD: &str = r#"p&ss|w<o>r^d%$ "quoted" 'single' `tick`"#;
+
+        let server = server_with(ServerConfig {
+            password_env: Some("P".to_owned()),
+            ..ServerConfig::default()
+        });
+
+        assert_eq!(
+            server
+                .resolve_password_with(env_with("P", AWKWARD), no_shell)
+                .unwrap()
+                .as_deref(),
+            Some(AWKWARD)
+        );
+    }
+
+    #[test]
+    fn a_password_from_the_environment_keeps_its_spaces_but_drops_a_trailing_newline() {
+        let server = server_with(ServerConfig {
+            password_env: Some("P".to_owned()),
+            ..ServerConfig::default()
+        });
+
+        // Leading and inner spaces are part of the password; only the line ending goes.
+        assert_eq!(
+            server
+                .resolve_password_with(env_with("P", "  spaced pass  \r\n"), no_shell)
+                .unwrap()
+                .as_deref(),
+            Some("  spaced pass  ")
+        );
+    }
+
+    #[test]
+    fn an_unset_or_empty_environment_variable_is_an_error_not_an_empty_password() {
+        // Sending an empty password to a server is worse than not trying.
+        let server = server_with(ServerConfig {
+            password_env: Some("MISSING".to_owned()),
+            ..ServerConfig::default()
+        });
+
+        let unset = server
+            .resolve_password_with(|_| None, no_shell)
+            .unwrap_err()
+            .to_string();
+        assert!(unset.contains("not set in the environment"), "{unset}");
+
+        let empty = server
+            .resolve_password_with(env_with("MISSING", ""), no_shell)
+            .unwrap_err()
+            .to_string();
+        assert!(empty.contains("empty"), "{empty}");
+
+        // A variable holding nothing but a line ending is empty too.
+        let blank = server
+            .resolve_password_with(env_with("MISSING", "\n"), no_shell)
+            .unwrap_err()
+            .to_string();
+        assert!(blank.contains("empty"), "{blank}");
+    }
+
+    #[test]
+    fn a_literal_password_wins_over_the_environment_and_the_shell() {
+        let server = server_with(ServerConfig {
+            password: Some("literal".to_owned()),
+            password_env: Some("P".to_owned()),
+            password_command: Some("should not run".to_owned()),
+            ..ServerConfig::default()
+        });
+
+        assert_eq!(
+            server
+                .resolve_password_with(env_with("P", "from-env"), no_shell)
+                .unwrap()
+                .as_deref(),
+            Some("literal")
+        );
+    }
+
+    #[test]
+    fn the_environment_wins_over_the_shell() {
+        let server = server_with(ServerConfig {
+            password_env: Some("P".to_owned()),
+            password_command: Some("should not run".to_owned()),
+            ..ServerConfig::default()
+        });
+
+        assert_eq!(
+            server
+                .resolve_password_with(env_with("P", "from-env"), no_shell)
+                .unwrap()
+                .as_deref(),
+            Some("from-env")
         );
     }
 
