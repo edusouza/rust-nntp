@@ -32,10 +32,11 @@ into reusable layers: a dependency-light protocol crate, a blocking client crate
 ```
 
 > **Status: pre-release.** See [CHANGELOG.md](CHANGELOG.md) for what works and the
-> [issue tracker](https://github.com/edusouza/rust-nntp/issues) for what does not. The
-> one thing to know before trusting it: every test runs against a fake server included in
-> this repository, so nothing yet proves the client agrees with a real one
-> ([#4](https://github.com/edusouza/rust-nntp/issues/4)).
+> [issue tracker](https://github.com/edusouza/rust-nntp/issues) for what does not. Most
+> tests run against a fake server included in this repository; the client has also been
+> checked against INN 2.8.0 on real traffic — 71 000 `LIST` lines, 44 overview records and
+> 10 articles, with no parse failures
+> ([results](docs/protocol-coverage.md#verified-against-a-real-server)).
 
 ## Try it in thirty seconds, without a Usenet account
 

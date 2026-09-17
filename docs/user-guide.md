@@ -139,11 +139,15 @@ expiry and cancellation leave gaps, so the span is an upper bound rather than a 
 
 ## Validating against a real server
 
-Every automated test here runs against the bundled fake server, so nothing proves the
-client agrees with a real one. If you have a news account, the runbook for closing that gap
-is [`docs/validating-against-a-real-server.md`](validating-against-a-real-server.md): the
-`doctor` probe, then an opt-in test suite that checks real `LIST` output, real overview
-records, real articles, and that `XOVER` agrees with `OVER`.
+Every automated test that CI runs uses the bundled fake server, which implements *our*
+reading of the RFCs — so a misunderstanding shared by the client and the fake server would
+be invisible to all of them. There is an opt-in suite that closes that gap against a real
+server, and if you have a news account you can run it yourself:
+[`docs/validating-against-a-real-server.md`](validating-against-a-real-server.md) is the
+runbook, covering the `doctor` probe and then the suite, which checks real `LIST` output,
+real overview records, real articles, and that `XOVER` agrees with `OVER`. It has been run
+against INN 2.8.0 and passes;
+[the results are recorded](protocol-coverage.md#verified-against-a-real-server).
 
 ## Logs
 

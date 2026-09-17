@@ -6,12 +6,10 @@ change to command coverage: if you add a command, add its row.
 Legend: ✅ implemented end to end · 🟡 grammar implemented in `nntp-proto`, not yet driven by
 the client or surfaced in the UI · ⬜ not implemented · 🚫 out of scope for a reader client
 
-Verified against a real server once, on 2026-09-17: **INN 2.8.0** at
-`news.eternal-september.org`, over implicit TLS with `AUTHINFO USER`/`PASS`. 26 188 groups
-from `LIST ACTIVE` and 45 102 descriptions from `LIST NEWSGROUPS` parsed with zero
-unparseable lines; `OVERVIEW.FMT` matched the assumed layout exactly; the clock skew was
-zero. One divergence found, now fixed and regression-tested: the `411` group-name
-assumption noted under `GROUP` below.
+A ✅ in the tables below means the offline suite covers it. What a real server confirms is
+recorded separately, under [Verified against a real server](#verified-against-a-real-server)
+at the end of this file: the whole suite passed against INN 2.8.0 on 2026-09-17, and the one
+divergence it found is noted under `GROUP`.
 
 ## RFC 3977 — Network News Transfer Protocol
 
@@ -95,3 +93,42 @@ assumption noted under `GROUP` below.
 | `quoted-printable` / `base64` body decoding | ✅ | Brought forward from v0.2: unreadable bodies were too common without it. |
 | Non-UTF-8 body charsets | ✅ | Declared charsets via `encoding_rs`; unlabelled 8-bit falls back to Windows-1252. |
 | yEnc / uuencode attachments | 🚫 v0.1 | Binary groups are out of scope for the first release. |
+
+## Verified against a real server
+
+The eight `#[ignore]`d tests in
+[`crates/nntp-client/tests/real_server.rs`](../crates/nntp-client/tests/real_server.rs) are
+the only thing here that is not self-confirming: everything else is the client agreeing with
+a fake server this project also wrote, which [ADR-0004](adr/0004-fake-server-for-tests.md)
+identifies as the weak point of that design. They must be run by hand, from a machine with
+outbound TCP and an account on a news server — the runbook is
+[`validating-against-a-real-server.md`](validating-against-a-real-server.md).
+
+Last run: **2026-09-17**, INN 2.8.0 (20260619 snapshot) at `news.eternal-september.org:563`,
+implicit TLS, `AUTHINFO USER`/`PASS`, `NNTP_TEST_GROUP=misc.test`. **8 passed, 0 failed**,
+on Windows (`x86_64-pc-windows-msvc`).
+
+| What was checked | Result |
+| --- | --- |
+| Greeting, `CAPABILITIES`, `MODE READER`, authentication | `VERSION IMPLEMENTATION AUTHINFO COMPRESS HDR LIST OVER POST READER XPAT`; implementation read as `INN 2.8.0 (20260619 snapshot)` |
+| `LIST NEWSGROUPS` | 45 102 descriptions, **0 unparseable lines**; 1 907 of them contain non-ASCII text |
+| `LIST ACTIVE` | 26 188 groups in 1.81 s, **0 unparseable lines** |
+| `GROUP` | `misc.test`: ~1 242 articles, 969 063..970 373 |
+| `ARTICLE <message-id>` with no group selected | fetched `<w8TqS.267351$nBp.244460@usenetxs.com>` on a fresh connection |
+| `OVER` on 50 real articles | 44 records, **0 unparseable lines**; 12 replies, **0 unparseable dates, 0 missing message-ids, 0 undecoded subjects** |
+| `ARTICLE` / `HEAD` on 10 real articles | headers agree between the two, **0 unparseable header lines** |
+| `LIST OVERVIEW.FMT` | `Subject From Date Message-ID References bytes lines Xref:full` — the RFC 3977 §8.3 prefix exactly |
+| `DATE` | `2026-09-17T16:49:27+00:00`, **0 s skew** |
+| `XOVER` vs `OVER` | 19 records each, identical field by field, 0 unparseable |
+
+Two things are worth naming about that table. The `OVER` range asked for 50 articles and got
+44: the watermarks from `GROUP` and `LIST ACTIVE` are an estimate that counts cancelled and
+expired articles, which is why the group listing shows `≤n` rather than `n`. And the date,
+subject and `References` columns are the ones that matter most — they are the fields where
+real Usenet traffic is least like a fixture, and they came back clean across 44 records from
+30 years of accumulated posting conventions.
+
+The first run, an hour earlier, failed four of the eight. One failure was a fixture mistake
+on my part (`comp.lang.rust`, which no server carries — `select_group` now lists groups the
+server does carry when `GROUP` fails) and the other was real: the `411` divergence under
+`GROUP` above.

@@ -25,6 +25,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   offline. Eight tests, the most valuable being that every line of a real `LIST ACTIVE`
   parses and that `XOVER` agrees with `OVER` record for record.
 
+  All eight now pass against INN 2.8.0 at `news.eternal-september.org`: 45 102 `LIST
+  NEWSGROUPS` descriptions and 26 188 `LIST ACTIVE` groups with zero unparseable lines, 44
+  real overview records with zero unparseable dates and zero undecoded subjects, 10 real
+  articles where `HEAD` agrees with `ARTICLE`, and `XOVER` matching `OVER` record for
+  record. The numbers are in
+  [`docs/protocol-coverage.md`](docs/protocol-coverage.md#verified-against-a-real-server);
+  this closes [#4].
+
 ### Fixed
 
 - A `411` reply no longer has the group name read out of it. RFC 3977 §6.1.1 does not
@@ -53,10 +61,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 First release: a read-only Usenet reader. It connects, lists groups, lists articles and
 displays them, over TLS, with authentication, from a terminal.
 
-What it does **not** do yet, in order of how much it matters: nothing proves it agrees with
-a real news server ([#4]), read/unread state is not kept between sessions ([#7]), a long
-request cannot be cancelled ([#9]), and posting, threading and a disk cache are all later
-milestones. See [#3] for the roadmap.
+What it does **not** do yet, in order of how much it matters: read/unread state is not kept
+between sessions ([#7]), a long request cannot be cancelled ([#9]), and posting, threading
+and a disk cache are all later milestones. See [#3] for the roadmap.
+
+Agreement with a real news server ([#4]) was the last open question at the time this section
+was written; it was answered before the tag, by the run recorded in
+[`docs/protocol-coverage.md`](docs/protocol-coverage.md#verified-against-a-real-server).
 
 ### Added
 

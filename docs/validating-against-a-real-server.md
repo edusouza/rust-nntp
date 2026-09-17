@@ -6,8 +6,10 @@ A misunderstanding shared by the client and the fake server is invisible to all 
 
 Closing that gap needs a real server, real credentials and a network — none of which the
 project's CI has. So it is a deliberate, opt-in, run-it-yourself step, and this is the
-runbook. It is the outstanding item in
-[issue #4](https://github.com/edusouza/rust-nntp/issues/4).
+runbook. It was the outstanding item in
+[issue #4](https://github.com/edusouza/rust-nntp/issues/4), closed by the run recorded in
+[the coverage matrix](protocol-coverage.md#verified-against-a-real-server) — re-run it
+whenever the protocol layer changes, and add your results there.
 
 ## What you need
 

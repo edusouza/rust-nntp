@@ -381,10 +381,6 @@ fn the_overview_format_starts_with_the_seven_required_fields() {
 fn overview_records_for_real_articles_parse_completely() {
     let (settings, mut client) = connect();
     let summary = select_group(&mut client, &settings);
-    eprintln!(
-        "{}: ~{} articles, numbers {}..{}",
-        summary.name, summary.estimated_count, summary.low, summary.high
-    );
 
     let Some((low, high)) = summary.range() else {
         panic!(
