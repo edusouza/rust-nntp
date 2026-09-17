@@ -25,7 +25,7 @@ nntp-testserver = { path = "crates/nntp-testserver", version = "0.1.0" }
 
 # External
 anyhow = "1.0"
-base64 = "0.22"
+base64 = "0.23"
 chrono = { version = "0.4", default-features = false, features = ["std", "clock", "alloc"] }
 clap = { version = "4", features = ["derive", "env"] }
 crossterm = "0.29"
