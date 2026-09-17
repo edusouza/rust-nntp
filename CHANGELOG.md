@@ -35,6 +35,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- `nntp-tui config path` now prints the read-state file as well as the configuration and
+  the log, named after the configured server. A path nothing prints is a path nobody can
+  find, and this one is meant to be inspected, hand-edited and copied from another
+  newsreader.
 - `base64` 0.22 → 0.23, with `default-features = false`. 0.23 turns on a `simd-unsafe`
   feature by default; this crate decodes base64 that arrives from a remote peer, the
   decoder is not a bottleneck for article-sized input, and the scalar engine's API is
