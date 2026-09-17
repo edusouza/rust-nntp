@@ -76,6 +76,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   groups. Recorded in
   [`docs/protocol-coverage.md`](docs/protocol-coverage.md#read-state-checked-by-hand).
 
+### Fixed
+
+- **The arrow keys did nothing while a group filter was being typed** — so a filter that
+  left several groups could not be used to pick one of them without pressing `Enter`
+  first, which is most of the point of an incremental filter. `↑`, `↓`, `PageUp`,
+  `PageDown`, `Home` and `End` now move through what the filter left; `j` and `k`
+  deliberately do not, because they are filter text, and a filter that could not contain
+  the letter `j` would be a worse bug than the one it replaced.
+
+  Reported from real use. The fix also covers a race the report did not mention: an
+  overview reply arriving while the filter is open moves the focus to the article pane, so
+  cursor movement during filtering now targets the group list explicitly rather than
+  whichever pane happens to be focused.
+
 ### Changed
 
 - `nntp-tui config path` now prints the read-state file as well as the configuration and

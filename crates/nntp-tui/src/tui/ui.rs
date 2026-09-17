@@ -415,7 +415,7 @@ fn draw_overlay(frame: &mut Frame<'_>, title: &str, text: Text<'static>, area: R
 }
 
 fn help_text() -> Text<'static> {
-    const ROWS: [(&str, &str); 17] = [
+    const ROWS: [(&str, &str); 18] = [
         ("Tab / Shift-Tab", "next / previous pane"),
         ("h l  ← →", "move focus left / right"),
         ("j k  ↓ ↑", "move down / up"),
@@ -428,6 +428,7 @@ fn help_text() -> Text<'static> {
         ("M", "mark the article under the cursor read / unread"),
         ("c", "catch up: mark the whole group read"),
         ("/", "filter groups by name or description"),
+        ("↑ ↓ while filtering", "move through what the filter left"),
         ("Esc", "clear the filter, or close an overlay"),
         ("r", "reload the focused pane"),
         ("m", "show recent messages"),

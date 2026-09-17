@@ -201,11 +201,16 @@ while something is outstanding.
 | `M` | mark the article under the cursor read, or unread if it was read |
 | `c` | catch up: mark the whole group read |
 | `/` | filter groups by name or description |
+| `↑` `↓` `PageUp` `PageDown` `Home` `End` while filtering | move through what the filter left, without leaving the filter |
 | `Esc` | clear the filter, or close an overlay |
 | `r` | reload the focused pane |
 | `m` | recent messages |
 | `?` or `F1` | help |
 | `q` or `Ctrl-C` | quit |
+
+While a filter is being typed, the arrows and the page keys move through the groups it
+left — `j` and `k` cannot, because they are filter text. `Enter` closes the filter and
+keeps it applied; a second `Enter` opens the group under the cursor.
 
 The cursor clamps at the ends of a list rather than wrapping: a list that jumps back to
 the top when you hold a key down is disorienting, and a news reader is mostly held-down
