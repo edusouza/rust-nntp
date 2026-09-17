@@ -37,6 +37,34 @@ comment explaining why.
 Anything that constrains future work gets an ADR in [`docs/adr/`](docs/adr/) using the
 existing numbering and template. Record the decision *and* the options that were rejected.
 
+## The README screenshot
+
+The screenshot in the README is generated, not pasted. If you change the reader's layout,
+`cargo test -p nntp-tui --test screenshot` fails and tells you to refresh it:
+
+```sh
+UPDATE_SCREENSHOT=1 cargo test -p nntp-tui --test screenshot
+```
+
+A screenshot nobody regenerates ends up describing a program that no longer exists, which
+is worse than having none.
+
+## Cutting a release
+
+1. Move everything under `## [Unreleased]` in `CHANGELOG.md` into a new version section,
+   with the date and a short paragraph saying what the release *is* — and an honest one
+   saying what it still is not.
+2. Bump `workspace.package.version` in the root `Cargo.toml`, and run `cargo check` so the
+   lock file follows.
+3. Check that `docs/protocol-coverage.md` matches reality. It is part of the definition of
+   done for a command, and it is the first thing a reader of this project will believe.
+4. Run everything CI runs, on both feature configurations:
+   `cargo test --workspace --all-features` and
+   `cargo test --workspace --no-default-features`.
+5. Merge to `main`, then tag *that* commit: `git tag -a v0.1.0 -m 'v0.1.0'`. Tag the
+   default branch, not a feature branch — a tag on an unmerged commit points at history
+   that a squash merge will orphan.
+
 ## Issues
 
 Found a protocol bug, a server quirk, or a gap in RFC coverage? Open an issue rather than

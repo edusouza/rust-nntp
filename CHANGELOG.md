@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+Nothing yet.
+
+## [0.1.0] — 2026-09-17
+
+First release: a read-only Usenet reader. It connects, lists groups, lists articles and
+displays them, over TLS, with authentication, from a terminal.
+
+What it does **not** do yet, in order of how much it matters: nothing proves it agrees with
+a real news server ([#4]), read/unread state is not kept between sessions ([#7]), a long
+request cannot be cancelled ([#9]), and posting, threading and a disk cache are all later
+milestones. See [#3] for the roadmap.
+
 ### Added
 
 - `nntp-proto`, the IO-free protocol layer:
@@ -155,4 +167,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `=20` escape is never stripped — that is what keeps a `-- ` signature separator intact.
   Found by the transcript integration test, not by a unit test.
 
-[Unreleased]: https://github.com/edusouza/rust-nntp/commits/main
+[Unreleased]: https://github.com/edusouza/rust-nntp/compare/v0.1.0...HEAD
+[0.1.0]: https://github.com/edusouza/rust-nntp/releases/tag/v0.1.0
+[#3]: https://github.com/edusouza/rust-nntp/issues/3
+[#4]: https://github.com/edusouza/rust-nntp/issues/4
+[#7]: https://github.com/edusouza/rust-nntp/issues/7
+[#9]: https://github.com/edusouza/rust-nntp/issues/9
