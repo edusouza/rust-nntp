@@ -84,7 +84,7 @@ the client or surfaced in the UI · ⬜ not implemented · 🚫 out of scope for
 | RFC 5322 header folding/unfolding | ✅ | Unfolded per §2.2.3; unparseable lines collected rather than dropped. |
 | RFC 5322 `Date` parsing | ✅ | Plus the obsolete forms of §4.3 and the malformed ones seen in practice. |
 | RFC 2047 encoded words in headers | ✅ | `B` and `Q`, adjacent-word whitespace elision, split across folds. |
-| MIME multipart bodies | ⬜ | v0.2. |
+| MIME multipart bodies | ⬜ | v0.2. The raw body, boundaries included, is shown meanwhile. |
 | `quoted-printable` / `base64` body decoding | ✅ | Brought forward from v0.2: unreadable bodies were too common without it. |
 | Non-UTF-8 body charsets | ✅ | Declared charsets via `encoding_rs`; unlabelled 8-bit falls back to Windows-1252. |
 | yEnc / uuencode attachments | 🚫 v0.1 | Binary groups are out of scope for the first release. |

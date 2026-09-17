@@ -1041,7 +1041,6 @@ dependencies = [
  "anyhow",
  "chrono",
  "clap",
- "crossterm",
  "directories",
  "nntp-client",
  "nntp-proto",

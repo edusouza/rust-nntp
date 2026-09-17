@@ -20,14 +20,31 @@ pub struct Cli {
     #[arg(long, global = true, value_name = "PATH")]
     pub log_file: Option<PathBuf>,
 
-    /// What to do.
+    /// What to do. With no subcommand, the terminal reader opens.
     #[command(subcommand)]
-    pub command: Command,
+    pub command: Option<Command>,
+}
+
+impl Cli {
+    /// Whether this invocation will open the terminal reader.
+    ///
+    /// The reader owns the terminal, so logs have to go to a file rather than to standard
+    /// error; this is how that decision is made before anything is initialised.
+    pub fn opens_the_reader(&self) -> bool {
+        matches!(self.command, None | Some(Command::Tui { .. }))
+    }
 }
 
 /// The subcommands.
 #[derive(Debug, Subcommand)]
 pub enum Command {
+    /// Open the terminal reader (the default with no subcommand)
+    Tui {
+        /// Connection details.
+        #[command(flatten)]
+        server: ServerArgs,
+    },
+
     /// Probe a server and report what it supports
     ///
     /// Run this first against a new server. It reports the greeting, the capability list,
@@ -141,7 +158,7 @@ pub enum ConfigAction {
 /// The flags override the configured server field by field, so
 /// `--server es --host localhost` uses the credentials from `es` against a local server —
 /// which is exactly what one wants when reproducing a problem.
-#[derive(Debug, Args, Clone)]
+#[derive(Debug, Args, Clone, Default)]
 pub struct ServerArgs {
     /// Use this server from the configuration file
     #[arg(long, short = 's', value_name = "NAME")]
@@ -225,9 +242,41 @@ mod tests {
     }
 
     #[test]
+    fn no_subcommand_opens_the_reader() {
+        let cli = parse(&["nntp-tui"]);
+        assert!(cli.command.is_none());
+        assert!(cli.opens_the_reader());
+    }
+
+    #[test]
+    fn the_tui_subcommand_takes_connection_flags() {
+        let cli = parse(&["nntp-tui", "tui", "--host", "127.0.0.1", "--no-tls"]);
+        assert!(cli.opens_the_reader());
+        match cli.command {
+            Some(Command::Tui { server }) => {
+                assert_eq!(server.host.as_deref(), Some("127.0.0.1"));
+                assert!(server.no_tls);
+            }
+            other => panic!("expected Tui, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_command_line_subcommands_do_not_open_the_reader() {
+        // They print to standard output, so their logs belong on standard error.
+        for args in [
+            vec!["nntp-tui", "groups"],
+            vec!["nntp-tui", "config", "path"],
+            vec!["nntp-tui", "doctor", "--host", "x"],
+        ] {
+            assert!(!parse(&args).opens_the_reader(), "{args:?}");
+        }
+    }
+
+    #[test]
     fn parses_doctor_with_explicit_connection_flags() {
         let cli = parse(&["nntp-tui", "doctor", "--host", "news.example.org", "--tls"]);
-        match cli.command {
+        match cli.command.expect("a subcommand") {
             Command::Doctor { server, group } => {
                 assert_eq!(server.host.as_deref(), Some("news.example.org"));
                 assert!(server.tls);
@@ -252,7 +301,7 @@ mod tests {
     #[test]
     fn parses_groups_with_a_pattern_and_a_limit() {
         let cli = parse(&["nntp-tui", "groups", "-p", "comp.*", "-n", "5", "-d"]);
-        match cli.command {
+        match cli.command.expect("a subcommand") {
             Command::Groups {
                 pattern,
                 limit,
@@ -270,7 +319,7 @@ mod tests {
     #[test]
     fn parses_overview_with_a_default_count() {
         let cli = parse(&["nntp-tui", "overview", "misc.test"]);
-        match cli.command {
+        match cli.command.expect("a subcommand") {
             Command::Overview { group, count, .. } => {
                 assert_eq!(group, "misc.test");
                 assert_eq!(count, 20);
@@ -282,7 +331,7 @@ mod tests {
     #[test]
     fn parses_an_article_by_number_and_by_message_id() {
         let by_number = parse(&["nntp-tui", "article", "42", "--group", "misc.test"]);
-        match by_number.command {
+        match by_number.command.expect("a subcommand") {
             Command::Article {
                 article,
                 group,
@@ -299,7 +348,7 @@ mod tests {
         }
 
         let by_id = parse(&["nntp-tui", "article", "<a@b>", "--part", "headers"]);
-        match by_id.command {
+        match by_id.command.expect("a subcommand") {
             Command::Article { article, part, .. } => {
                 assert_eq!(article, "<a@b>");
                 assert_eq!(part, ArticlePart::Headers);
@@ -312,15 +361,15 @@ mod tests {
     fn parses_the_config_subcommands() {
         assert!(matches!(
             parse(&["nntp-tui", "config", "path"]).command,
-            Command::Config {
+            Some(Command::Config {
                 action: ConfigAction::Path
-            }
+            })
         ));
         assert!(matches!(
             parse(&["nntp-tui", "config", "init", "--force"]).command,
-            Command::Config {
+            Some(Command::Config {
                 action: ConfigAction::Init { force: true }
-            }
+            })
         ));
     }
 
@@ -338,7 +387,7 @@ mod tests {
     #[test]
     fn no_transport_flag_means_no_override() {
         let cli = parse(&["nntp-tui", "doctor", "--host", "x"]);
-        match cli.command {
+        match cli.command.expect("a subcommand") {
             Command::Doctor { server, .. } => assert_eq!(server.security_override(), None),
             other => panic!("expected Doctor, got {other:?}"),
         }

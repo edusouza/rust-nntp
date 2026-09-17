@@ -14,6 +14,7 @@ to be wrong gets a new ADR that supersedes the old one, and the old one is marke
 | [0005](0005-config-and-state-storage.md) | TOML configuration and in-memory cache for v0.1 | Accepted |
 | [0006](0006-commit-cargo-lock.md) | Commit `Cargo.lock` | Accepted |
 | [0007](0007-rustls-for-tls.md) | Use rustls with webpki-roots for TLS | Accepted |
+| [0008](0008-ui-state-machine-separate-from-rendering.md) | Keep the interface state machine separate from rendering | Accepted |
 
 ## Template
 

@@ -16,6 +16,10 @@ default = ["tls"]
 ## TLS support, forwarded to nntp-client.
 tls = ["nntp-client/tls"]
 
+[lib]
+name = "nntp_tui"
+path = "src/lib.rs"
+
 [[bin]]
 name = "nntp-tui"
 path = "src/main.rs"
@@ -24,7 +28,6 @@ path = "src/main.rs"
 anyhow.workspace = true
 chrono.workspace = true
 clap.workspace = true
-crossterm.workspace = true
 directories.workspace = true
 nntp-client.workspace = true
 nntp-proto.workspace = true

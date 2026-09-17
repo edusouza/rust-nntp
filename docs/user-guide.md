@@ -1,7 +1,7 @@
 # User guide
 
-> The terminal UI lands in the next milestone. Everything below is implemented and
-> tested; `nntp-tui --help` is the authoritative reference.
+> Everything below is implemented and tested; `nntp-tui --help` is the authoritative
+> reference for the command line.
 
 ## Installing
 
@@ -22,7 +22,11 @@ The workspace ships a fake server, so you can drive the reader offline:
 
 ```sh
 cargo run -p nntp-testserver -- --port 1119          # terminal 1
-cargo run -p nntp-tui -- groups --host 127.0.0.1 --port 1119 --no-tls   # terminal 2
+
+# The reader:
+cargo run -p nntp-tui -- --host 127.0.0.1 --port 1119 --no-tls          # terminal 2
+# Or the command line:
+cargo run -p nntp-tui -- groups --host 127.0.0.1 --port 1119 --no-tls
 ```
 
 The fake server is deliberately awkward — sparse article numbers, encoded subjects, an
@@ -143,6 +147,56 @@ log.
 `--log-file <PATH>` writes to a file instead of standard error; the terminal UI uses that
 by default, since it owns the terminal.
 
-## Key bindings
+## The reader
 
-*(Written in milestone M6, with the terminal UI.)*
+`nntp-tui` with no subcommand opens the reader against the configured server;
+`nntp-tui tui --host …` takes the same connection flags as everything else.
+
+Three panes: groups, the article list for the selected group, and the article itself. The
+focused pane has a thick border. Network work happens on a separate thread, so the
+interface stays responsive while a large group loads — the spinner in the status bar turns
+while something is outstanding.
+
+### Key bindings
+
+| Keys | Action |
+| --- | --- |
+| `Tab` / `Shift-Tab` | next / previous pane |
+| `h` `l` or `←` `→` | move focus left / right |
+| `j` `k` or `↓` `↑` | move down / up |
+| `Ctrl-d` / `Ctrl-u` | page down / up |
+| `PageDown` / `PageUp` | page down / up |
+| `g` / `G` | first / last |
+| `Enter` | open the group or article under the cursor |
+| `n` / `p` | next / previous article, opening it |
+| `/` | filter groups by name or description |
+| `Esc` | clear the filter, or close an overlay |
+| `r` | reload the focused pane |
+| `m` | recent messages |
+| `?` or `F1` | help |
+| `q` or `Ctrl-C` | quit |
+
+The cursor clamps at the ends of a list rather than wrapping: a list that jumps back to
+the top when you hold a key down is disorienting, and a news reader is mostly held-down
+keys.
+
+### What the display tells you
+
+- **`≤n` next to a group** is an upper bound, not a count. `LIST ACTIVE` reports only the
+  watermarks, and expiry and cancellation leave gaps.
+- **`›` before a subject** marks a follow-up. Replies are marked rather than indented:
+  real threads arrive out of order and with missing parents, so an indent would be a lie
+  until threading lands in v0.2.
+- **The badge at the bottom left** is green for TLS and yellow for a plaintext connection,
+  and red when the connection has dropped. The worker reconnects on the next request, so
+  a dropped connection is a nuisance rather than the end of the session.
+- **Quoted lines are dimmed.** On Usenet most of a follow-up is quotation.
+- **An error takes over the status bar** until the next keystroke; `m` shows the ones that
+  have scrolled past.
+
+### What it does not do yet
+
+Posting, persistent read/unread state, threading and a disk cache are all v0.2 or later;
+see the [roadmap](https://github.com/edusouza/rust-nntp/issues/3). Read state is kept for
+the session only, so closing the reader forgets what you have read — the single most
+important gap, and the first thing in the v0.2 scope.
