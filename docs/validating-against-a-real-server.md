@@ -155,6 +155,22 @@ Eight tests, each asserting something the offline suite cannot:
    `ARTICLE`** about the subject and message-id.
 8. **fetching by message-id works with no group selected** — the path the reader uses to
    follow a `References` chain into another group.
+9. **real MIME articles yield something to read** — how many of a real group's articles
+   are multipart, how many are `format=flowed`, and whether every multipart one produces
+   either text or a named part. A multipart article that produces neither would be a blank
+   pane in the reader, which is the failure MIME support exists to prevent.
+
+Test 9 is the one worth pointing somewhere other than `misc.test`. A text-only group has
+no multipart traffic to find, so the test says so instead of passing quietly:
+
+```powershell
+$env:NNTP_TEST_GROUP = 'linux.debian.user'   # or any group fed from a mailing list
+cargo test -p nntp-client --test real_server -- --ignored --nocapture --test-threads=1 `
+  real_mime_articles_yield_something_to_read
+```
+
+Groups fed from mailing lists carry `multipart/alternative` from people writing in mail
+clients, and `format=flowed` from the same. A `comp.*` or `misc.*` group carries neither.
 
 ## Step 3 — drive the reader
 
@@ -177,6 +193,31 @@ colours; the old `conhost` console will look rough.
 Worth trying deliberately: a group with a hundred thousand articles (`comp.lang.c`), an
 article with an attachment, a thread with a missing parent, a non-Latin hierarchy
 (`fido7.*`, `japan.*`) to exercise charset handling.
+
+### Seeing MIME without a real server
+
+The bundled fake server can serve the MIME traffic too, which is the fastest way to see
+what the feature does — no account, no network:
+
+```powershell
+cargo run -p nntp-testserver -- --port 1119 --mime     # terminal 1
+cargo run -p nntp-tui -- --host 127.0.0.1 --port 1119 --no-tls   # terminal 2
+```
+
+`news.software.readers` then holds three articles worth opening: a mail-to-news gateway
+`multipart/mixed` wrapping a `multipart/alternative` plus a patch, an article in
+`format=flowed` with a quoted paragraph and a signature separator, and an article that is
+nothing but an attachment. What to look for:
+
+- the gateway article shows the plain text, **not** the boundary lines, the part headers or
+  the HTML copy, with the other two parts named above the body;
+- the flowed article shows one paragraph rather than three short lines, the quoted
+  paragraph stays separate from the reply, and `-- ` stays on its own line;
+- the attachment-only article says `(no text in this article)` rather than showing nothing.
+
+Add `--raw` to `nntp-tui article` to see what the same article looked like before any of
+this — the boundaries, the part headers and the base64 are all still there, which is the
+point of `--raw`.
 
 ## Step 4 — read state
 

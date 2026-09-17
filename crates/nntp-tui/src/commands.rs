@@ -415,7 +415,15 @@ pub fn article(
                     }
                     writeln!(out)?;
                 }
-                writeln!(out, "{}", fetched.display_text())?;
+
+                let text = fetched.display_text();
+                if text.is_empty() && !attachments.is_empty() {
+                    // The same note the reader shows: an article that is only an
+                    // attachment should say so rather than look like a failed fetch.
+                    writeln!(out, "(no text in this article)")?;
+                } else {
+                    writeln!(out, "{text}")?;
+                }
             }
         }
     }

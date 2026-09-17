@@ -29,6 +29,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
   `nntp-tui article --raw` is unchanged and still shows exactly what arrived.
 
+  `nntp-testserver --mime` serves a group of this traffic, so the feature can be seen
+  without a Usenet account, and the opt-in real-server suite gains a ninth test that
+  reports how much of a real group is multipart or flowed and asserts that every multipart
+  article yields either text or a named part.
+
 - **Read and unread state, remembered between runs** ([#7] — the largest functional gap in
   v0.1.0). Stored in the `.newsrc` format, one file per server under the platform data
   directory, because article numbers are the server's own and the same group on two
