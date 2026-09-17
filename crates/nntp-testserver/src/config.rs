@@ -62,6 +62,15 @@ pub struct Quirks {
     /// Advertise `OVER` but answer `500` to it, so the client must fall back to `XOVER`
     /// despite what the capability list said.
     pub over_advertised_but_missing: bool,
+
+    /// Pause for this long before each line of a multi-line block.
+    ///
+    /// A full-feed `LIST ACTIVE` takes tens of seconds on a real server, which is the
+    /// whole reason a client needs to be able to abandon one. Nothing in a corpus small
+    /// enough to be a fixture reproduces that, so the delay is the fixture: it makes a
+    /// response arrive slowly enough for a test to interrupt it on purpose, in
+    /// milliseconds rather than tens of seconds.
+    pub line_delay: Option<std::time::Duration>,
 }
 
 /// A test server's configuration.

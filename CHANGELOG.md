@@ -76,6 +76,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   groups. Recorded in
   [`docs/protocol-coverage.md`](docs/protocol-coverage.md#read-state-checked-by-hand).
 
+### Added
+
+- **A long request can be cancelled** ([#9], the largest gap left in v0.1.0). `Esc`
+  abandons whatever the reader is fetching; the status bar advertises it (`Esc: stop`)
+  while anything is outstanding.
+
+  `Cancel` is a shared flag checked once per line in `Connection::read_block_streaming`,
+  so a response that is still arriving is abandoned within one line. It **cannot** be a
+  message on the request channel: that channel is first-in-first-out and the worker sits
+  inside the request being cancelled, so the message would arrive only once the wait had
+  ended on its own.
+
+  Cancelling stops mid-response, so the connection is marked desynchronised and dropped —
+  that is the price of the guarantee `read_block_streaming` otherwise makes, that it always
+  reads to its terminator. The next request reconnects, and the message pane says so, since
+  a reconnection nobody explained looks like a fault.
+
+  What this does *not* cover, and says so in
+  [ADR-0003](docs/adr/0003-blocking-io-on-a-worker-thread.md): a server that has gone
+  silent. Nothing arriving means nothing to notice between lines, so the read timeout
+  remains what ends that wait.
+
+  `nntp-testserver --line-delay <MS>` pauses before each line of a block, which is how a
+  four-group corpus stands in for a response that takes tens of seconds.
+
 ### Fixed
 
 - **The arrow keys did nothing while a group filter was being typed** — so a filter that
@@ -321,6 +346,7 @@ records what was checked, against which server, on what date ([#4]).
 [#3]: https://github.com/edusouza/rust-nntp/issues/3
 [#4]: https://github.com/edusouza/rust-nntp/issues/4
 [#7]: https://github.com/edusouza/rust-nntp/issues/7
+[#9]: https://github.com/edusouza/rust-nntp/issues/9
 [#9]: https://github.com/edusouza/rust-nntp/issues/9
 [#12]: https://github.com/edusouza/rust-nntp/issues/12
 [#17]: https://github.com/edusouza/rust-nntp/issues/17

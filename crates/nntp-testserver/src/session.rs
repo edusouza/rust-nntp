@@ -690,7 +690,16 @@ impl<'a> Session<'a> {
             self.state.close_requested = true;
         }
 
+        let delay = self.config.quirks.line_delay;
+
         for (index, line) in lines.into_iter().enumerate() {
+            if let Some(delay) = delay {
+                // Flush first: a client waiting for the previous line must actually have
+                // it, or the delay would only fill the socket buffer and arrive in one
+                // burst at the end, which is the opposite of what this simulates.
+                output.flush()?;
+                std::thread::sleep(delay);
+            }
             if truncate && index >= 1 {
                 // Stop without the terminator: exactly what a server that dies mid-block
                 // leaves on the wire.

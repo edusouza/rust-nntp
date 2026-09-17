@@ -20,6 +20,7 @@
 │   tls               rustls configuration and handshake               │
 │   connection        framing: status lines, blocks, size limits        │
 │   client            one method per command, plus session state        │
+│   cancel            a shared flag that abandons a response            │
 │   limits / error    size bounds, and an error taxonomy by remedy      │
 └───────────────────────────┬──────────────────────────────────────────┘
                             │ &[u8] in, parsed values out

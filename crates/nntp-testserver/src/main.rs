@@ -186,6 +186,13 @@ fn parse_args() -> Result<Option<Args>, String> {
                 ca_out = Some(std::path::PathBuf::from(value));
             }
             "--mime" => mime = true,
+            "--line-delay" => {
+                let value = args.next().ok_or("--line-delay needs milliseconds")?;
+                let millis: u64 = value
+                    .parse()
+                    .map_err(|_| format!("bad millisecond count: {value}"))?;
+                quirks.line_delay = (millis > 0).then(|| std::time::Duration::from_millis(millis));
+            }
             "--no-overview-fmt" => quirks.no_overview_fmt = true,
             "--reject-open-ranges" => quirks.reject_open_ended_ranges = true,
             "--bare-lf" => quirks.bare_lf = true,
@@ -224,6 +231,8 @@ OPTIONS:
         --mime               Also serve news.software.readers: a mail-to-news gateway
                              multipart, a format=flowed article, and an article that is
                              nothing but an attachment
+        --line-delay <MS>    Pause this long before each line of a multi-line block, so a
+                             response takes long enough to be worth cancelling
         --no-overview-fmt    Refuse LIST OVERVIEW.FMT, as some servers do
         --reject-open-ranges Refuse an OVER range with an open upper bound
         --bare-lf            Terminate lines with LF instead of CRLF

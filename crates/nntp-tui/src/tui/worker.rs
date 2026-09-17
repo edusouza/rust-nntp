@@ -8,7 +8,7 @@
 use std::sync::mpsc::{Receiver, Sender};
 use std::thread::JoinHandle;
 
-use nntp_client::{Client, ClientError, Transport};
+use nntp_client::{Cancel, Client, ClientError, Transport};
 use nntp_proto::{ActiveEntry, GroupName, Range};
 
 use crate::session::{self, Target};
@@ -24,6 +24,7 @@ pub fn spawn(
     overview_chunk: u64,
     requests: Receiver<Request>,
     events: Sender<Event>,
+    cancel: Cancel,
 ) -> std::io::Result<JoinHandle<()>> {
     std::thread::Builder::new()
         .name("nntp-worker".to_owned())
@@ -33,6 +34,7 @@ pub fn spawn(
                 overview_chunk: overview_chunk.max(1),
                 client: None,
                 events,
+                cancel,
             }
             .run(&requests);
         })
@@ -43,6 +45,12 @@ struct Worker {
     overview_chunk: u64,
     client: Option<Client<Transport>>,
     events: Sender<Event>,
+    /// Raised by the interface to abandon the response being read.
+    ///
+    /// Shared state rather than a `Request`, because the request channel is
+    /// first-in-first-out and this thread is *inside* the request being cancelled: a
+    /// message would not be seen until the wait the user is escaping had ended.
+    cancel: Cancel,
 }
 
 impl Worker {
@@ -63,6 +71,19 @@ impl Worker {
     }
 
     fn handle(&mut self, request: Request) {
+        self.dispatch(request);
+
+        // Cleared *after* the request, never before. Clearing first looks tidier and is
+        // wrong: the interface raises the flag the moment the user presses the key, which
+        // can be before this thread has taken the request off the channel — so a reset
+        // here would throw away the cancellation and the keystroke would do nothing. A
+        // flag still raised at this point was either noticed (and the request is already
+        // reported as cancelled) or arrived too late to matter, and in both cases it must
+        // not leak into whatever runs next.
+        self.cancel.reset();
+    }
+
+    fn dispatch(&mut self, request: Request) {
         let outcome = match &request {
             Request::LoadGroups => self.load_groups(),
             Request::OpenGroup { group, count } => self.open_group(group, *count),
@@ -74,6 +95,19 @@ impl Worker {
         if let Err(error) = outcome {
             let fatal = error.is_connection_fatal();
             let context = describe(&request);
+
+            if error.is_cancelled() {
+                // The user's own doing, so not a failure — and deliberately not a
+                // `Disconnected` either, because the interface would show the connection
+                // as lost when nothing is wrong with the server. The connection *is*
+                // finished (it stopped mid-response), so it is dropped here and the next
+                // request reconnects; the reconnection is visible as a progress line.
+                tracing::debug!(%context, "request cancelled");
+                self.client = None;
+                self.send(Event::Cancelled { context });
+                return;
+            }
+
             tracing::warn!(%context, %error, fatal, "request failed");
 
             self.send(Event::Failed {
@@ -108,6 +142,11 @@ impl Worker {
                 greeting: client.greeting().text.clone(),
                 encrypted: client.is_encrypted(),
             });
+
+            let mut client = client;
+            // Every connection this worker owns can be cancelled, including the ones it
+            // makes after a cancellation dropped the last one.
+            client.connection_mut().set_cancel(self.cancel.clone());
             self.client = Some(client);
         }
 

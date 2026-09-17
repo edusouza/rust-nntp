@@ -53,6 +53,7 @@
     )
 )]
 
+pub mod cancel;
 pub mod client;
 pub mod connection;
 pub mod connector;
@@ -61,6 +62,7 @@ pub mod limits;
 #[cfg(feature = "tls")]
 pub mod tls;
 
+pub use cancel::Cancel;
 pub use client::{ArticleId, Client, ClientOptions, Greeting};
 pub use connection::Connection;
 pub use connector::{ConnectOptions, DEFAULT_PORT, DEFAULT_TLS_PORT, Security, Transport};

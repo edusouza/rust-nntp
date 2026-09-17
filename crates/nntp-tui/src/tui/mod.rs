@@ -58,8 +58,18 @@ pub fn run(config: &Config, target: Target) -> anyhow::Result<()> {
         }
     };
 
-    let worker = worker::spawn(target, config.ui.overview_chunk, request_rx, event_tx)
-        .context("starting the network worker")?;
+    // The flag the interface raises and the worker watches. Created here because both
+    // sides need it and it outlives neither on its own.
+    let cancel = nntp_client::Cancel::new();
+
+    let worker = worker::spawn(
+        target,
+        config.ui.overview_chunk,
+        request_rx,
+        event_tx,
+        cancel.clone(),
+    )
+    .context("starting the network worker")?;
 
     // `init` enables raw mode, switches to the alternate screen, and installs a panic
     // hook that restores both. Without that hook a panic leaves the user with an
@@ -67,6 +77,7 @@ pub fn run(config: &Config, target: Target) -> anyhow::Result<()> {
     let mut terminal = ratatui::try_init().context("setting up the terminal")?;
 
     let mut app = App::new(&config.ui, read_state);
+    app.cancel = cancel;
     for problem in read_problems {
         app.note(problem.to_string());
         tracing::warn!(%problem, "read state");

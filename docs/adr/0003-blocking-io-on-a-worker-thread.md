@@ -49,8 +49,22 @@ Cancellation is cooperative: the worker checks for a cancel flag between respons
   each rather than a task each. For a reader with one or two connections this is fine; a
   batch downloader with 20 connections would want revisiting.
 - Cancellation is not instant: a command already blocked in `read()` only aborts when the
-  read timeout expires or the socket is shut down. The worker exposes an explicit
-  "abandon connection" path for that case.
+  read timeout expires or the socket is shut down.
+
+  > **Implemented 2026-09-17** ([#9](https://github.com/edusouza/rust-nntp/issues/9)).
+  > `Cancel` is a shared flag checked once per line in
+  > `Connection::read_block_streaming`, so a response that is *still arriving* is
+  > abandoned within one line. It cannot be a message on the request channel: that
+  > channel is first-in-first-out and the worker is inside the request being cancelled.
+  >
+  > A cancelled read stops mid-response, so the connection is marked desynchronised and
+  > dropped; the next request reconnects. That cost is the reason
+  > `read_block_streaming` otherwise guarantees it always reads to its terminator.
+  >
+  > Still not covered, and still an accepted cost: a server that has gone **silent**. The
+  > flag is only seen between lines, so nothing arriving means nothing to notice, and the
+  > read timeout remains what ends it. Shutting the socket down from the interface thread
+  > would fix that and needs a handle the worker does not currently hand back.
 - We hand-roll the request/response plumbing that an async runtime would provide.
 
 ## Alternatives considered
