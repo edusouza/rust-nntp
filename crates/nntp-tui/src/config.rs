@@ -197,6 +197,18 @@ pub struct UiConfig {
 
     /// `strftime` format for dates in the article list.
     pub date_format: String,
+
+    /// Whether opening an article marks it read.
+    ///
+    /// On by default, because that is what the act of reading means and what every other
+    /// newsreader does. Turning it off leaves `M` as the only way an article becomes read,
+    /// which suits someone who skims a group and wants to decide deliberately.
+    pub mark_read_on_open: bool,
+
+    /// Whether the article list starts showing only unread articles.
+    ///
+    /// The `u` key toggles it either way; this is only the state the reader opens in.
+    pub unread_only: bool,
 }
 
 impl Default for UiConfig {
@@ -205,6 +217,8 @@ impl Default for UiConfig {
             overview_chunk: 500,
             initial_articles: 300,
             date_format: "%Y-%m-%d %H:%M".to_owned(),
+            mark_read_on_open: true,
+            unread_only: false,
         }
     }
 }
@@ -405,6 +419,10 @@ overview_chunk = {overview_chunk}
 # How many of a group's newest articles to load when it is opened.
 initial_articles = {initial_articles}
 date_format = "{date_format}"
+# Whether opening an article marks it read. Off leaves `M` as the only way.
+mark_read_on_open = {mark_read_on_open}
+# Whether the article list starts showing only unread articles. `u` toggles it.
+unread_only = {unread_only}
 "#,
             max_line_bytes = LimitsConfig::default().max_line_bytes,
             max_block_bytes = LimitsConfig::default().max_block_bytes,
@@ -412,6 +430,8 @@ date_format = "{date_format}"
             overview_chunk = UiConfig::default().overview_chunk,
             initial_articles = UiConfig::default().initial_articles,
             date_format = UiConfig::default().date_format,
+            mark_read_on_open = UiConfig::default().mark_read_on_open,
+            unread_only = UiConfig::default().unread_only,
         )
     }
 }

@@ -92,6 +92,11 @@ read -rs -p 'password: ' NNTP_PASSWORD; export NNTP_PASSWORD; echo
 This is the part worth doing, because it turns "it looked fine" into pass or fail. The
 tests read the password from `NNTP_TEST_PASS` directly, so again no shell touches it.
 
+Re-run it after any change to the protocol layer, and after a dependency bump that touches
+decoding: `base64` and `encoding_rs` both sit in the path that turns a real RFC 2047 subject
+into text, and this server's `LIST NEWSGROUPS` alone carries around 1 900 non-ASCII
+descriptions. That is a better test of a decoder than any fixture in this repository.
+
 ### Windows (PowerShell)
 
 ```powershell
@@ -173,12 +178,76 @@ Worth trying deliberately: a group with a hundred thousand articles (`comp.lang.
 article with an attachment, a thread with a missing parent, a non-Latin hierarchy
 (`fido7.*`, `japan.*`) to exercise charset handling.
 
+## Step 4 — read state
+
+The automated suite covers the protocol layer, which does not know read state exists. The
+store has unit tests and an end-to-end test against the fake server, so what a real server
+adds is scale — a group with six-digit article numbers and real gaps — and the one thing no
+test can check: whether the marks a user sees match what they actually read.
+
+Fifteen minutes, by hand. `nntp-tui config path` prints where the file will be:
+
+```text
+read state:    C:\Users\you\AppData\Local\nntp-tui\data\newsrc\news.eternal-september.org.newsrc
+```
+
+Then:
+
+1. **Open a group and read three or four articles**, moving with `n`. The count beside the
+   group in the left pane should drop by one each time, and the bullet should disappear
+   from each subject as you leave it.
+2. **Press `u`.** The articles you just read vanish from the list, and the pane subtitle
+   shows both counts. Press `u` again: they come back, with the cursor still on the same
+   article.
+3. **Press `M`** on a read article. It comes back as unread, with its mark. Press it again
+   to put it back.
+4. **Quit with `q` and look at the file.** One line per group you opened, with the numbers
+   you actually read — real article numbers, so six digits on Eternal September:
+
+   ```powershell
+   Get-Content "$env:LOCALAPPDATA\nntp-tui\data\newsrc\news.eternal-september.org.newsrc"
+   ```
+
+   ```sh
+   cat ~/.local/share/nntp-tui/newsrc/news.eternal-september.org.newsrc
+   ```
+
+   Expect something like `misc.test: 970370-970373`. Consecutive articles must appear as
+   **one range**, not four numbers. That is the whole reason for the representation, and it
+   is visible right here.
+
+5. **Start the reader again.** What you read is still read, the count is still lower, and
+   `u` still hides it. That is the acceptance criterion of
+   [#7](https://github.com/edusouza/rust-nntp/issues/7), with a real server behind it.
+6. **Press `c` in a group you do not mind losing**, quit, and look again: the range should
+   span the group's whole watermark range, not just the articles that were listed.
+   Catch-up that covered only the visible list would not be catching up.
+7. **Break the file on purpose.** Add a junk line and a bad range:
+
+   ```text
+   misc.test: 969063-970373
+   this line is not a newsrc line
+   comp.lang.c: 1-10,oops,20
+   ```
+
+   The reader must open, `misc.test` must still be caught up, `comp.lang.c` must keep
+   `1-10,20`, and `m` must show one message per fault. Anything else — refusing to start,
+   or starting with everything silently unread — is a bug worth an issue.
+8. **Check that the numbers are per server.** With a second account anywhere, open the same
+   group on both: two files, two unrelated sets of numbers. The same group on two servers
+   has two unrelated numberings, and one shared file would mark articles read that were
+   never opened.
+
+What to report if something is wrong: the file's contents, the group, and what you expected
+to be unread. The file holds no credentials — but it does name the groups you have been
+reading, which may be more than you want in a public issue.
+
 **Pick a group the server actually carries.** `misc.test` exists nearly everywhere and is
 the default. `comp.lang.rust` does *not* exist — Rust discussion never moved to Usenet — so
 using it makes every article test fail with `no such newsgroup`. If you get that, the
 failure message lists groups the server does carry, and `nntp-tui groups` lists them all.
 
-## Step 4 — what to do with a failure
+## Step 5 — what to do with a failure
 
 **A failure here is a finding, not a broken test.** For each one:
 

@@ -10,6 +10,7 @@
 │   tui::worker       owns the client, blocks on its own thread         │
 │   cli / commands    argument parsing, doctor, groups, overview, …    │
 │   config            TOML (serde) + platform paths                     │
+│   readstate         read/unread ranges, and the .newsrc file          │
 │   session           config ⊕ flags → a connected client              │
 └───────────────────────────┬──────────────────────────────────────────┘
                             │ Request / Event channels
@@ -54,7 +55,8 @@ cost worth avoiding.
 | Layered workspace, not one crate | [0002](adr/0002-layered-workspace.md) | The bugs that matter are parsing bugs against hostile input, and those are only cheap to test when the parser is a pure function. |
 | Blocking IO on a worker thread, not async | [0003](adr/0003-blocking-io-on-a-worker-thread.md) | NNTP is a serialised conversation over one connection. `tokio` would colour every API for one background worker. |
 | Test against an in-repo fake server | [0004](adr/0004-fake-server-for-tests.md) | No outbound 119/563 here, and a real server cannot be asked to misbehave on demand. It found real bugs on first contact. |
-| TOML config, in-memory cache | [0005](adr/0005-config-and-state-storage.md) | Ship a working reader before designing a schema. The cost — no persistent read state — is tracked as an issue. |
+| TOML config, in-memory cache | [0005](adr/0005-config-and-state-storage.md) | Ship a working reader before designing a schema. Its read-state half is superseded by 0009. |
+| Read state in a `.newsrc` file, one per server | [0009](adr/0009-newsrc-file-for-read-state.md) | It is the one thing this program stores that other programs read. Small, written rarely — none of what makes SQLite right for a cache applies. |
 | rustls with a bundled root set | [0007](adr/0007-rustls-for-tls.md) | No C toolchain, identical on three platforms. Verification cannot be disabled from anywhere. |
 | UI state machine separate from rendering | [0008](adr/0008-ui-state-machine-separate-from-rendering.md) | Otherwise the interface's decisions are only testable by drawing them and having a human look. |
 
@@ -135,6 +137,7 @@ The suite is entirely offline and runs on Linux, macOS and Windows.
 | `nntp-proto` | unit tests over byte slices, including malformed input, plus transcript tests over captured INN-shaped output through the public API |
 | `nntp-client` | the conversation driven over scripted in-memory streams, then end to end over a real socket against the fake server, including its deliberate misbehaviour |
 | TLS | a real handshake against a certificate generated at run time, with verification left on; the two failure cases — untrusted CA, wrong name — are asserted to fail |
+| `nntp-tui` read state | unit tests, including 4 000 random operations against an oracle |
 | `nntp-tui` state machine | unit tests over key events and worker events |
 | `nntp-tui` rendering | `TestBackend` snapshots, including terminals too small to use |
 | `nntp-tui` as a whole | state machine plus worker plus a real socket plus the fake server |

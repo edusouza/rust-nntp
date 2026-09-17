@@ -382,7 +382,7 @@ fn config_init_then_show_round_trips() {
 }
 
 #[test]
-fn config_path_reports_both_paths() {
+fn config_path_reports_every_path_the_program_uses() {
     let output = run(&["config", "path", "--config", missing_config()]);
 
     assert!(output.status.success(), "stderr: {}", stderr(&output));
@@ -390,6 +390,29 @@ fn config_path_reports_both_paths() {
     assert!(text.contains("configuration:"), "{text}");
     assert!(text.contains("does not exist yet"), "{text}");
     assert!(text.contains("log file:"), "{text}");
+    // Read state is a file the user may want to inspect, hand-edit or copy from another
+    // newsreader, and a path nothing printed is a path nobody can find.
+    assert!(text.contains("read state:"), "{text}");
+}
+
+#[test]
+fn config_path_names_the_read_state_file_after_the_configured_server() {
+    // The file is per server, because article numbers are the server's own. With a server
+    // configured, the exact file can be printed rather than just its directory.
+    let path = std::env::temp_dir().join(format!("nntp-tui-newsrc-{}.toml", std::process::id()));
+    std::fs::write(
+        &path,
+        b"default_server = \"es\"\n\n[servers.es]\nhost = \"news.example.org\"\n",
+    )
+    .unwrap();
+
+    let output = run(&["config", "path", "--config", &path.to_string_lossy()]);
+
+    assert!(output.status.success(), "stderr: {}", stderr(&output));
+    let text = stdout(&output);
+    assert!(text.contains("news.example.org.newsrc"), "{text}");
+
+    std::fs::remove_file(&path).ok();
 }
 
 #[test]

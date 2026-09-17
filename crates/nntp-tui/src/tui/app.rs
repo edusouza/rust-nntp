@@ -11,6 +11,7 @@ use nntp_proto::{ArticleSpec, GroupSummary, OverviewRecord, Range};
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use crate::config::UiConfig;
+use crate::readstate::ReadStore;
 use crate::tui::protocol::{Event, GroupRow, Request};
 
 /// How many messages to keep for the message pane.
@@ -153,8 +154,18 @@ pub struct App {
     pub group: Option<GroupSummary>,
     /// Overview records for the selected group, newest last.
     pub articles: Vec<OverviewRecord>,
-    /// Index into [`Self::articles`].
+    /// Index into [`Self::visible_articles`], not into [`Self::articles`] — the two differ
+    /// only while [`Self::unread_only`] is on.
     pub article_cursor: usize,
+    /// Whether the article list hides articles that have been read.
+    pub unread_only: bool,
+
+    /// Which articles have been read, per group.
+    ///
+    /// The state machine owns it and mutates it; loading and saving belong to the run
+    /// loop, because ADR-0008 keeps IO out of here. Everything below therefore reads and
+    /// writes this freely and never touches the file.
+    pub read: ReadStore,
 
     /// The article on display.
     pub article: Option<ArticleView>,
@@ -185,6 +196,8 @@ pub struct App {
 
     /// How many of a group's newest articles to load.
     initial_articles: u64,
+    /// Whether opening an article marks it read.
+    mark_read_on_open: bool,
     /// `strftime` format for dates.
     date_format: String,
     /// Height of the article list, so page keys can move by a screenful.
@@ -195,7 +208,11 @@ pub struct App {
 
 impl App {
     /// A fresh interface, with the group list already requested.
-    pub fn new(config: &UiConfig) -> Self {
+    ///
+    /// `read` is this server's read state, already loaded. It is passed in rather than
+    /// loaded here so that the state machine stays free of IO, and so that the tests can
+    /// start the reader with any reading history they like.
+    pub fn new(config: &UiConfig, read: ReadStore) -> Self {
         Self {
             focus: Pane::Groups,
             overlay: Overlay::None,
@@ -206,6 +223,8 @@ impl App {
             group: None,
             articles: Vec::new(),
             article_cursor: 0,
+            unread_only: config.unread_only,
+            read,
             article: None,
             body_scroll: 0,
             server: String::new(),
@@ -219,6 +238,7 @@ impl App {
             dirty: true,
             should_quit: false,
             initial_articles: config.initial_articles,
+            mark_read_on_open: config.mark_read_on_open,
             date_format: config.date_format.clone(),
             list_height: 20,
             body_height: 20,
@@ -260,9 +280,54 @@ impl App {
             .and_then(|index| self.groups.get(*index))
     }
 
+    /// Indices into [`Self::articles`] that the article list shows, in order.
+    ///
+    /// Everything unless [`Self::unread_only`] is on, in which case only the unread. The
+    /// same shape as [`Self::visible_groups`], deliberately: one filtering pattern in the
+    /// interface rather than two.
+    pub fn visible_articles(&self) -> Vec<usize> {
+        if !self.unread_only {
+            return (0..self.articles.len()).collect();
+        }
+
+        self.articles
+            .iter()
+            .enumerate()
+            .filter(|(_, record)| self.is_unread(record.number))
+            .map(|(index, _)| index)
+            .collect()
+    }
+
     /// The overview record under the cursor.
     pub fn selected_article(&self) -> Option<&OverviewRecord> {
-        self.articles.get(self.article_cursor)
+        let visible = self.visible_articles();
+        visible
+            .get(self.article_cursor)
+            .and_then(|index| self.articles.get(*index))
+    }
+
+    /// Whether article `number` in the selected group is unread.
+    ///
+    /// An article in no group at all counts as unread: there is nowhere to have recorded
+    /// otherwise, and calling something read on no evidence is the worse mistake.
+    pub fn is_unread(&self, number: u64) -> bool {
+        match &self.group {
+            Some(summary) => !self.read.read_set(summary.name.as_str()).contains(number),
+            None => true,
+        }
+    }
+
+    /// How many of `group`'s numbers are unread, as an upper bound.
+    ///
+    /// Built from the watermarks, so it counts numbers left by cancelled and expired
+    /// articles as unread — the same reason the group list writes its totals as `≤n`.
+    pub fn unread_in(&self, group: &GroupRow) -> u64 {
+        if group.is_empty() {
+            return 0;
+        }
+        self.read
+            .read_set(group.name.as_str())
+            .unread_in(group.low, group.high)
     }
 
     /// Advances the spinner. Called on each idle tick.
@@ -288,7 +353,10 @@ impl App {
     }
 
     /// Records a message, for the message pane.
-    fn note(&mut self, message: impl Into<String>) {
+    ///
+    /// Public because the run loop has things to report that the state machine cannot
+    /// know — a read-state file it could not parse, for one.
+    pub fn note(&mut self, message: impl Into<String>) {
         let message = message.into();
         tracing::debug!(%message, "ui message");
         self.messages.push_front(message);
@@ -321,9 +389,18 @@ impl App {
             }
 
             Event::GroupOpened(summary) => {
+                // Numbers below the low watermark are gone for good, so read state about
+                // them can never be useful again and would otherwise accumulate in the
+                // store forever. This is the only moment the watermarks are known.
+                self.read.forget_expired(summary.name.as_str(), summary.low);
+
+                let unread = self
+                    .read
+                    .read_set(summary.name.as_str())
+                    .unread_in(summary.low, summary.high);
                 self.status = format!(
-                    "{}: {} articles, {}..{}",
-                    summary.name, summary.estimated_count, summary.low, summary.high
+                    "{}: \u{2264}{} unread of {}, {}..{}",
+                    summary.name, unread, summary.estimated_count, summary.low, summary.high
                 );
                 self.group = Some(*summary);
             }
@@ -351,14 +428,36 @@ impl App {
 
                 self.articles = records;
                 // Newest last, and the newest is what a reader wants to see first.
-                self.article_cursor = self.articles.len().saturating_sub(1);
+                self.article_cursor = self.visible_articles().len().saturating_sub(1);
                 self.focus = Pane::Articles;
-                self.status = format!("{}: {} articles listed", group, self.articles.len());
+
+                let unread = self
+                    .articles
+                    .iter()
+                    .filter(|record| self.is_unread(record.number))
+                    .count();
+                self.status = format!(
+                    "{}: {} articles listed, {unread} unread",
+                    group,
+                    self.articles.len()
+                );
             }
 
             Event::Article(article) => {
                 self.inflight = self.inflight.saturating_sub(1);
                 let view = ArticleView::new(&article, &self.date_format);
+
+                // Reading an article is what makes it read, unless the user has asked to
+                // decide that themselves. The number comes from the article rather than
+                // from the cursor: a fetch by message-id has no cursor position, and the
+                // cursor may have moved while the fetch was in flight.
+                if self.mark_read_on_open
+                    && let Some(number) = view.number
+                    && let Some(group) = self.group.as_ref().map(|summary| summary.name.to_string())
+                {
+                    self.read.mark_read(&group, number);
+                }
+
                 self.status = format!("{} — {}", view.date, view.subject);
                 self.article = Some(view);
                 self.body_scroll = 0;
@@ -449,6 +548,10 @@ impl App {
 
             KeyCode::Char('n') => return self.step_article(1),
             KeyCode::Char('p') => return self.step_article(-1),
+
+            KeyCode::Char('u') => self.toggle_unread_only(),
+            KeyCode::Char('M') => self.toggle_read_under_cursor(),
+            KeyCode::Char('c') => self.catch_up(),
 
             _ => self.dirty = false,
         }
@@ -554,6 +657,86 @@ impl App {
         }
     }
 
+    /// `u`: show only unread articles, or everything again.
+    ///
+    /// The article under the cursor is kept under the cursor where it still passes the
+    /// filter. Toggling a filter and finding yourself somewhere else in the list is the
+    /// kind of small betrayal that makes a reader feel unpredictable.
+    fn toggle_unread_only(&mut self) {
+        let anchor = self.selected_article().map(|record| record.number);
+        self.unread_only = !self.unread_only;
+
+        let visible = self.visible_articles();
+        self.article_cursor = anchor
+            .and_then(|number| {
+                visible.iter().position(|index| {
+                    self.articles
+                        .get(*index)
+                        .is_some_and(|r| r.number == number)
+                })
+            })
+            .unwrap_or_else(|| visible.len().saturating_sub(1));
+
+        self.status = if self.unread_only {
+            format!(
+                "showing {} unread of {}",
+                visible.len(),
+                self.articles.len()
+            )
+        } else {
+            format!("showing all {} articles", self.articles.len())
+        };
+    }
+
+    /// `M`: mark the article under the cursor read, or unread if it already was read.
+    fn toggle_read_under_cursor(&mut self) {
+        let Some(number) = self.selected_article().map(|record| record.number) else {
+            return;
+        };
+        let Some(group) = self.group.as_ref().map(|summary| summary.name.to_string()) else {
+            return;
+        };
+
+        if self.is_unread(number) {
+            self.read.mark_read(&group, number);
+            self.status = format!("article {number} marked read");
+        } else {
+            self.read.mark_unread(&group, number);
+            self.status = format!("article {number} marked unread");
+        }
+
+        // With the unread filter on, marking the article under the cursor read removes it
+        // from the list, so the cursor has to be brought back inside it.
+        self.clamp_article_cursor();
+    }
+
+    /// `c`: catch up — mark the whole selected group read.
+    ///
+    /// The range comes from the group's watermarks rather than from the article list,
+    /// because the list holds only the newest few hundred records and "catch up" that
+    /// leaves older articles unread would not be catching up.
+    fn catch_up(&mut self) {
+        let Some(summary) = &self.group else {
+            self.status = "no group selected".to_owned();
+            return;
+        };
+        let name = summary.name.to_string();
+        let Some((low, high)) = summary.range() else {
+            self.status = format!("{name} is empty");
+            return;
+        };
+
+        self.read.mark_range_read(&name, low, high);
+        self.status = format!("{name}: caught up to article {high}");
+        self.clamp_article_cursor();
+    }
+
+    /// Brings the article cursor back inside the visible list.
+    fn clamp_article_cursor(&mut self) {
+        let count = self.visible_articles().len();
+        self.article_cursor = self.article_cursor.min(count.saturating_sub(1));
+    }
+
     fn load_selected_article(&mut self) -> Vec<Request> {
         let Some(record) = self.selected_article() else {
             return Vec::new();
@@ -574,12 +757,13 @@ impl App {
 
     /// `n` / `p`: move to the next or previous article and open it.
     fn step_article(&mut self, delta: isize) -> Vec<Request> {
-        if self.articles.is_empty() {
+        let count = self.visible_articles().len();
+        if count == 0 {
             return Vec::new();
         }
 
         let next = self.article_cursor as isize + delta;
-        if next < 0 || next as usize >= self.articles.len() {
+        if next < 0 || next as usize >= count {
             self.status = if delta > 0 {
                 "already at the newest article".to_owned()
             } else {
@@ -628,7 +812,8 @@ impl App {
                 self.group_cursor = shift(self.group_cursor, delta, count);
             }
             Pane::Articles => {
-                self.article_cursor = shift(self.article_cursor, delta, self.articles.len());
+                let count = self.visible_articles().len();
+                self.article_cursor = shift(self.article_cursor, delta, count);
             }
             Pane::Body => self.scroll_body(delta),
         }
@@ -647,7 +832,9 @@ impl App {
             Pane::Groups => {
                 self.group_cursor = self.visible_groups().len().saturating_sub(1);
             }
-            Pane::Articles => self.article_cursor = self.articles.len().saturating_sub(1),
+            Pane::Articles => {
+                self.article_cursor = self.visible_articles().len().saturating_sub(1);
+            }
             Pane::Body => {
                 let lines = self.article.as_ref().map_or(0, |view| view.body.len());
                 // Stop with the last line at the bottom of the pane rather than scrolling
@@ -683,8 +870,14 @@ mod tests {
 
     use super::*;
 
+    /// A read-state store that is never saved: these tests exercise the state machine,
+    /// which by design never writes the file (ADR-0008).
+    fn store() -> ReadStore {
+        ReadStore::empty(std::path::PathBuf::from("unused-by-the-state-machine"))
+    }
+
     fn app() -> App {
-        App::new(&UiConfig::default())
+        App::new(&UiConfig::default(), store())
     }
 
     fn key(code: KeyCode) -> KeyEvent {
@@ -740,6 +933,199 @@ mod tests {
             skipped: 0,
         });
         app
+    }
+
+    /// An article event for `number`, as the worker would deliver it.
+    fn article_event(number: u64) -> Event {
+        let block =
+            nntp_proto::DataBlock::parse(b"From: a@b\r\nSubject: something\r\n\r\nbody\r\n.\r\n");
+        Event::Article(Box::new(
+            nntp_proto::Article::from_block(&block).with_number(number),
+        ))
+    }
+
+    #[test]
+    fn opening_an_article_marks_it_read() {
+        let mut app = app_with_articles();
+        assert!(app.is_unread(2));
+
+        app.on_event(article_event(2));
+
+        assert!(!app.is_unread(2), "the article the user just read is read");
+        assert!(app.is_unread(1), "and nothing else is");
+        assert!(app.read.is_dirty(), "so the run loop knows to save");
+    }
+
+    #[test]
+    fn marking_read_on_open_can_be_turned_off() {
+        let config = UiConfig {
+            mark_read_on_open: false,
+            ..UiConfig::default()
+        };
+        let mut app = App::new(&config, store());
+        app.on_event(Event::GroupOpened(Box::new(summary("misc.test", 1, 3, 3))));
+
+        app.on_event(article_event(2));
+
+        assert!(app.is_unread(2), "the user asked to decide this themselves");
+        assert!(!app.read.is_dirty(), "and nothing was recorded");
+    }
+
+    #[test]
+    fn an_article_arriving_with_no_group_selected_is_not_recorded_anywhere() {
+        // A fetch by message-id has no group. Guessing the current group would record
+        // read state against numbers that belong to a different group entirely.
+        let mut app = app();
+
+        app.on_event(article_event(2));
+
+        assert!(!app.read.is_dirty());
+        assert_eq!(app.read.group_count(), 0);
+    }
+
+    #[test]
+    fn the_unread_filter_hides_read_articles_and_keeps_the_cursor_where_it_was() {
+        let mut app = app_with_articles();
+        // Read the middle article, then put the cursor on the oldest.
+        app.read.mark_read("misc.test", 2);
+        app.article_cursor = 0;
+        assert_eq!(app.selected_article().map(|r| r.number), Some(1));
+
+        app.on_key(key(KeyCode::Char('u')));
+
+        assert!(app.unread_only);
+        assert_eq!(app.visible_articles(), vec![0, 2], "article 2 is hidden");
+        assert_eq!(
+            app.selected_article().map(|r| r.number),
+            Some(1),
+            "the article under the cursor stays under the cursor"
+        );
+
+        // And back again.
+        app.on_key(key(KeyCode::Char('u')));
+        assert!(!app.unread_only);
+        assert_eq!(app.visible_articles(), vec![0, 1, 2]);
+        assert_eq!(app.selected_article().map(|r| r.number), Some(1));
+    }
+
+    #[test]
+    fn the_cursor_survives_the_article_under_it_being_filtered_away() {
+        let mut app = app_with_articles();
+        app.article_cursor = 1;
+        app.on_key(key(KeyCode::Char('u')));
+
+        // Marking the article under the cursor read removes it from a filtered list.
+        app.on_key(key(KeyCode::Char('M')));
+
+        assert!(!app.is_unread(2));
+        let visible = app.visible_articles();
+        assert_eq!(visible.len(), 2);
+        assert!(
+            app.article_cursor < visible.len(),
+            "cursor {} is outside a list of {}",
+            app.article_cursor,
+            visible.len()
+        );
+    }
+
+    #[test]
+    fn everything_read_with_the_filter_on_shows_an_empty_list_rather_than_a_bad_cursor() {
+        let mut app = app_with_articles();
+        app.read.mark_range_read("misc.test", 1, 3);
+        app.on_key(key(KeyCode::Char('u')));
+
+        assert!(app.visible_articles().is_empty());
+        assert_eq!(app.selected_article(), None);
+        assert_eq!(app.article_cursor, 0);
+
+        // Moving around an empty list must not panic or produce a request.
+        assert!(app.on_key(key(KeyCode::Char('j'))).is_empty());
+        assert!(app.on_key(key(KeyCode::Char('G'))).is_empty());
+        assert!(app.on_key(key(KeyCode::Char('n'))).is_empty());
+        assert!(app.on_key(key(KeyCode::Enter)).is_empty());
+    }
+
+    #[test]
+    fn marking_toggles_both_ways() {
+        let mut app = app_with_articles();
+        app.article_cursor = 0;
+
+        app.on_key(key(KeyCode::Char('M')));
+        assert!(!app.is_unread(1));
+        assert!(app.status.contains("read"), "{}", app.status);
+
+        app.on_key(key(KeyCode::Char('M')));
+        assert!(app.is_unread(1));
+        assert!(app.status.contains("unread"), "{}", app.status);
+    }
+
+    #[test]
+    fn catching_up_uses_the_watermarks_not_the_listed_articles() {
+        // The article list holds the newest few hundred records; catching up has to mean
+        // the whole group, or the next visit will show hundreds of older articles as
+        // unread.
+        let mut app = app();
+        app.on_event(Event::GroupOpened(Box::new(summary(
+            "misc.test",
+            900,
+            1_000,
+            101,
+        ))));
+        app.on_event(Event::Overview {
+            group: GroupName::parse("misc.test").unwrap(),
+            records: vec![record(999, "one"), record(1_000, "two")],
+            skipped: 0,
+        });
+
+        app.on_key(key(KeyCode::Char('c')));
+
+        assert_eq!(app.read.read_set("misc.test").to_string(), "900-1000");
+        assert!(app.status.contains("caught up"), "{}", app.status);
+    }
+
+    #[test]
+    fn catching_up_with_no_group_selected_says_so_rather_than_doing_nothing() {
+        let mut app = app();
+        app.on_key(key(KeyCode::Char('c')));
+
+        assert_eq!(app.read.group_count(), 0);
+        assert!(app.status.contains("no group"), "{}", app.status);
+    }
+
+    #[test]
+    fn the_group_list_reports_unread_counts_from_the_read_state() {
+        let mut app = app();
+        app.read.mark_range_read("comp.lang.rust", 1, 7);
+        app.on_event(Event::Groups(some_groups()));
+
+        let groups = some_groups();
+        // comp.lang.rust spans 1..10 with 7 read.
+        assert_eq!(app.unread_in(&groups[0]), 3);
+        // comp.lang.c has nothing recorded, so all five numbers are unread.
+        assert_eq!(app.unread_in(&groups[1]), 5);
+        // An empty group has nothing to be unread, rather than a nonsense count.
+        assert_eq!(app.unread_in(&groups[3]), 0);
+    }
+
+    #[test]
+    fn selecting_a_group_forgets_read_state_for_expired_articles() {
+        let mut app = app();
+        app.read.mark_range_read("misc.test", 1, 1_000);
+
+        // The server now starts the group at 900: everything below that is gone.
+        app.on_event(Event::GroupOpened(Box::new(summary(
+            "misc.test",
+            900,
+            1_000,
+            101,
+        ))));
+
+        assert_eq!(app.read.read_set("misc.test").to_string(), "900-1000");
+        assert!(
+            app.status.contains("unread"),
+            "the status line should say what is left: {}",
+            app.status
+        );
     }
 
     #[test]

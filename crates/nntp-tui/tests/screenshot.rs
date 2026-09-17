@@ -17,10 +17,13 @@
     clippy::indexing_slicing
 )]
 
+use std::path::PathBuf;
+
 use nntp_proto::{
     Article, DataBlock, GroupName, OverviewFmt, OverviewRecord, PostingStatus, StatusLine,
 };
 use nntp_tui::config::UiConfig;
+use nntp_tui::readstate::ReadStore;
 use nntp_tui::tui::app::App;
 use nntp_tui::tui::protocol::{Event, GroupRow};
 use nntp_tui::tui::ui;
@@ -29,6 +32,11 @@ use ratatui::backend::TestBackend;
 
 /// The file the documentation includes.
 const SCREENSHOT: &str = "docs/reader-screen.txt";
+
+/// The README shows the same screen inside a fenced block, and a second copy is a second
+/// thing that can go stale — it did, the first time the reader's layout changed after the
+/// README was written. So the copy is checked too, and refreshed by the same command.
+const README: &str = "README.md";
 
 const WIDTH: u16 = 100;
 const HEIGHT: u16 = 22;
@@ -52,7 +60,10 @@ fn record(number: u64, subject: &str, from: &str, references: &str) -> OverviewR
 
 /// The state the screenshot shows: a group open, an article being read.
 fn representative_app() -> App {
-    let mut app = App::new(&UiConfig::default());
+    let mut app = App::new(
+        &UiConfig::default(),
+        ReadStore::empty(PathBuf::from("unused")),
+    );
 
     app.on_event(Event::Connected {
         server: "news.example.org:563".to_owned(),
@@ -134,13 +145,31 @@ fn render(app: &mut App) -> String {
         .join("\n")
 }
 
-fn screenshot_path() -> std::path::PathBuf {
+fn workspace_path(relative: &str) -> std::path::PathBuf {
     // CARGO_MANIFEST_DIR is crates/nntp-tui; the documentation lives at the workspace
     // root.
     std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("..")
         .join("..")
-        .join(SCREENSHOT)
+        .join(relative)
+}
+
+/// Replaces the first fenced block in the README whose first line looks like the top of
+/// the reader's group pane.
+fn splice_into_readme(readme: &str, screen: &str) -> Option<String> {
+    let fence = readme.find("```text\n\u{250c} Groups")?;
+    let body_start = fence + "```text\n".len();
+    let body_end = body_start + readme.get(body_start..)?.find("```")?;
+    let mut out = String::with_capacity(readme.len());
+    out.push_str(readme.get(..body_start)?);
+    out.push_str(screen);
+    out.push('\n');
+    out.push_str(readme.get(body_end..)?);
+    Some(out)
+}
+
+fn screenshot_path() -> std::path::PathBuf {
+    workspace_path(SCREENSHOT)
 }
 
 #[test]
@@ -170,6 +199,29 @@ fn the_documented_screen_matches_what_the_reader_draws() {
 }
 
 #[test]
+fn the_screen_in_the_readme_matches_it_too() {
+    let rendered = render(&mut representative_app());
+    let path = workspace_path(README);
+    let readme = std::fs::read_to_string(&path)
+        .unwrap_or_else(|error| panic!("cannot read {}: {error}", path.display()));
+
+    if std::env::var_os("UPDATE_SCREENSHOT").is_some() {
+        let updated = splice_into_readme(&readme, &rendered)
+            .unwrap_or_else(|| panic!("no reader screen found in {}", path.display()));
+        std::fs::write(&path, updated).expect("write the README");
+        return;
+    }
+
+    assert!(
+        readme.replace("\r\n", "\n").contains(&rendered),
+        "\nthe screen in {README} is not what the reader draws.\n\
+         Refresh it with:\n\
+         \n    UPDATE_SCREENSHOT=1 cargo test -p nntp-tui --test screenshot\n\
+         \nExpected to find:\n{rendered}"
+    );
+}
+
+#[test]
 fn the_representative_screen_shows_what_it_claims_to() {
     // Guards against a screenshot that is technically up to date and shows nothing
     // useful, which would make the test above pass while the documentation misleads.
@@ -182,6 +234,9 @@ fn the_representative_screen_shows_what_it_claims_to() {
         "news.example.org:563",
         "TLS",
         "≤",
+        // The unread mark: a screenshot that does not show it would be documenting the
+        // v0.1.0 reader.
+        "\u{2022}",
         "q: quit",
     ] {
         assert!(

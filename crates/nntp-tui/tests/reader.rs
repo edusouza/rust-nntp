@@ -14,12 +14,14 @@
     clippy::indexing_slicing
 )]
 
+use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::time::{Duration, Instant};
 
 use nntp_testserver::{CapabilityProfile, Corpus, Quirks, ServerConfig, TestServer};
 use nntp_tui::cli::ServerArgs;
 use nntp_tui::config::{Config, SecurityConfig};
+use nntp_tui::readstate::ReadStore;
 use nntp_tui::session::{self, Target};
 use nntp_tui::tui::app::{App, Overlay, Pane};
 use nntp_tui::tui::protocol::{Event, Request};
@@ -39,13 +41,17 @@ struct Harness {
 
 impl Harness {
     fn new(server: TestServer) -> Self {
+        Self::with_read_state(server, ReadStore::empty(PathBuf::from("unused")))
+    }
+
+    fn with_read_state(server: TestServer, read: ReadStore) -> Self {
         let target = target_for(&server);
         let (request_tx, request_rx) = mpsc::channel();
         let (event_tx, event_rx) = mpsc::channel();
 
         worker::spawn(target, 500, request_rx, event_tx).expect("spawn the worker");
 
-        let mut app = App::new(&Config::default().ui);
+        let mut app = App::new(&Config::default().ui, read);
         let initial = app.initial_requests();
         for request in initial {
             request_tx.send(request).expect("send");
@@ -171,6 +177,78 @@ fn opens_a_group_and_then_an_article() {
     // The Date header is unparseable, so the raw text is shown rather than nothing.
     assert_eq!(view.date, "yesterday afternoon");
     assert_eq!(harness.app.focus, Pane::Body);
+}
+
+#[test]
+fn read_state_survives_a_restart() {
+    // The acceptance criterion of #7, end to end: read an article through a real socket,
+    // save, start a second reader against the same server, and find the article still
+    // read and the unread count one lower.
+    let directory = std::env::temp_dir().join(format!("nntp-tui-reader-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&directory);
+    let path = directory.join("127.0.0.1.newsrc");
+
+    let mut harness =
+        Harness::with_read_state(serve(ServerConfig::new()), ReadStore::empty(path.clone()));
+    harness.settle("the group list", |app| !app.groups.is_empty());
+
+    harness.press(KeyCode::Char('/'));
+    harness.type_text("misc.test");
+    harness.press(KeyCode::Enter);
+    harness.press(KeyCode::Enter);
+    harness.settle("the article list", |app| !app.articles.is_empty());
+
+    let unread_before = harness
+        .app
+        .articles
+        .iter()
+        .filter(|record| harness.app.is_unread(record.number))
+        .count();
+    assert_eq!(unread_before, 3, "nothing has been read yet");
+
+    harness.press(KeyCode::Enter);
+    harness.settle("the article", |app| app.article.is_some());
+    let number = harness
+        .app
+        .article
+        .as_ref()
+        .and_then(|view| view.number)
+        .expect("the article has a number");
+    assert!(!harness.app.is_unread(number), "reading it marked it read");
+
+    // What the run loop does on the way out.
+    harness.app.read.save_if_dirty().expect("save read state");
+    assert!(path.exists(), "the store was written to {}", path.display());
+
+    // A second reader, as if the program had been restarted.
+    let (restored, problems) = ReadStore::load(path.clone());
+    assert!(problems.is_empty(), "{problems:?}");
+
+    let mut second = Harness::with_read_state(serve(ServerConfig::new()), restored);
+    second.settle("the group list", |app| !app.groups.is_empty());
+    second.press(KeyCode::Char('/'));
+    second.type_text("misc.test");
+    second.press(KeyCode::Enter);
+    second.press(KeyCode::Enter);
+    second.settle("the article list", |app| !app.articles.is_empty());
+
+    assert!(
+        !second.app.is_unread(number),
+        "article {number} should still be read after a restart"
+    );
+    let unread_after = second
+        .app
+        .articles
+        .iter()
+        .filter(|record| second.app.is_unread(record.number))
+        .count();
+    assert_eq!(unread_after, unread_before - 1);
+
+    // And the unread filter now has something to hide.
+    second.press(KeyCode::Char('u'));
+    assert_eq!(second.app.visible_articles().len(), unread_after);
+
+    let _ = std::fs::remove_dir_all(&directory);
 }
 
 #[test]
@@ -426,7 +504,10 @@ fn credentials_from_the_configuration_are_used() {
     let (event_tx, event_rx) = mpsc::channel();
     worker::spawn(target, 500, request_rx, event_tx).expect("spawn");
 
-    let mut app = App::new(&Config::default().ui);
+    let mut app = App::new(
+        &Config::default().ui,
+        ReadStore::empty(PathBuf::from("unused")),
+    );
     for request in app.initial_requests() {
         request_tx.send(request).expect("send");
     }

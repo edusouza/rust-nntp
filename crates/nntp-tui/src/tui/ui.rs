@@ -102,13 +102,27 @@ fn draw_groups(frame: &mut Frame<'_>, app: &App, area: Rect) {
         .iter()
         .filter_map(|index| app.groups.get(*index))
         .map(|group| {
+            // The number here is *unread*, not the total: it is what a reader opens the
+            // list to find out, and this pane is two dozen columns wide, so showing both
+            // meant showing neither — the first attempt rendered "≤18342 unre". The
+            // total is in the status bar the moment the group is opened. "≤" because the
+            // watermarks bound the count rather than stating it, as everywhere else.
+            let unread = app.unread_in(group);
             let count = if group.is_empty() {
                 Span::from("  empty").dim()
+            } else if unread == 0 {
+                Span::from("  read").dim()
             } else {
-                // "≤" because the watermarks bound the count rather than stating it.
-                Span::from(format!("  \u{2264}{}", group.article_bound())).dim()
+                Span::from(format!("  \u{2264}{unread}")).dim()
             };
-            ListItem::new(Line::from(vec![Span::from(group.name.to_string()), count]))
+            // Bold marks a group with something in it, so the shape of the list answers
+            // "where is there anything new" without reading any numbers.
+            let name = if unread > 0 {
+                Span::from(group.name.to_string()).bold()
+            } else {
+                Span::from(group.name.to_string())
+            };
+            ListItem::new(Line::from(vec![name, count]))
         })
         .collect();
 
@@ -125,14 +139,28 @@ fn draw_groups(frame: &mut Frame<'_>, app: &App, area: Rect) {
 }
 
 fn draw_articles(frame: &mut Frame<'_>, app: &App, area: Rect) {
-    let subtitle = app
-        .group
-        .as_ref()
-        .map(|summary| format!("{} ({})", summary.name, app.articles.len()));
+    let subtitle = app.group.as_ref().map(|summary| {
+        if app.unread_only {
+            // "shown/total" rather than "n unread of m", and no trailing word: this
+            // pane is a third of the screen, and both longer forms were clipped
+            // mid-word by the block title. The placeholder below says what the numbers
+            // mean when the list is empty, and the help overlay says it always.
+            format!(
+                "{} ({}/{})",
+                summary.name,
+                app.visible_articles().len(),
+                app.articles.len()
+            )
+        } else {
+            format!("{} ({})", summary.name, app.articles.len())
+        }
+    });
 
-    let items: Vec<ListItem<'_>> = app
-        .articles
+    let visible = app.visible_articles();
+
+    let items: Vec<ListItem<'_>> = visible
         .iter()
+        .filter_map(|index| app.articles.get(*index))
         .map(|record| {
             let subject = if record.subject.is_empty() {
                 "(no subject)".to_owned()
@@ -142,25 +170,41 @@ fn draw_articles(frame: &mut Frame<'_>, app: &App, area: Rect) {
             // A reply is marked rather than indented: real threads arrive out of order
             // and with missing parents, so an indent would be a lie until v0.2 builds
             // the tree properly.
-            let marker = if record.is_reply() { "› " } else { "  " };
+            let reply = if record.is_reply() { "› " } else { "  " };
+
+            // Unread is marked, read is not. The other way round would put a mark on
+            // almost every line in a group you follow, which is no mark at all.
+            let unread = app.is_unread(record.number);
+            let mark = if unread { "•" } else { " " };
+            let subject = if unread {
+                Span::from(subject).bold()
+            } else {
+                Span::from(subject).dim()
+            };
 
             ListItem::new(Line::from(vec![
-                Span::from(marker).dim(),
-                Span::from(subject),
+                Span::from(mark).fg(ACCENT),
+                Span::from(reply).dim(),
+                subject,
             ]))
         })
         .collect();
 
     let mut state = ListState::default();
-    if !app.articles.is_empty() {
-        state.select(Some(app.article_cursor.min(app.articles.len() - 1)));
+    if !visible.is_empty() {
+        state.select(Some(app.article_cursor.min(visible.len() - 1)));
     }
 
-    let placeholder = if app.articles.is_empty() {
-        Some(if app.group.is_some() {
-            "no articles"
-        } else {
+    let placeholder = if visible.is_empty() {
+        Some(if app.group.is_none() {
             "select a group and press Enter"
+        } else if app.unread_only && !app.articles.is_empty() {
+            // Distinguishing the two matters: "nothing unread" is a finished group and
+            // "no articles" is an empty one, and telling a reader the wrong one of those
+            // sends them looking for a bug.
+            "nothing unread — u: show all"
+        } else {
+            "no articles"
         })
     } else {
         None
@@ -344,7 +388,7 @@ fn draw_overlay(frame: &mut Frame<'_>, title: &str, text: Text<'static>, area: R
 }
 
 fn help_text() -> Text<'static> {
-    const ROWS: [(&str, &str); 14] = [
+    const ROWS: [(&str, &str); 17] = [
         ("Tab / Shift-Tab", "next / previous pane"),
         ("h l  ← →", "move focus left / right"),
         ("j k  ↓ ↑", "move down / up"),
@@ -353,6 +397,9 @@ fn help_text() -> Text<'static> {
         ("g / G", "first / last"),
         ("Enter", "open the group or article under the cursor"),
         ("n / p", "next / previous article, opening it"),
+        ("u", "show only unread articles, or everything"),
+        ("M", "mark the article under the cursor read / unread"),
+        ("c", "catch up: mark the whole group read"),
         ("/", "filter groups by name or description"),
         ("Esc", "clear the filter, or close an overlay"),
         ("r", "reload the focused pane"),
@@ -370,8 +417,14 @@ fn help_text() -> Text<'static> {
     }
     lines.push(Line::default());
     lines.push(Line::from(
-        Span::from("  Article counts are shown as ≤n: LIST ACTIVE reports watermarks, and expiry leaves gaps.")
+        Span::from("  The number beside a group is how many articles are unread; \u{2022} marks an unread article.")
             .dim(),
+    ));
+    lines.push(Line::from(
+        Span::from(
+            "  Counts are shown as ≤n: LIST ACTIVE reports watermarks, and expiry leaves gaps.",
+        )
+        .dim(),
     ));
 
     Text::from(lines)
@@ -392,7 +445,11 @@ fn messages_text(app: &App) -> Text<'static> {
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
+
     use ratatui::Terminal;
+
+    use crate::readstate::ReadStore;
     use ratatui::backend::TestBackend;
 
     use super::*;
@@ -418,7 +475,24 @@ mod tests {
     }
 
     fn app() -> App {
-        App::new(&UiConfig::default())
+        App::new(
+            &UiConfig::default(),
+            ReadStore::empty(PathBuf::from("unused")),
+        )
+    }
+
+    fn group_summary(name: &str, low: u64, high: u64) -> nntp_proto::GroupSummary {
+        let line = nntp_proto::StatusLine::parse(
+            format!("211 {} {low} {high} {name}", high - low + 1).as_bytes(),
+        )
+        .unwrap();
+        nntp_proto::GroupSummary::parse(&line, None).unwrap()
+    }
+
+    fn overview_record(number: u64, subject: &str) -> nntp_proto::OverviewRecord {
+        let line = format!("{number}\t{subject}\ta@x\t\t<{number}@x>\t\t10\t1");
+        nntp_proto::OverviewRecord::parse(line.as_bytes(), &nntp_proto::OverviewFmt::standard())
+            .unwrap()
     }
 
     fn group_row(name: &str, low: u64, high: u64) -> GroupRow {
@@ -473,7 +547,7 @@ mod tests {
     }
 
     #[test]
-    fn lists_groups_with_a_bounded_count() {
+    fn lists_groups_with_a_bounded_unread_count() {
         let mut app = app();
         app.on_event(Event::Groups(vec![
             group_row("comp.lang.rust", 1, 10),
@@ -482,9 +556,72 @@ mod tests {
 
         let screen = render(&mut app, 100, 20);
         assert!(screen.contains("comp.lang.rust"), "{screen}");
+        // Nothing has been read, so all ten numbers are unread.
         assert!(screen.contains("≤10"), "{screen}");
         // An empty group says so rather than claiming zero articles.
         assert!(screen.contains("empty"), "{screen}");
+    }
+
+    #[test]
+    fn a_group_with_nothing_left_says_read_rather_than_zero() {
+        let mut app = app();
+        app.read.mark_range_read("comp.lang.rust", 1, 10);
+        app.on_event(Event::Groups(vec![group_row("comp.lang.rust", 1, 10)]));
+
+        let screen = render(&mut app, 100, 20);
+        assert!(screen.contains("read"), "{screen}");
+        // "≤0" would be technically true and useless.
+        assert!(!screen.contains("≤0"), "{screen}");
+    }
+
+    #[test]
+    fn unread_articles_are_marked_and_read_ones_are_not() {
+        let mut app = app();
+        app.on_event(Event::GroupOpened(Box::new(group_summary(
+            "misc.test",
+            1,
+            3,
+        ))));
+        app.read.mark_read("misc.test", 2);
+        app.on_event(Event::Overview {
+            group: nntp_proto::GroupName::parse("misc.test").unwrap(),
+            records: vec![
+                overview_record(1, "unread one"),
+                overview_record(2, "already read"),
+                overview_record(3, "unread two"),
+            ],
+            skipped: 0,
+        });
+
+        let screen = render(&mut app, 100, 20);
+        assert!(screen.contains("•  unread one"), "{screen}");
+        assert!(screen.contains("•  unread two"), "{screen}");
+        // The read one is on screen, without a mark.
+        assert!(screen.contains("already read"), "{screen}");
+        assert!(!screen.contains("•  already read"), "{screen}");
+    }
+
+    #[test]
+    fn a_finished_group_under_the_unread_filter_says_so() {
+        let mut app = app();
+        app.on_event(Event::GroupOpened(Box::new(group_summary(
+            "misc.test",
+            1,
+            2,
+        ))));
+        app.on_event(Event::Overview {
+            group: nntp_proto::GroupName::parse("misc.test").unwrap(),
+            records: vec![overview_record(1, "one"), overview_record(2, "two")],
+            skipped: 0,
+        });
+        app.read.mark_range_read("misc.test", 1, 2);
+        app.unread_only = true;
+
+        let screen = render(&mut app, 100, 20);
+        // "no articles" here would send the reader looking for a bug in a group that is
+        // simply finished.
+        assert!(screen.contains("nothing unread"), "{screen}");
+        assert!(screen.contains("(0/2)"), "{screen}");
     }
 
     #[test]

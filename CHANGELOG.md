@@ -7,7 +7,57 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-Nothing yet. `v0.1.0` is the current release; [#3] is the roadmap for what comes next.
+### Added
+
+- **Read and unread state, remembered between runs** ([#7] — the largest functional gap in
+  v0.1.0). Stored in the `.newsrc` format, one file per server under the platform data
+  directory, because article numbers are the server's own and the same group on two
+  servers has two unrelated numberings.
+
+  The format is the one `slrn`, `tin` and `nn` have used since the 1980s
+  (`comp.lang.c: 1-4237,4240,4242-4250`), so a reading history can be copied between
+  readers; the `:` / `!` subscription flag is kept and written back even though this
+  reader has no subscription list yet. [ADR-0009](docs/adr/0009-newsrc-file-for-read-state.md)
+  records why this is a text file rather than the SQLite table
+  [ADR-0005](docs/adr/0005-config-and-state-storage.md) had planned.
+
+  In the reader: the number beside a group is now how many articles are **unread**, a
+  group with something new has its name in bold, `•` marks an unread article, `u` shows
+  only unread articles, `M` marks one read or unread, and `c` catches up on a whole group
+  from its watermarks. Opening an article marks it read unless `mark_read_on_open = false`
+  is set under `[ui]`; `unread_only = true` opens with the filter already on.
+
+  Nothing about read state can stop the reader from starting: a missing file is a first
+  run, and an unreadable, oversized or partly garbled one gives back whatever could be
+  recovered, with the rest reported in the message pane and the log. Saving is atomic —
+  a temporary file renamed over the old one — so a crash leaves either the old state or
+  the new, never half a file.
+
+  Checked by hand against INN 2.8.0, including the part no test can check: a deliberately
+  corrupted store, where the reader opened, reported the fault, and kept the readable
+  groups. Recorded in
+  [`docs/protocol-coverage.md`](docs/protocol-coverage.md#read-state-checked-by-hand).
+
+### Changed
+
+- `nntp-tui config path` now prints the read-state file as well as the configuration and
+  the log, named after the configured server. A path nothing prints is a path nobody can
+  find, and this one is meant to be inspected, hand-edited and copied from another
+  newsreader.
+- `base64` 0.22 → 0.23, with `default-features = false`. 0.23 turns on a `simd-unsafe`
+  feature by default; this crate decodes base64 that arrives from a remote peer, the
+  decoder is not a bottleneck for article-sized input, and the scalar engine's API is
+  identical — so the SIMD engines are declined for now rather than inherited silently. The
+  lenient decoder still tolerates the missing padding and trailing bits that real RFC 2047
+  encoded words carry, which was the acceptance criterion.
+- `toml` 0.9 → 1.1 and `actions/checkout` v5 → v7. Neither needed a code change; the
+  `checkout` major is a security default about `pull_request_target` and `workflow_run`,
+  which this workflow does not use. Closes [#17].
+
+  The real-server suite was re-run after both bumps and is unchanged: 45 102 descriptions
+  and 26 188 groups with zero unparseable lines, and zero undecoded subjects across 44 real
+  overview records. That is the check that matters for a `base64` major, because 1 907 of
+  those descriptions are non-ASCII.
 
 ## [0.1.0] — 2026-09-17
 
@@ -220,3 +270,4 @@ records what was checked, against which server, on what date ([#4]).
 [#4]: https://github.com/edusouza/rust-nntp/issues/4
 [#7]: https://github.com/edusouza/rust-nntp/issues/7
 [#9]: https://github.com/edusouza/rust-nntp/issues/9
+[#17]: https://github.com/edusouza/rust-nntp/issues/17

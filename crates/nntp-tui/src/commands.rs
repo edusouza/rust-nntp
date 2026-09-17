@@ -8,6 +8,7 @@ use nntp_proto::{ArticleSpec, GroupName, MessageId, Range, Wildmat};
 
 use crate::cli::{ArticlePart, ConfigAction, ServerArgs};
 use crate::config::Config;
+use crate::readstate::ReadStore;
 use crate::session;
 
 /// Probes a server and reports what it supports.
@@ -489,6 +490,25 @@ pub fn config(
             match crate::logging::default_log_path() {
                 Ok(log) => writeln!(out, "log file:      {}", log.display())?,
                 Err(error) => writeln!(out, "log file:      unavailable — {error}")?,
+            }
+
+            // Read state is per server, so the path depends on which one is in play.
+            // Printing it for the server that would be used is more useful than printing
+            // the directory and leaving the reader to work out the file name themselves.
+            let config = Config::load(Some(&path)).unwrap_or_default();
+            let server = config
+                .server(None)
+                .map(|(_, server)| server.host.clone())
+                .unwrap_or_default();
+            match ReadStore::default_path(&server) {
+                Ok(newsrc) if server.is_empty() => writeln!(
+                    out,
+                    "read state:    {} (no server configured; the name comes from the \
+                     server in use)",
+                    newsrc.parent().unwrap_or(&newsrc).display()
+                )?,
+                Ok(newsrc) => writeln!(out, "read state:    {}", newsrc.display())?,
+                Err(error) => writeln!(out, "read state:    unavailable — {error}")?,
             }
         }
         ConfigAction::Show => {

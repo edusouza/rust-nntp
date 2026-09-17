@@ -15,6 +15,7 @@ to be wrong gets a new ADR that supersedes the old one, and the old one is marke
 | [0006](0006-commit-cargo-lock.md) | Commit `Cargo.lock` | Accepted |
 | [0007](0007-rustls-for-tls.md) | Use rustls with webpki-roots for TLS | Accepted |
 | [0008](0008-ui-state-machine-separate-from-rendering.md) | Keep the interface state machine separate from rendering | Accepted |
+| [0009](0009-newsrc-file-for-read-state.md) | Store read state in a `.newsrc`-format file, one per server | Accepted |
 
 ## Template
 

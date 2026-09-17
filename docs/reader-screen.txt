@@ -1,6 +1,6 @@
 ┌ Groups — 5 ────────────┐┌ Articles — comp.lang.rust (2) ─┐┏ Article — 1–6 of 6 ━━━━━━━━━━━━━━━━━━┓
-│comp.lang.c  ≤18342     ││  café and crates               │┃From: Åsa Lindqvist <asa@example.se>  ┃
-│comp.lang.rust  ≤6      ││› Re: café and crates           │┃Newsgroups: comp.lang.rust            ┃
+│comp.lang.c  ≤18342     ││•  café and crates              │┃From: Åsa Lindqvist <asa@example.se>  ┃
+│comp.lang.rust  ≤5      ││ › Re: café and crates          │┃Newsgroups: comp.lang.rust            ┃
 │de.comp.test  ≤97       ││                                │┃Subject: Re: café and crates          ┃
 │misc.test  ≤3           ││                                │┃Date: Wed, 17 Sep 2026 10:11:12 +0200 ┃
 │news.announce.newgroups ││                                │┃References: <4237@example.org>        ┃

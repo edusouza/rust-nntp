@@ -105,6 +105,17 @@ Notes worth reading once:
   certificate verification; see
   [ADR-0007](adr/0007-rustls-for-tls.md) for why.
 
+The `[ui]` table holds the reader's preferences, all optional:
+
+```toml
+[ui]
+mark_read_on_open = true      # opening an article marks it read
+unread_only = false           # start with the unread filter on
+initial_articles = 300        # how many of a group's newest articles to load
+overview_chunk = 500          # overview records per round trip
+date_format = "%Y-%m-%d %H:%M"
+```
+
 Command-line flags override the configured server field by field, so this uses the
 credentials from `es` against a server on your own machine:
 
@@ -186,6 +197,9 @@ while something is outstanding.
 | `g` / `G` | first / last |
 | `Enter` | open the group or article under the cursor |
 | `n` / `p` | next / previous article, opening it |
+| `u` | show only unread articles, or everything again |
+| `M` | mark the article under the cursor read, or unread if it was read |
+| `c` | catch up: mark the whole group read |
 | `/` | filter groups by name or description |
 | `Esc` | clear the filter, or close an overlay |
 | `r` | reload the focused pane |
@@ -199,8 +213,15 @@ keys.
 
 ### What the display tells you
 
-- **`≤n` next to a group** is an upper bound, not a count. `LIST ACTIVE` reports only the
-  watermarks, and expiry and cancellation leave gaps.
+- **`≤n` next to a group** is how many articles are **unread**, and an upper bound rather
+  than a count: `LIST ACTIVE` reports only the watermarks, and expiry and cancellation
+  leave gaps that nothing short of asking the server can tell apart from articles nobody
+  has read. A group with nothing left says `read`; the total is in the status bar the
+  moment you open the group. A group with something unread has its name in bold, so the
+  shape of the list answers "where is there anything new" without reading any numbers.
+- **`•` before a subject** marks an unread article, and its subject is bold. Read articles
+  are dimmed and unmarked — the other way round would put a mark on nearly every line of
+  a group you follow, which is no mark at all.
 - **`›` before a subject** marks a follow-up. Replies are marked rather than indented:
   real threads arrive out of order and with missing parents, so an indent would be a lie
   until threading lands in v0.2.
@@ -211,9 +232,41 @@ keys.
 - **An error takes over the status bar** until the next keystroke; `m` shows the ones that
   have scrolled past.
 
+### Read and unread
+
+What you have read is remembered between runs, in the `.newsrc` format every newsreader
+since the 1980s has used:
+
+```text
+comp.lang.c: 1-4237,4240,4242-4250
+misc.test! 1-100
+```
+
+- **One file per server**, under the platform data directory —
+  `~/.local/share/nntp-tui/newsrc/news.example.org.newsrc` on Linux. Per server because
+  article numbers are assigned by the server: the same group on two servers has two
+  unrelated numberings, and one shared file would mark articles read on one server
+  because their numbers happened to be read on another.
+- **Interoperable on purpose.** `slrn`, `tin` and `nn` read and write the same format, so
+  the file can be copied between readers. The `:` / `!` subscription flag is kept and
+  written back even though this reader has no subscription list yet, because dropping a
+  field another reader wrote would make that claim false.
+- **Opening an article marks it read**, unless you set `mark_read_on_open = false` under
+  `[ui]`, which leaves `M` as the only way an article becomes read. `unread_only = true`
+  opens the reader with the unread filter already on; `u` toggles it either way.
+- **Nothing here can stop the reader from starting.** A missing file is a first run, and
+  a file that is unreadable, larger than 8 MiB, or partly garbled gives you whatever could
+  be recovered — with the rest reported in `m` and in the log. Read state is a
+  convenience, not something you typed. See
+  [ADR-0009](adr/0009-newsrc-file-for-read-state.md).
+- **Saving is atomic** — a temporary file renamed over the old one — so a crash or a full
+  disk leaves either the old state or the new, never half a file. It is written when the
+  reader exits.
+
+Two instances of the reader against the same server will have the last one to exit win.
+
 ### What it does not do yet
 
-Posting, persistent read/unread state, threading and a disk cache are all v0.2 or later;
-see the [roadmap](https://github.com/edusouza/rust-nntp/issues/3). Read state is kept for
-the session only, so closing the reader forgets what you have read — the single most
-important gap, and the first thing in the v0.2 scope.
+Posting, threading, MIME multipart and a disk cache are all v0.2 or later; see the
+[roadmap](https://github.com/edusouza/rust-nntp/issues/3). There is no subscription list
+yet, so the group list shows everything the server carries.
