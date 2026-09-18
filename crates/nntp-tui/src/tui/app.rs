@@ -321,6 +321,12 @@ pub struct App {
     /// IO and belongs to the run loop, which is the only part that owns the terminal
     /// (ADR-0008). Taken with [`Self::take_compose`].
     pub compose: Option<ComposeRequest>,
+    /// The groups the article being posted is addressed to.
+    ///
+    /// Kept so that the list can be refreshed when it lands in the group on screen: the
+    /// article list is a snapshot of the last fetch, so without this the article a person
+    /// has just written is the one article missing from it.
+    posting_groups: Vec<String>,
     /// The draft file behind the article currently being posted.
     ///
     /// Held until the server accepts it. Anything else — a rejection, a dropped
@@ -397,6 +403,7 @@ impl App {
             messages: VecDeque::new(),
             compose: None,
             posting: None,
+            posting_groups: Vec::new(),
             from: None,
             inflight: 0,
             cancel: Cancel::new(),
@@ -611,8 +618,12 @@ impl App {
         self.dirty = true;
     }
 
-    /// Applies an event from the worker.
-    pub fn on_event(&mut self, event: Event) {
+    /// Applies an event from the worker, returning any requests it produced.
+    ///
+    /// Almost every event produces none: the interface asks, the worker answers. The
+    /// exception is posting, where the answer changes the group on screen and the reader
+    /// has to go and look again — see [`Event::Posted`].
+    pub fn on_event(&mut self, event: Event) -> Vec<Request> {
         self.dirty = true;
 
         match event {
@@ -662,7 +673,7 @@ impl App {
                 // replaced it says so once, when its own completion arrives, and one note
                 // per chunk would bury everything else in the message pane.
                 if !self.accepts_overview(&group, token) {
-                    return;
+                    return Vec::new();
                 }
 
                 self.overview_skipped += skipped;
@@ -686,7 +697,7 @@ impl App {
 
                 if !self.accepts_overview(&group, token) {
                     self.note(format!("discarded a late overview reply for {group}"));
-                    return;
+                    return Vec::new();
                 }
 
                 if self.overview_skipped > 0 {
@@ -734,14 +745,21 @@ impl App {
 
             Event::Posted { text } => {
                 self.inflight = self.inflight.saturating_sub(1);
-                // The draft file goes only now, and the run loop is what removes it: the
-                // article exists somewhere other than this machine, so the copy here is
-                // the one thing nobody needs any more.
+                // The draft file goes only now: the article exists somewhere other than
+                // this machine, so the copy here is the one thing nobody needs any more.
                 if let Some(path) = self.posting.take() {
                     crate::compose::discard(&path);
                 }
                 self.status = format!("posted: {text}");
                 self.note(format!("posted: {text}"));
+
+                let groups = std::mem::take(&mut self.posting_groups);
+                // The article list is a snapshot of the last fetch, so the article just
+                // written is the one article missing from it. Refetching is the difference
+                // between "it says it posted" and seeing it in the group.
+                if let Some(requests) = self.refresh_after_posting(&groups) {
+                    return requests;
+                }
             }
 
             Event::Progress(message) => self.status = message,
@@ -781,6 +799,35 @@ impl App {
                 self.note("the worker stopped");
             }
         }
+
+        Vec::new()
+    }
+
+    /// Refetches the group on screen when an article has just been posted to it.
+    ///
+    /// `None` when the article went somewhere else — a crosspost to groups the reader is
+    /// not looking at changes nothing on screen, and refetching would be a round trip
+    /// nobody asked for.
+    fn refresh_after_posting(&mut self, groups: &[String]) -> Option<Vec<Request>> {
+        let group = self.group.as_ref()?.name.clone();
+        let name = group.to_string();
+        if !groups.contains(&name) {
+            return None;
+        }
+
+        self.status = format!("posted; reloading {name}…");
+        self.inflight += 1;
+        let token = self.begin_overview_fetch();
+
+        // `OpenGroup` rather than a range: the article just posted is *past* the high
+        // watermark this reader knows about, so a range built from what is on screen
+        // cannot include it. Selecting the group again is what asks the server for the
+        // watermarks it has now.
+        Some(vec![Request::OpenGroup {
+            group,
+            count: self.initial_articles,
+            token,
+        }])
     }
 
     /// Applies a key press, returning any requests it produced.
@@ -1216,6 +1263,11 @@ impl App {
         }
 
         self.posting = Some(path);
+        self.posting_groups = draft
+            .newsgroups()
+            .into_iter()
+            .map(ToOwned::to_owned)
+            .collect();
         self.status = format!("posting to {}…", draft.newsgroups().join(", "));
         self.inflight += 1;
 

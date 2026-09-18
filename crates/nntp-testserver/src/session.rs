@@ -4,9 +4,10 @@
 //! be tested over in-memory buffers, the same trick the client uses.
 
 use std::io::{BufRead, BufReader, Read, Write};
+use std::sync::{RwLock, RwLockReadGuard};
 
 use crate::config::{CapabilityProfile, GreetingMode, ServerConfig};
-use crate::corpus::{Corpus, Group};
+use crate::corpus::{Article, Corpus, Group};
 
 /// Whether the session continues after a command.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -100,7 +101,7 @@ struct State {
 /// A single client session.
 #[derive(Debug)]
 pub struct Session<'a> {
-    corpus: &'a Corpus,
+    corpus: &'a RwLock<Corpus>,
     config: &'a ServerConfig,
     state: State,
     postbox: Option<Postbox>,
@@ -108,7 +109,12 @@ pub struct Session<'a> {
 
 impl<'a> Session<'a> {
     /// Starts a session.
-    pub fn new(corpus: &'a Corpus, config: &'a ServerConfig) -> Self {
+    ///
+    /// The corpus is behind a lock because a client can add to it: an article accepted by
+    /// `POST` is filed into the group it names, so it comes back from `GROUP`, `OVER` and
+    /// `ARTICLE` like any other. A fake server that takes an article and then denies all
+    /// knowledge of it cannot be used to check that posting works.
+    pub fn new(corpus: &'a RwLock<Corpus>, config: &'a ServerConfig) -> Self {
         Self {
             corpus,
             config,
@@ -396,9 +402,53 @@ impl<'a> Session<'a> {
             }
         }
 
-        let message_id = article
-            .header("Message-ID")
-            .unwrap_or_else(|| format!("<{}@test.invalid>", self.state.commands_served));
+        let message_id = article.header("Message-ID").unwrap_or_else(|| {
+            // A server assigns one when the poster did not, which is the usual case: a
+            // reader that generated its own would have to guarantee it is unique on a
+            // network it cannot see.
+            format!(
+                "<{}.{}@test.invalid>",
+                self.state.commands_served,
+                std::process::id()
+            )
+        });
+
+        // Filed into the groups it names, so it comes back from `GROUP`, `OVER` and
+        // `ARTICLE` like any other article. Without this the server takes an article,
+        // answers `240`, and then denies all knowledge of it — which is exactly what
+        // somebody testing the posting path is trying to check, and it is not what a
+        // server does.
+        let filed = {
+            let stored = Article {
+                message_id: message_id.clone(),
+                head: article
+                    .lines
+                    .iter()
+                    .take_while(|line| !line.is_empty())
+                    .cloned()
+                    .collect(),
+                body: article
+                    .lines
+                    .iter()
+                    .skip_while(|line| !line.is_empty())
+                    .skip(1)
+                    .cloned()
+                    .collect(),
+            };
+            let groups = newsgroups_of(&article);
+            let mut corpus = self
+                .corpus
+                .write()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            corpus.inject(&groups, &stored)
+        };
+
+        if filed.is_empty() {
+            // Every group it named is one this server does not carry. A real server
+            // refuses rather than accepting an article it has nowhere to put.
+            self.status(output, 441, "no such newsgroup here")?;
+            return Ok(Flow::Continue);
+        }
 
         if let Some(postbox) = &self.postbox {
             // A poisoned mutex means another session thread panicked; the article is
@@ -541,7 +591,25 @@ impl<'a> Session<'a> {
         let Some(name) = args.first() else {
             return self.status(output, 501, "GROUP needs a newsgroup name");
         };
-        let Some(group) = self.corpus.find(name) else {
+        // Everything wanted from the corpus is taken out here and the lock released before
+        // a byte is written: holding a read guard across the write would stall a POST from
+        // another session for as long as the output takes, which with `--line-delay` is
+        // measured in seconds.
+        let found = {
+            let corpus = self.corpus();
+            corpus.find(name).map(|group| {
+                let (low, high) = group.watermarks();
+                (
+                    low,
+                    high,
+                    group.articles.len(),
+                    group.name.clone(),
+                    group.low(),
+                )
+            })
+        };
+
+        let Some((low, high, count, name, first)) = found else {
             // INN 2.8.0's exact wording, chosen deliberately: it carries no group name.
             // The previous message here began with the group name, which happened to match
             // what the client's parser assumed a 411 looked like -- so the fake server was
@@ -549,11 +617,6 @@ impl<'a> Session<'a> {
             // not be more convenient than the real one.
             return self.status(output, 411, "No such newsgroup");
         };
-
-        let (low, high) = group.watermarks();
-        let count = group.articles.len();
-        let name = group.name.clone();
-        let first = group.low();
 
         self.state.current_group = Some(name.clone());
         self.state.current_article = first;
@@ -569,17 +632,22 @@ impl<'a> Session<'a> {
             },
         };
 
-        let Some(group) = self.corpus.find(&name) else {
-            return self.status(output, 411, "No such newsgroup");
+        let found = {
+            let corpus = self.corpus();
+            corpus.find(&name).map(|group| {
+                let (low, high) = group.watermarks();
+                let numbers: Vec<Vec<u8>> = group
+                    .articles
+                    .keys()
+                    .map(|number| number.to_string().into_bytes())
+                    .collect();
+                (low, high, group.articles.len(), numbers)
+            })
         };
 
-        let (low, high) = group.watermarks();
-        let count = group.articles.len();
-        let numbers: Vec<Vec<u8>> = group
-            .articles
-            .keys()
-            .map(|number| number.to_string().into_bytes())
-            .collect();
+        let Some((low, high, count, numbers)) = found else {
+            return self.status(output, 411, "No such newsgroup");
+        };
 
         self.state.current_group = Some(name.clone());
         self.status(output, 211, &format!("{count} {low} {high} {name}"))?;
@@ -594,7 +662,7 @@ impl<'a> Session<'a> {
         match keyword.as_str() {
             "ACTIVE" => {
                 let lines: Vec<Vec<u8>> = self
-                    .corpus
+                    .corpus()
                     .groups()
                     .iter()
                     .map(|group| {
@@ -608,7 +676,7 @@ impl<'a> Session<'a> {
             }
             "NEWSGROUPS" => {
                 let lines: Vec<Vec<u8>> = self
-                    .corpus
+                    .corpus()
                     .groups()
                     .iter()
                     .map(|group| {
@@ -623,7 +691,7 @@ impl<'a> Session<'a> {
             }
             "ACTIVE.TIMES" => {
                 let lines: Vec<Vec<u8>> = self
-                    .corpus
+                    .corpus()
                     .groups()
                     .iter()
                     .map(|group| {
@@ -657,32 +725,32 @@ impl<'a> Session<'a> {
     }
 
     fn fetch(&mut self, output: &mut impl Write, verb: &str, args: &[&str]) -> std::io::Result<()> {
-        let found = match args.first() {
-            Some(arg) if arg.starts_with('<') => self
-                .corpus
-                .find_by_id(arg)
-                .map(|(_, _, article)| (0u64, article.clone())),
-            Some(arg) => {
-                let Ok(number) = arg.parse::<u64>() else {
-                    return self.status(output, 501, "bad article number");
-                };
-                match self.selected_group() {
+        let number = match args.first() {
+            Some(arg) if arg.starts_with('<') => None,
+            Some(arg) => match arg.parse::<u64>() {
+                Ok(number) => Some(number),
+                Err(_) => return self.status(output, 501, "bad article number"),
+            },
+            None => match self.state.current_article {
+                Some(number) => Some(number),
+                None => return self.status(output, 420, "no article selected"),
+            },
+        };
+
+        // One guard for the whole lookup, released before anything is written.
+        let found = {
+            let corpus = self.corpus();
+            match number {
+                None => args
+                    .first()
+                    .and_then(|arg| corpus.find_by_id(arg))
+                    .map(|(_, _, article)| (0u64, article.clone())),
+                Some(number) => match self.selected_group(&corpus) {
                     None => return self.status(output, 412, "no newsgroup selected"),
                     Some(group) => group
                         .article_by_number(number)
                         .map(|article| (number, article.clone())),
-                }
-            }
-            None => {
-                let Some(number) = self.state.current_article else {
-                    return self.status(output, 420, "no article selected");
-                };
-                match self.selected_group() {
-                    None => return self.status(output, 412, "no newsgroup selected"),
-                    Some(group) => group
-                        .article_by_number(number)
-                        .map(|article| (number, article.clone())),
-                }
+                },
             }
         };
 
@@ -733,7 +801,8 @@ impl<'a> Session<'a> {
         if let Some(arg) = args.first()
             && arg.starts_with('<')
         {
-            let Some((group, number, article)) = self.corpus.find_by_id(arg) else {
+            let corpus = self.corpus();
+            let Some((group, number, article)) = corpus.find_by_id(arg) else {
                 return self.status(output, 430, "no such article");
             };
             let line = article.overview_line(number, &group.name);
@@ -741,7 +810,7 @@ impl<'a> Session<'a> {
             return self.block(output, [line.as_slice()]);
         }
 
-        let Some(group) = self.selected_group().cloned() else {
+        let Some(group) = self.selected_group(&self.corpus()).cloned() else {
             return self.status(output, 412, "no newsgroup selected");
         };
 
@@ -778,7 +847,7 @@ impl<'a> Session<'a> {
     }
 
     fn step(&mut self, output: &mut impl Write, verb: &str) -> std::io::Result<()> {
-        let Some(group) = self.selected_group().cloned() else {
+        let Some(group) = self.selected_group(&self.corpus()).cloned() else {
             return self.status(output, 412, "no newsgroup selected");
         };
         let Some(current) = self.state.current_article else {
@@ -802,11 +871,27 @@ impl<'a> Session<'a> {
         }
     }
 
-    fn selected_group(&self) -> Option<&Group> {
+    /// The corpus, for reading.
+    ///
+    /// A poisoned lock means another session thread panicked mid-write. The corpus is a
+    /// fixture, not a database, so the session carries on with what is there rather than
+    /// taking this thread down as well.
+    fn corpus(&self) -> RwLockReadGuard<'a, Corpus> {
+        self.corpus
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// The selected group, looked up in a corpus the caller is already holding open.
+    ///
+    /// Takes the guard rather than locking again: a `&Group` cannot outlive the lock it
+    /// came from, and re-locking in here would hand back a reference into a guard that
+    /// dies at the end of this function.
+    fn selected_group<'c>(&self, corpus: &'c Corpus) -> Option<&'c Group> {
         self.state
             .current_group
             .as_ref()
-            .and_then(|name| self.corpus.find(name))
+            .and_then(|name| corpus.find(name))
     }
 
     // -- output helpers -----------------------------------------------------------------
@@ -873,6 +958,17 @@ fn parse_range(arg: &str) -> Option<(u64, Option<u64>)> {
     }
 }
 
+/// The groups an article is addressed to.
+fn newsgroups_of(article: &PostedArticle) -> Vec<String> {
+    article
+        .header("Newsgroups")
+        .unwrap_or_default()
+        .split(',')
+        .map(|group| group.trim().to_owned())
+        .filter(|group| !group.is_empty())
+        .collect()
+}
+
 /// Reads a data block a client is sending: lines until a lone `.`, unstuffed.
 ///
 /// The mirror of the client's dot-stuffing, and it has to be exact. A server that does not
@@ -915,7 +1011,7 @@ mod tests {
 
     /// Runs a script of commands against a session and returns everything it wrote.
     fn converse(config: &ServerConfig, commands: &str) -> String {
-        let corpus = Corpus::sample();
+        let corpus = RwLock::new(Corpus::sample());
         let mut session = Session::new(&corpus, config);
         let mut input = std::io::Cursor::new(commands.as_bytes().to_vec());
         let mut output = Vec::new();

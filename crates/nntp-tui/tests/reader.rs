@@ -91,7 +91,11 @@ impl Harness {
                 return;
             }
             match self.events.recv_timeout(Duration::from_millis(100)) {
-                Ok(event) => self.app.on_event(event),
+                Ok(event) => {
+                    for request in self.app.on_event(event) {
+                        self.requests.send(request).expect("send");
+                    }
+                }
                 Err(RecvTimeoutError::Timeout) => self.app.tick(),
                 Err(RecvTimeoutError::Disconnected) => break,
             }
@@ -334,7 +338,9 @@ fn composes_a_follow_up_and_posts_it() {
         "the parent should be quoted: {}",
         posted[0].body_text()
     );
-    assert_eq!(harness.app.inflight, 0);
+
+    // Posting into the group on screen reloads it, so the reader is briefly busy again.
+    harness.settle("the reload that follows a posting", |app| app.inflight == 0);
 }
 
 #[test]
@@ -382,6 +388,47 @@ fn a_rejected_article_reports_the_servers_words_and_keeps_the_draft() {
     // The connection survived a refusal, so the reader is still usable.
     assert!(harness.app.connected);
     assert_eq!(harness.app.inflight, 0);
+}
+
+#[test]
+fn an_article_appears_in_the_list_after_it_is_posted() {
+    // "Why doesn't my message appear, even though it was posted?" — asked from a real
+    // session, and it had two causes. The server filed the article nowhere, and the
+    // article list is a snapshot of the last fetch, so even a server that kept it would
+    // not have shown it without a refetch. Both are the reader's problem to survive.
+    let mut harness = Harness::new(serve(ServerConfig::new()));
+    harness.app.from = Some("A Tester <tester@example.org>".to_owned());
+    harness.settle("the group list", |app| !app.groups.is_empty());
+
+    harness.press(KeyCode::Char('/'));
+    harness.type_text("misc.test");
+    harness.press(KeyCode::Enter);
+    harness.press(KeyCode::Enter);
+    harness.settle("the article list", |app| app.articles.len() == 3);
+
+    for outgoing in harness.app.on_composed(Some((
+        "From: A Tester <tester@example.org>\n\
+         Newsgroups: misc.test\n\
+         Subject: Something I just wrote\n\
+         \n\
+         And it should be on screen.\n"
+            .to_owned(),
+        PathBuf::from("unused-draft"),
+    ))) {
+        harness.requests.send(outgoing).expect("send");
+    }
+
+    harness.settle("the posted article to appear in the list", |app| {
+        app.articles
+            .iter()
+            .any(|record| record.subject == "Something I just wrote")
+    });
+
+    assert_eq!(harness.app.articles.len(), 4);
+
+    // The list shows it before the fetch has finished — that is #8 working — so settle
+    // the rest of the reload before asserting the reader is idle again.
+    harness.settle("the reload to finish", |app| app.inflight == 0);
 }
 
 #[test]

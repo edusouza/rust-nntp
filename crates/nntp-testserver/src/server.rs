@@ -167,7 +167,7 @@ impl TestServer {
         let accept_loop = {
             let stop = Arc::clone(&stop);
             let shared = Arc::new(Shared {
-                corpus,
+                corpus: std::sync::RwLock::new(corpus),
                 config,
                 postbox: Arc::clone(&postbox),
                 #[cfg(feature = "tls")]
@@ -247,7 +247,7 @@ impl Drop for TestServer {
 
 /// What every session thread needs.
 struct Shared {
-    corpus: Corpus,
+    corpus: std::sync::RwLock<Corpus>,
     config: ServerConfig,
     postbox: Postbox,
     #[cfg(feature = "tls")]

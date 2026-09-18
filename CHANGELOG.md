@@ -59,6 +59,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A posted article now comes back.** `nntp-testserver` accepted an article, answered
+  `240`, and filed it nowhere — so the group it was posted to never showed it, which is the
+  one thing somebody testing the posting path wants to see. It is now stored in the groups
+  it names, with a number after that group's high watermark, and comes back from `GROUP`,
+  `OVER` and `ARTICLE` like any other. An article for a group the server does not carry is
+  refused rather than accepted and dropped.
+
+  The reader had a second, independent reason to hide it: the article list is a snapshot of
+  the last fetch, so the article a person has just written was the one article missing from
+  it. Posting into the group on screen now reloads it — by selecting the group again rather
+  than refetching a range, since the new article is *past* the watermark the reader knows
+  about and no range built from what is on screen could include it.
+
 - **`nntp-testserver` no longer drops a connection a person is using.** Its sockets had a
   thirty-second timeout, which keeps an abandoned connection from holding the test suite's
   shutdown and is far too short for somebody reading an article: against the standalone

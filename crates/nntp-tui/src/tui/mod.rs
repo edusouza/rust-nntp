@@ -140,7 +140,13 @@ fn event_loop(
         // redraw each.
         loop {
             match events.try_recv() {
-                Ok(event) => app.on_event(event),
+                Ok(event) => {
+                    // An event can produce work of its own — a posting lands in the group
+                    // on screen and the list has to be fetched again.
+                    for request in app.on_event(event) {
+                        send(requests, app, request);
+                    }
+                }
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => {
                     app.on_event(Event::Stopped);

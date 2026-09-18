@@ -692,3 +692,68 @@ fn an_idle_connection_survives_a_pause_and_is_told_when_it_does_not() {
         other => panic!("unexpected error: {other:?}"),
     }
 }
+
+#[test]
+fn a_posted_article_comes_back_from_the_group_it_was_posted_to() {
+    // Asked from a real session: "why doesn't my message appear, even though it was
+    // posted?" Because the server took it and filed it nowhere. A fake server that
+    // accepts an article, answers 240, and then denies all knowledge of it cannot be used
+    // to check the one thing somebody testing the posting path wants to see.
+    let server = TestServer::start().unwrap();
+    let mut client = connect(&server);
+
+    let before = client
+        .select_group(&GroupName::parse("misc.test").unwrap())
+        .unwrap();
+
+    client
+        .post(&draft("This article should come back."))
+        .unwrap();
+
+    // The watermark moved, which is how a reader notices there is something new.
+    let after = client
+        .select_group(&GroupName::parse("misc.test").unwrap())
+        .unwrap();
+    assert_eq!(after.high, before.high + 1);
+    assert_eq!(after.estimated_count, before.estimated_count + 1);
+
+    // And the article itself is there, as posted.
+    let article = client.article(ArticleSpec::Number(after.high)).unwrap();
+    assert_eq!(article.subject(), "A test posting");
+    assert!(
+        article
+            .display_text()
+            .contains("This article should come back."),
+        "{}",
+        article.display_text()
+    );
+
+    // It is in the overview too, or the reader would never list it.
+    let records = client
+        .overview(Range::between(after.high, after.high))
+        .unwrap();
+    assert_eq!(records.entries.len(), 1);
+    assert_eq!(records.entries[0].subject, "A test posting");
+}
+
+#[test]
+fn an_article_for_a_group_this_server_does_not_carry_is_refused() {
+    // A server cannot file an article somewhere it has no group, and pretending to have
+    // accepted it is the failure mode this whole episode was about.
+    let server = TestServer::start().unwrap();
+    let mut client = connect(&server);
+
+    let draft = nntp_proto::Draft::parse(
+        "From: A Poster <poster@example.org>\n\
+         Newsgroups: no.such.group\n\
+         Subject: Nowhere to put this\n\
+         \n\
+         Body.\n",
+    );
+
+    let error = client.post(&draft).unwrap_err();
+    assert!(
+        matches!(error, ClientError::PostingRejected { .. }),
+        "{error:?}"
+    );
+}

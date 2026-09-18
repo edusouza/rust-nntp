@@ -331,6 +331,10 @@ those are the server's to set. Everything wrong is reported at once, so one trip
 the editor is enough. If the server still refuses, its own message is shown as it arrived;
 that is usually the only explanation there is.
 
+The group you posted to is reloaded straight afterwards, so your article appears in the
+list without asking — against a real server it may take a moment to be accepted and come
+back, and `r` refetches whenever you want.
+
 Accented subjects are sent as RFC 2047 encoded words and a non-ASCII body gets the MIME
 headers that describe it, so what you type is what the other end reads.
 
