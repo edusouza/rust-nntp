@@ -66,6 +66,9 @@ pub fn resolve(config: &Config, args: &ServerArgs) -> anyhow::Result<Target> {
     if let Some(security) = args.security_override() {
         server.security = security;
     }
+    if let Some(from) = &args.from {
+        server.from = Some(from.clone());
+    }
     if let Some(username) = &args.username {
         server.username = Some(username.clone());
     }
@@ -179,6 +182,7 @@ mod tests {
             tls: false,
             starttls: false,
             no_tls: false,
+            from: None,
             username: None,
             password_command: None,
             password_env: None,
@@ -186,6 +190,30 @@ mod tests {
             ca_file: None,
             tls_server_name: None,
         }
+    }
+
+    #[test]
+    fn the_from_flag_overrides_the_configured_identity() {
+        // The case that made this necessary: a server given entirely on the command line
+        // has no configured identity to post as, so without the flag the reader can read
+        // from a fake server but cannot write to it.
+        let config = Config::default();
+        let target = resolve(
+            &config,
+            &ServerArgs {
+                host: Some("127.0.0.1".to_owned()),
+                port: Some(1119),
+                no_tls: true,
+                from: Some("A Tester <tester@example.org>".to_owned()),
+                ..ServerArgs::default()
+            },
+        )
+        .expect("resolve");
+
+        assert_eq!(
+            target.server.from.as_deref(),
+            Some("A Tester <tester@example.org>")
+        );
     }
 
     const CONFIGURED: &str = r#"

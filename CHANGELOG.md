@@ -14,7 +14,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   on a pre-filled article and offer what comes back. A reader that could not answer was
   half a reader.
 
-  Set `from = "Your Name <you@example.org>"` under the server in the configuration file.
+  Set `from = "Your Name <you@example.org>"` under the server in the configuration file, or
+  `--from` when the server is given entirely on the command line and there is no configured
+  identity to take.
   There is deliberately no default: a `From` assembled from the login name and the
   machine's host name is how articles end up signed `user@localhost`, and a reader that
   refuses to post until it is told who you are is better than one that posts as somebody

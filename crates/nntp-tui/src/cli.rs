@@ -184,6 +184,13 @@ pub struct ServerArgs {
     #[arg(long, conflicts_with_all = ["tls", "starttls"])]
     pub no_tls: bool,
 
+    /// Who to post as, overriding the configuration
+    ///
+    /// Needed when the server is given entirely on the command line, since there is then
+    /// no configured server to take an identity from.
+    #[arg(long, value_name = "ADDRESS")]
+    pub from: Option<String>,
+
     /// Username for AUTHINFO, overriding the configuration
     #[arg(long, short = 'u', value_name = "USER")]
     pub username: Option<String>,

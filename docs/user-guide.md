@@ -300,6 +300,13 @@ from = "Your Name <you@example.org>"
 There is no default on purpose. A `From` guessed from your login name and your machine's
 host name is how articles end up signed `user@localhost`.
 
+A server given entirely on the command line has no configured identity to take, so `--from`
+supplies one — which is how posting is tested against the fake server:
+
+```sh
+nntp-tui --host 127.0.0.1 --port 1119 --no-tls --from "You <you@example.org>"
+```
+
 The editor is `$VISUAL`, then `$EDITOR`, then `vi` (or `notepad` on Windows). Arguments in
 the variable work — `EDITOR="code --wait"`, `EDITOR="emacsclient -c"` — as long as the path
 itself has no spaces in it.
