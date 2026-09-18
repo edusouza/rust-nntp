@@ -202,7 +202,7 @@ while something is outstanding.
 | `c` | catch up: mark the whole group read |
 | `/` | filter groups by name or description |
 | `↑` `↓` `PageUp` `PageDown` `Home` `End` while filtering | move through what the filter left, without leaving the filter |
-| `Esc` | clear the filter, or close an overlay |
+| `Esc` | stop a request in progress; otherwise clear the filter or close an overlay |
 | `r` | reload the focused pane |
 | `m` | recent messages |
 | `?` or `F1` | help |
@@ -256,6 +256,27 @@ keys.
   and all — when you need to see what the sender actually sent.
 - **An error takes over the status bar** until the next keystroke; `m` shows the ones that
   have scrolled past.
+
+### Stopping a long request
+
+A `LIST ACTIVE` against a full-feed server is tens of thousands of lines and takes tens of
+seconds. **`Esc` abandons it**, and while anything is outstanding the status bar says so
+(`Esc: stop`). The spinner keeps turning until the worker notices, which takes at most one
+line of the response.
+
+Two things worth knowing, because they are visible:
+
+- **The connection is dropped when you cancel.** Stopping part-way through a response
+  leaves it pointing into the middle of a reply, so it cannot be reused; the next request
+  reconnects, which you see as `connecting to …` in the status bar. That is the honest
+  cost, and the message pane (`m`) says so when it happens.
+- **A server that has gone silent is a different problem.** Cancelling notices between
+  lines of a response that is arriving; if the server has stopped sending altogether, what
+  ends the wait is the read timeout (`read_timeout_secs`, 60 by default). Lower it if you
+  are on a flaky link.
+
+`Esc` keeps its other meanings when nothing is outstanding, and always belongs to the
+filter while you are typing one.
 
 ### Read and unread
 

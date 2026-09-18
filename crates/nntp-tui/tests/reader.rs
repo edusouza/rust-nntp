@@ -49,9 +49,13 @@ impl Harness {
         let (request_tx, request_rx) = mpsc::channel();
         let (event_tx, event_rx) = mpsc::channel();
 
-        worker::spawn(target, 500, request_rx, event_tx).expect("spawn the worker");
-
         let mut app = App::new(&Config::default().ui, read);
+
+        // The harness shares the app's cancel flag with the worker, exactly as the run
+        // loop does, so a test can cancel the way a keystroke would.
+        worker::spawn(target, 500, request_rx, event_tx, app.cancel.clone())
+            .expect("spawn the worker");
+
         let initial = app.initial_requests();
         for request in initial {
             request_tx.send(request).expect("send");
@@ -289,6 +293,91 @@ fn reader_showing(server: TestServer, group: &str, subject: &str) -> Harness {
     harness.press(KeyCode::Enter);
     harness.settle("the article", |app| app.article.is_some());
     harness
+}
+
+#[test]
+fn a_long_request_can_be_cancelled_and_the_reader_carries_on() {
+    // The whole of #9, end to end: a response that is still arriving, a keystroke, and a
+    // reader that is usable immediately afterwards.
+    //
+    // The delay is the fixture. A real `LIST ACTIVE` takes tens of seconds, which is why
+    // cancelling matters and why no corpus small enough to ship reproduces it; 40ms a line
+    // makes the group list take long enough to interrupt on purpose.
+    let server = TestServer::with(
+        Corpus::sample(),
+        ServerConfig::new().quirks(Quirks {
+            line_delay: Some(Duration::from_millis(40)),
+            ..Quirks::default()
+        }),
+    )
+    .expect("start the server");
+
+    let mut harness = Harness::new(server);
+
+    // The group list is in flight; stop it.
+    harness.settle("the request to be outstanding", |app| app.inflight > 0);
+    harness.press(KeyCode::Esc);
+    harness.settle("the cancellation", |app| app.inflight == 0);
+
+    assert!(
+        harness.app.groups.is_empty(),
+        "the group list was abandoned, not delivered"
+    );
+    assert!(
+        harness.app.status.contains("cancelled"),
+        "status: {}",
+        harness.app.status
+    );
+    assert!(
+        harness.app.error.is_none(),
+        "cancelling is not a failure: {:?}",
+        harness.app.error
+    );
+
+    // And the reader still works. The cancelled connection was dropped — stopping
+    // mid-response leaves it desynchronised — so this reconnects, which the user sees as
+    // a progress line rather than as an error.
+    harness.press(KeyCode::Char('r'));
+    harness.settle("the group list on a fresh connection", |app| {
+        !app.groups.is_empty()
+    });
+
+    assert_eq!(harness.app.groups.len(), 4);
+    assert!(harness.app.connected);
+    assert!(
+        harness.app.error.is_none(),
+        "the reconnection was clean: {:?}",
+        harness.app.error
+    );
+}
+
+#[test]
+fn cancelling_takes_effect_while_the_response_is_still_arriving() {
+    // Not "eventually": the flag is checked once per line, so the abandonment has to
+    // happen while the server is still sending rather than after the last line.
+    let server = TestServer::with(
+        Corpus::sample(),
+        ServerConfig::new().quirks(Quirks {
+            // 26 groups and descriptions at 120ms each would be seconds of response.
+            line_delay: Some(Duration::from_millis(120)),
+            ..Quirks::default()
+        }),
+    )
+    .expect("start the server");
+
+    let mut harness = Harness::new(server);
+    harness.settle("the request to be outstanding", |app| app.inflight > 0);
+
+    let asked_at = Instant::now();
+    harness.press(KeyCode::Esc);
+    harness.settle("the cancellation", |app| app.inflight == 0);
+    let took = asked_at.elapsed();
+
+    assert!(
+        took < Duration::from_secs(2),
+        "cancellation took {took:?}, which is long enough that it waited for the response"
+    );
+    assert!(harness.app.groups.is_empty());
 }
 
 #[test]
@@ -659,12 +748,12 @@ fn credentials_from_the_configuration_are_used() {
 
     let (request_tx, request_rx) = mpsc::channel();
     let (event_tx, event_rx) = mpsc::channel();
-    worker::spawn(target, 500, request_rx, event_tx).expect("spawn");
 
     let mut app = App::new(
         &Config::default().ui,
         ReadStore::empty(PathBuf::from("unused")),
     );
+    worker::spawn(target, 500, request_rx, event_tx, app.cancel.clone()).expect("spawn");
     for request in app.initial_requests() {
         request_tx.send(request).expect("send");
     }

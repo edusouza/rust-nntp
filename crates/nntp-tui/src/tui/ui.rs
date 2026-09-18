@@ -342,8 +342,16 @@ fn draw_status(frame: &mut Frame<'_>, app: &App, area: Rect) {
     // Laid out rather than concatenated: on a narrow terminal the hint gives up its
     // space and then disappears, instead of pushing the status message off the edge or
     // being cut mid-word.
-    const HINT: &str = " ?: help  m: messages  q: quit";
-    let hint_width = u16::try_from(HINT.chars().count()).unwrap_or(u16::MAX);
+    // While something is outstanding the hint says how to stop it: a cancel key nobody
+    // can find is a cancel key nobody has.
+    const IDLE_HINT: &str = " ?: help  m: messages  q: quit";
+    const BUSY_HINT: &str = " Esc: stop  ?: help  q: quit";
+    let hint = if app.inflight > 0 {
+        BUSY_HINT
+    } else {
+        IDLE_HINT
+    };
+    let hint_width = u16::try_from(hint.chars().count()).unwrap_or(u16::MAX);
     let connection_width =
         u16::try_from(connection.content.chars().count() + 2).unwrap_or(u16::MAX);
 
@@ -367,7 +375,7 @@ fn draw_status(frame: &mut Frame<'_>, app: &App, area: Rect) {
     );
     // Rendered last and right-aligned, so it is the part that vanishes first.
     frame.render_widget(
-        Paragraph::new(Line::from(Span::from(HINT).dim())).alignment(Alignment::Right),
+        Paragraph::new(Line::from(Span::from(hint).dim())).alignment(Alignment::Right),
         right,
     );
 }
@@ -429,7 +437,10 @@ fn help_text() -> Text<'static> {
         ("c", "catch up: mark the whole group read"),
         ("/", "filter groups by name or description"),
         ("↑ ↓ while filtering", "move through what the filter left"),
-        ("Esc", "clear the filter, or close an overlay"),
+        (
+            "Esc",
+            "stop a request in progress; else clear the filter or close an overlay",
+        ),
         ("r", "reload the focused pane"),
         ("m", "show recent messages"),
         ("?  F1", "this help"),

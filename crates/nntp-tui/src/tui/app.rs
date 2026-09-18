@@ -10,6 +10,8 @@ use std::collections::VecDeque;
 use nntp_proto::{ArticleSpec, GroupSummary, OverviewRecord, Range};
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
+use nntp_client::Cancel;
+
 use crate::config::UiConfig;
 use crate::readstate::ReadStore;
 use crate::tui::protocol::{Event, GroupRow, Request};
@@ -211,6 +213,12 @@ pub struct App {
 
     /// How many requests are outstanding, for the spinner.
     pub inflight: usize,
+    /// Raised to abandon the response the worker is reading.
+    ///
+    /// Shared with the worker thread. A `Request` would not do: the channel is
+    /// first-in-first-out and the worker is inside the request being cancelled, so the
+    /// message would arrive only once the wait had ended on its own.
+    pub cancel: Cancel,
     /// Spinner phase.
     pub spinner: usize,
     /// Whether the screen needs redrawing.
@@ -258,6 +266,7 @@ impl App {
             error: None,
             messages: VecDeque::new(),
             inflight: 0,
+            cancel: Cancel::new(),
             spinner: 0,
             dirty: true,
             should_quit: false,
@@ -490,6 +499,18 @@ impl App {
 
             Event::Progress(message) => self.status = message,
 
+            Event::Cancelled { context } => {
+                self.inflight = self.inflight.saturating_sub(1);
+                // A status line, not the error line: the user asked for this. The note
+                // about the connection is there because the next request will visibly
+                // reconnect, and a reconnection nobody explained looks like a fault.
+                self.status = format!("{context} cancelled");
+                self.note(format!(
+                    "{context} cancelled; the connection was dropped and will be remade \
+                     on the next request"
+                ));
+            }
+
             Event::Failed { context, message } => {
                 self.inflight = self.inflight.saturating_sub(1);
                 let text = format!("{context}: {message}");
@@ -546,7 +567,13 @@ impl App {
                 self.focus = Pane::Groups;
             }
             KeyCode::Esc => {
-                if self.filter.is_empty() {
+                // Stopping a long fetch is what a user reaches for Esc to do, so it comes
+                // first — but only while something is actually outstanding, otherwise Esc
+                // would stop clearing filters. Esc *while typing* a filter is handled in
+                // `filter_key` and still belongs to the filter.
+                if self.inflight > 0 {
+                    self.request_cancellation();
+                } else if self.filter.is_empty() {
                     self.focus = Pane::Groups;
                 } else {
                     self.filter.clear();
@@ -659,6 +686,21 @@ impl App {
             _ => self.dirty = false,
         }
         Vec::new()
+    }
+
+    /// Asks the worker to abandon whatever it is reading.
+    ///
+    /// Raises the shared flag and says so. The worker answers with
+    /// [`Event::Cancelled`] once it notices — within one line of a response that is still
+    /// arriving — which is when `inflight` comes down. Pressing it twice is harmless.
+    pub fn request_cancellation(&mut self) {
+        if self.inflight == 0 {
+            self.status = "nothing to cancel".to_owned();
+            return;
+        }
+
+        self.cancel.cancel();
+        self.status = "cancelling…".to_owned();
     }
 
     /// Moves the group cursor within the filtered list.
@@ -1246,6 +1288,108 @@ mod tests {
         assert_eq!(app.group_cursor, 2);
         app.on_key(ctrl('u'));
         assert_eq!(app.group_cursor, 0);
+    }
+
+    #[test]
+    fn escape_stops_a_request_in_progress() {
+        let mut app = app();
+        app.initial_requests();
+        assert_eq!(app.inflight, 1);
+        assert!(!app.cancel.is_cancelled());
+
+        app.on_key(key(KeyCode::Esc));
+
+        assert!(app.cancel.is_cancelled(), "the worker's flag is raised");
+        assert!(app.status.contains("cancelling"), "{}", app.status);
+        // Still outstanding: the worker has not answered yet, and pretending otherwise
+        // would stop the spinner while the socket is still being read.
+        assert_eq!(app.inflight, 1);
+    }
+
+    #[test]
+    fn the_cancelled_event_is_a_status_and_not_an_error() {
+        let mut app = app();
+        app.initial_requests();
+        app.on_key(key(KeyCode::Esc));
+
+        app.on_event(Event::Cancelled {
+            context: "the group list".to_owned(),
+        });
+
+        assert_eq!(app.inflight, 0);
+        assert!(app.status.contains("cancelled"), "{}", app.status);
+        assert!(
+            app.error.is_none(),
+            "the user asked for this: {:?}",
+            app.error
+        );
+        // And the message pane explains the reconnection that will follow, so it does not
+        // look like a fault when it happens.
+        assert!(
+            app.messages
+                .iter()
+                .any(|message| message.contains("connection")),
+            "{:?}",
+            app.messages
+        );
+    }
+
+    #[test]
+    fn escape_with_nothing_outstanding_keeps_its_old_meaning() {
+        // The filter must still be clearable, which is what Esc is for the rest of the
+        // time.
+        let mut app = app();
+        app.on_event(Event::Groups(some_groups()));
+        app.filter = "misc".to_owned();
+        assert_eq!(app.inflight, 0);
+
+        app.on_key(key(KeyCode::Esc));
+
+        assert!(app.filter.is_empty());
+        assert!(!app.cancel.is_cancelled(), "nothing was cancelled");
+    }
+
+    #[test]
+    fn escape_while_typing_a_filter_still_belongs_to_the_filter() {
+        // Even with a request outstanding: the user is typing, and Esc there means "never
+        // mind this filter".
+        let mut app = app();
+        app.on_event(Event::Groups(some_groups()));
+        app.initial_requests();
+        app.on_key(key(KeyCode::Char('/')));
+        app.on_key(key(KeyCode::Char('x')));
+
+        app.on_key(key(KeyCode::Esc));
+
+        assert!(!app.editing_filter);
+        assert!(app.filter.is_empty());
+        assert!(
+            !app.cancel.is_cancelled(),
+            "the load was not cancelled by a filter keystroke"
+        );
+    }
+
+    #[test]
+    fn cancelling_twice_is_harmless() {
+        let mut app = app();
+        app.initial_requests();
+
+        app.on_key(key(KeyCode::Esc));
+        app.on_key(key(KeyCode::Esc));
+
+        assert!(app.cancel.is_cancelled());
+        assert_eq!(app.inflight, 1);
+    }
+
+    #[test]
+    fn cancelling_with_nothing_outstanding_says_so_rather_than_raising_the_flag() {
+        // A raised flag with nothing reading would be taken by whatever ran next.
+        let mut app = app();
+
+        app.request_cancellation();
+
+        assert!(!app.cancel.is_cancelled());
+        assert!(app.status.contains("nothing to cancel"), "{}", app.status);
     }
 
     #[test]

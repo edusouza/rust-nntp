@@ -19,6 +19,17 @@ pub enum ClientError {
     #[error("transport error: {0}")]
     Io(#[from] io::Error),
 
+    /// The caller asked for the response in progress to be abandoned.
+    ///
+    /// Not a failure of anything: the remedy is to discard the connection — it is left
+    /// pointing into the middle of a reply — and reconnect when there is something else
+    /// to ask. See [`crate::Cancel`].
+    #[error("cancelled while reading {what}")]
+    Cancelled {
+        /// What was being read, for the message.
+        what: &'static str,
+    },
+
     /// The peer closed the connection, or it was closed mid-response.
     #[error("connection closed by the server{}", context_suffix(.0))]
     ConnectionClosed(Option<&'static str>),
@@ -197,6 +208,9 @@ impl ClientError {
             | Self::Proto(_)
             | Self::LineTooLong { .. }
             | Self::BlockTooLarge { .. }
+            // Cancelling stops mid-response, so the connection cannot be reused. This is
+            // the one fatal variant that is nobody's fault.
+            | Self::Cancelled { .. }
             | Self::Tls(_) => true,
 
             Self::UnexpectedResponse { .. }
@@ -219,6 +233,16 @@ impl ClientError {
             Self::Server { code, .. } => code.as_u16() < 500,
             _ => false,
         }
+    }
+
+    /// Whether this is the caller's own cancellation coming back.
+    ///
+    /// Worth its own question because it is the only error a caller should *not* report
+    /// as a failure: the user asked for it, and telling them their request failed when
+    /// they stopped it themselves is the kind of message that makes a program feel
+    /// broken.
+    pub fn is_cancelled(&self) -> bool {
+        matches!(self, Self::Cancelled { .. })
     }
 
     /// Whether the caller should obtain credentials and try again.

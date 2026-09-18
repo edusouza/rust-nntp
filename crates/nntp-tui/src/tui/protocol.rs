@@ -67,6 +67,15 @@ pub enum Event {
     Article(Box<nntp_proto::Article>),
     /// Progress on a long operation, for the status bar.
     Progress(String),
+    /// A request the user abandoned.
+    ///
+    /// Separate from [`Self::Failed`] on purpose: the user asked for this, and telling
+    /// them their request failed when they stopped it themselves is the kind of message
+    /// that makes a program feel broken.
+    Cancelled {
+        /// What was being read, for the status line.
+        context: String,
+    },
     /// Something went wrong. Not fatal to the interface.
     Failed {
         /// What was being attempted.

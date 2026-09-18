@@ -9,6 +9,7 @@ use std::io::{BufRead, BufReader, Read, Write};
 use nntp_proto::block::{self, DataBlock};
 use nntp_proto::{Command, StatusLine};
 
+use crate::cancel::Cancel;
 use crate::error::{ClientError, Result};
 use crate::limits::Limits;
 
@@ -28,6 +29,9 @@ pub struct Connection<S> {
     /// violation, where the rest of the over-long line is still queued. Any further use
     /// would read one response as another, so it is refused.
     desynchronised: bool,
+    /// Checked once per line of a data block, so a caller on another thread can abandon a
+    /// long response. `None` means nothing can cancel this connection.
+    cancel: Option<Cancel>,
 }
 
 impl<S: Read + Write> Connection<S> {
@@ -42,7 +46,22 @@ impl<S: Read + Write> Connection<S> {
             stream: BufReader::with_capacity(READ_BUFFER_SIZE, stream),
             limits,
             desynchronised: false,
+            cancel: None,
         }
+    }
+
+    /// Lets `cancel` abandon a data block this connection is reading.
+    ///
+    /// Without one, a response is always read to its terminator. With one, a raised flag
+    /// stops the read within a line and leaves the connection desynchronised, because
+    /// stopping mid-response is exactly what desynchronised means. See [`Cancel`].
+    pub fn set_cancel(&mut self, cancel: Cancel) {
+        self.cancel = Some(cancel);
+    }
+
+    /// The flag that can cancel this connection's reads, if one was given.
+    pub fn cancel_flag(&self) -> Option<&Cancel> {
+        self.cancel.as_ref()
     }
 
     /// The limits in force.
@@ -143,22 +162,37 @@ impl<S: Read + Write> Connection<S> {
 
     /// Reads a multi-line data block, passing each line to `on_line` as it arrives.
     ///
-    /// Lines are already dot-unstuffed and have no line terminator. The block is always
-    /// read to its terminator even if the caller ignores the content, because stopping
-    /// early would leave the connection pointing into the middle of a response.
+    /// Lines are already dot-unstuffed and have no line terminator. The block is otherwise
+    /// always read to its terminator even if the caller ignores the content, because
+    /// stopping early would leave the connection pointing into the middle of a response.
+    ///
+    /// The one exception is cancellation: if a [`Cancel`] was given to
+    /// [`Self::set_cancel`] and it has been raised, the read stops and the connection is
+    /// marked desynchronised. The cost is explicit rather than hidden — a cancelled
+    /// connection is finished, and its owner has to discard it.
     ///
     /// Returns the number of lines read.
     ///
     /// # Errors
     ///
     /// Returns [`ClientError::BlockTooLarge`] if the configured line count or octet count
-    /// is exceeded, and [`ClientError::ConnectionClosed`] if the stream ends before the
-    /// terminator arrives.
+    /// is exceeded, [`ClientError::Cancelled`] if the flag was raised, and
+    /// [`ClientError::ConnectionClosed`] if the stream ends before the terminator arrives.
     pub fn read_block_streaming(&mut self, mut on_line: impl FnMut(&[u8])) -> Result<usize> {
         let mut lines = 0usize;
         let mut bytes = 0usize;
 
         loop {
+            // Before the read rather than after it: a flag raised while the previous line
+            // was being handed to `on_line` should stop this block, not buy another line.
+            if self.cancel.as_ref().is_some_and(Cancel::is_cancelled) {
+                tracing::debug!(lines, bytes, "<< cancelled mid-block");
+                self.desynchronised = true;
+                return Err(ClientError::Cancelled {
+                    what: "a data block",
+                });
+            }
+
             let line = self.read_line("a data block")?;
             if block::is_terminator(&line) {
                 tracing::trace!(lines, bytes, "<< end of block");
@@ -437,6 +471,86 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn a_raised_cancel_flag_stops_a_block_within_a_line() {
+        let mut conn = connect(b"a\r\nb\r\nc\r\nd\r\n.\r\n");
+        let cancel = Cancel::new();
+        conn.set_cancel(cancel.clone());
+
+        let mut seen = Vec::new();
+        let error = conn
+            .read_block_streaming(|line| {
+                seen.push(String::from_utf8_lossy(line).into_owned());
+                // Ask to stop while handling the second line, as a keystroke would.
+                if seen.len() == 2 {
+                    cancel.cancel();
+                }
+            })
+            .unwrap_err();
+
+        assert!(matches!(error, ClientError::Cancelled { .. }));
+        // Two lines were delivered and the third was never read: the check happens before
+        // the read, so a flag raised during `on_line` does not buy another line.
+        assert_eq!(seen, ["a", "b"]);
+    }
+
+    #[test]
+    fn a_cancelled_block_poisons_the_connection() {
+        // Stopping mid-response is what desynchronised means. The alternative — pretending
+        // the connection is fine — would read the tail of this block as the next response.
+        let mut conn = connect(b"a\r\nb\r\n.\r\n211 3 1 3 misc.test\r\n");
+        let cancel = Cancel::new();
+        conn.set_cancel(cancel.clone());
+        cancel.cancel();
+
+        let error = conn.read_block_streaming(|_| {}).unwrap_err();
+
+        assert!(matches!(error, ClientError::Cancelled { .. }));
+        assert!(error.is_cancelled());
+        assert!(
+            error.is_connection_fatal(),
+            "the owner has to discard the connection"
+        );
+        assert!(conn.is_desynchronised());
+        assert!(conn.read_status().is_err(), "and it refuses further use");
+    }
+
+    #[test]
+    fn a_cancellation_raised_before_the_block_starts_reads_nothing() {
+        let mut conn = connect(b"a\r\nb\r\n.\r\n");
+        let cancel = Cancel::new();
+        conn.set_cancel(cancel.clone());
+        cancel.cancel();
+
+        let mut seen = 0usize;
+        let error = conn.read_block_streaming(|_| seen += 1).unwrap_err();
+
+        assert!(matches!(error, ClientError::Cancelled { .. }));
+        assert_eq!(seen, 0);
+    }
+
+    #[test]
+    fn a_lowered_flag_does_not_interfere() {
+        // The flag is shared and long-lived, so a connection holding one that nobody has
+        // raised must behave exactly as one without.
+        let mut conn = connect(b"a\r\nb\r\n.\r\n");
+        conn.set_cancel(Cancel::new());
+
+        assert_eq!(conn.read_block_streaming(|_| {}).unwrap(), 2);
+        assert!(!conn.is_desynchronised());
+    }
+
+    #[test]
+    fn without_a_flag_a_block_is_always_read_to_the_terminator() {
+        // The contract the rest of the client relies on, kept for connections that never
+        // got a flag.
+        let mut conn = connect(b"a\r\nb\r\n.\r\n211 3 1 3 misc.test\r\n");
+        assert!(conn.cancel_flag().is_none());
+
+        assert_eq!(conn.read_block_streaming(|_| {}).unwrap(), 2);
+        assert_eq!(conn.read_status().unwrap().code.as_u16(), 211);
     }
 
     #[test]
