@@ -329,6 +329,8 @@ impl<'a> Session<'a> {
                 self.fetch(output, &verb, &args).map(|()| Flow::Continue)
             }
             "OVER" | "XOVER" => self.over(output, &verb, &args).map(|()| Flow::Continue),
+            "HDR" | "XHDR" => self.hdr(output, &verb, &args).map(|()| Flow::Continue),
+            "NEWGROUPS" => self.newgroups(output, &args).map(|()| Flow::Continue),
             "POST" => self.post(output),
             "NEXT" | "LAST" => self.step(output, &verb).map(|()| Flow::Continue),
             other => self
@@ -359,6 +361,88 @@ impl<'a> Session<'a> {
 
         self.status(output, 382, "continue with TLS negotiation")?;
         Ok(Flow::UpgradeToTls)
+    }
+
+    /// `HDR` / `XHDR`: one header field across a range (RFC 3977 §8.5, RFC 2980 §2.9).
+    fn hdr(&mut self, output: &mut impl Write, verb: &str, args: &[&str]) -> std::io::Result<()> {
+        if verb == "HDR" && self.config.capabilities == CapabilityProfile::NoOver {
+            // A server old enough to lack OVER lacks HDR too, and answering one without
+            // the other would be a server shape that does not exist.
+            return self.status(output, 500, "command not recognised");
+        }
+
+        let Some(field) = args.first() else {
+            return self.status(output, 501, "HDR needs a header name");
+        };
+        let field = (*field).to_owned();
+
+        // The message-id form needs no selected group.
+        if let Some(arg) = args.get(1)
+            && arg.starts_with('<')
+        {
+            let line = {
+                let corpus = self.corpus();
+                corpus
+                    .find_by_id(arg)
+                    .map(|(_, _, article)| header_line(0, article, &field))
+            };
+            let Some(line) = line else {
+                return self.status(output, 430, "no such article");
+            };
+            let code = headers_follow_code(verb);
+            self.status(output, code, &format!("{field} header follows"))?;
+            return self.block(output, [line.as_slice()]);
+        }
+
+        let Some(group) = self.selected_group(&self.corpus()).cloned() else {
+            return self.status(output, 412, "no newsgroup selected");
+        };
+
+        let (low, high) = match args.get(1) {
+            None => match self.state.current_article {
+                Some(number) => (number, Some(number)),
+                None => return self.status(output, 420, "no article selected"),
+            },
+            Some(spec) => match parse_range(spec) {
+                Some(range) => range,
+                None => return self.status(output, 501, "bad range"),
+            },
+        };
+        let high = high.unwrap_or(u64::MAX);
+
+        let lines: Vec<Vec<u8>> = group
+            .articles
+            .iter()
+            .filter(|(number, _)| **number >= low && **number <= high)
+            .map(|(number, article)| header_line(*number, article, &field))
+            .collect();
+
+        let code = headers_follow_code(verb);
+        self.status(output, code, &format!("{field} header follows"))?;
+        self.block(output, lines.iter().map(Vec::as_slice))
+    }
+
+    /// `NEWGROUPS`: groups created since a date (RFC 3977 §7.3).
+    fn newgroups(&mut self, output: &mut impl Write, args: &[&str]) -> std::io::Result<()> {
+        let Some(since) = parse_newgroups_date(args) else {
+            return self.status(output, 501, "NEWGROUPS needs yyyymmdd hhmmss [GMT]");
+        };
+
+        let lines: Vec<Vec<u8>> = {
+            let corpus = self.corpus();
+            corpus
+                .groups()
+                .iter()
+                .filter(|group| group.created >= since)
+                .map(|group| {
+                    let (low, high) = group.watermarks();
+                    format!("{} {} {} {}", group.name, high, low, group.posting.flag()).into_bytes()
+                })
+                .collect()
+        };
+
+        self.status(output, 231, "list of new newsgroups follows")?;
+        self.block(output, lines.iter().map(Vec::as_slice))
     }
 
     /// `POST`: the first half of the exchange. The article arrives next.
@@ -720,6 +804,13 @@ impl<'a> Session<'a> {
                     ],
                 )
             }
+            "HEADERS" => {
+                // A colon alone means "any field in the article", which RFC 3977 §8.6
+                // allows and which is the honest answer for a server that stores whole
+                // articles rather than a fixed overview database.
+                self.status(output, 215, "field list follows")?;
+                self.block(output, [b":".as_slice()])
+            }
             other => self.status(output, 501, &format!("LIST {other} is not supported")),
         }
     }
@@ -956,6 +1047,89 @@ fn parse_range(arg: &str) -> Option<(u64, Option<u64>)> {
         Some((low, "")) => low.parse().ok().map(|low| (low, None)),
         Some((low, high)) => Some((low.parse().ok()?, Some(high.parse().ok()?))),
     }
+}
+
+/// The success code for a header listing, which differs between the two spellings.
+///
+/// RFC 3977 §8.5.2 gives `HDR` its own code, `225`; RFC 2980 §2.9 had `XHDR` share `221`
+/// with `HEAD`. Servers have been seen to mix them, and the client accepts either from
+/// either — but this server answers what the relevant specification says, because a fake
+/// that blurs the two teaches a client that the distinction does not exist.
+fn headers_follow_code(verb: &str) -> u16 {
+    if verb.starts_with('X') { 221 } else { 225 }
+}
+
+/// One `HDR` line: the article number, a space, and the field's value.
+///
+/// A field the article does not have still gets a line — the article exists, and leaving it
+/// out would make the response look like a shorter range than was asked for.
+fn header_line(number: u64, article: &Article, field: &str) -> Vec<u8> {
+    let mut line = number.to_string().into_bytes();
+    if let Some(value) = article.header_value(field) {
+        line.push(b' ');
+        line.extend_from_slice(&value);
+    }
+    line
+}
+
+/// `yyyymmdd hhmmss [GMT]` as seconds since the epoch.
+///
+/// Two-digit years are accepted because RFC 3977 §7.3.1 still allows them, and a server
+/// that refuses one is refusing a client that is following the specification.
+fn parse_newgroups_date(args: &[&str]) -> Option<u64> {
+    let date = args.first()?;
+    let time = args.get(1)?;
+
+    let (year, rest) = match date.len() {
+        8 => (date.get(..4)?.parse::<i32>().ok()?, date.get(4..)?),
+        6 => {
+            let two = date.get(..2)?.parse::<i32>().ok()?;
+            // RFC 3977 §7.3.1: within the century closest to the present.
+            (
+                if two >= 70 { 1900 + two } else { 2000 + two },
+                date.get(2..)?,
+            )
+        }
+        _ => return None,
+    };
+
+    let month = rest.get(..2)?.parse::<u32>().ok()?;
+    let day = rest.get(2..)?.parse::<u32>().ok()?;
+    let hour = time.get(..2)?.parse::<u32>().ok()?;
+    let minute = time.get(2..4)?.parse::<u32>().ok()?;
+    let second = time.get(4..6)?.parse::<u32>().ok()?;
+
+    if !(1..=12).contains(&month) || !(1..=31).contains(&day) {
+        return None;
+    }
+    if hour > 23 || minute > 59 || second > 60 {
+        return None;
+    }
+
+    let seconds = days_from_civil(year, month, day) * 86_400
+        + i64::from(hour) * 3_600
+        + i64::from(minute) * 60
+        + i64::from(second);
+
+    Some(seconds.max(0).unsigned_abs())
+}
+
+/// Days since 1970-01-01 for a civil date.
+///
+/// Howard Hinnant's `days_from_civil`, which is exact for any proleptic Gregorian date and
+/// is ten lines. A fake server acquiring a date library to compare one timestamp would cost
+/// more than it explains.
+const fn days_from_civil(year: i32, month: u32, day: u32) -> i64 {
+    let year = if month <= 2 { year - 1 } else { year } as i64;
+    let era = if year >= 0 { year } else { year - 399 } / 400;
+    let year_of_era = year - era * 400;
+
+    let month = month as i64;
+    let day_of_year =
+        (153 * (if month > 2 { month - 3 } else { month + 9 }) + 2) / 5 + day as i64 - 1;
+    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
+
+    era * 146_097 + day_of_era - 719_468
 }
 
 /// The groups an article is addressed to.

@@ -9,6 +9,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **The commands that were parsed but never issued now have client methods** ([#16]). Six
+  of them had wire grammar in `nntp-proto` and tests to match, and nothing that could
+  actually send one — an honest state to be in, and not one to stay in. The coverage matrix
+  has no yellow rows left.
+
+  | Method | Command | Why it is worth having |
+  | --- | --- | --- |
+  | `header_field` (+ streaming) | `HDR`, falling back to `XHDR` | One field across a range, at a fraction of `OVER`'s bytes — what threading a whole group needs |
+  | `article_numbers` | `LISTGROUP` | Which numbers a group *holds*, rather than the range they lie in: the only way to see the gaps expiry leaves |
+  | `next_article` / `previous_article` | `NEXT` / `LAST` | How a group is walked when the server offers no overview at all |
+  | `group_creation_times` | `LIST ACTIVE.TIMES` | When a group was created, and by whom |
+  | `available_header_fields` | `LIST HEADERS` | Which fields `HDR` will accept; `doctor` now reports it |
+  | `new_groups` | `NEWGROUPS` | The cheap half of keeping a group list fresh |
+
+  `HDR` accepts `225` **or** `221`: RFC 3977 §8.5.2 gives it its own code, RFC 2980 had
+  `XHDR` share `HEAD`'s, and servers mix them — insisting on the letter of the newer
+  document would refuse a response that is perfectly usable. `nntp-testserver` answers
+  whichever code the relevant specification gives, because a fake that blurs the two would
+  teach a client that the distinction does not exist.
+
+  `nntp-testserver` gained `HDR`/`XHDR`, `LIST HEADERS` and `NEWGROUPS`, which it had never
+  served. The opt-in real-server suite gained a tenth test: that `HDR References` and `OVER`
+  agree about the same articles, compared as sets of message-ids rather than as text. If
+  they disagreed, a group would thread differently depending on which command the reader
+  happened to use, and no offline fixture could catch it because both sides of it would be
+  ours.
+
 - **Posting, in the editor you already use** ([#11]). `w` writes a new article in the
   selected group and `f` follows up to the one on screen; both open `$VISUAL` or `$EDITOR`
   on a pre-filled article and offer what comes back. A reader that could not answer was
@@ -507,4 +534,5 @@ records what was checked, against which server, on what date ([#4]).
 [#10]: https://github.com/edusouza/rust-nntp/issues/10
 [#11]: https://github.com/edusouza/rust-nntp/issues/11
 [#12]: https://github.com/edusouza/rust-nntp/issues/12
+[#16]: https://github.com/edusouza/rust-nntp/issues/16
 [#17]: https://github.com/edusouza/rust-nntp/issues/17

@@ -757,3 +757,219 @@ fn an_article_for_a_group_this_server_does_not_carry_is_refused() {
         "{error:?}"
     );
 }
+
+// -- the commands that were parsed but never issued (#16) -------------------------------
+
+#[test]
+fn fetches_one_header_across_a_range() {
+    // The point of HDR: one field for many articles, at a fraction of OVER's bytes. This
+    // is what threading a whole group needs, since it only wants References.
+    let server = TestServer::start().unwrap();
+    let mut client = connect(&server);
+    client
+        .select_group(&GroupName::parse("misc.test").unwrap())
+        .unwrap();
+
+    let subjects = client
+        .header_field(
+            &nntp_proto::HeaderName::parse("Subject").unwrap(),
+            Range::between(1, 3).into(),
+        )
+        .unwrap();
+
+    assert_eq!(subjects.entries.len(), 3);
+    assert_eq!(subjects.entries[0].number, 1);
+    assert_eq!(subjects.entries[0].value, "A plain test article");
+    assert!(subjects.skipped.is_empty(), "{:?}", subjects.skipped);
+
+    // And the field that threading actually wants.
+    let references = client
+        .header_field(
+            &nntp_proto::HeaderName::parse("References").unwrap(),
+            Range::between(1, 3).into(),
+        )
+        .unwrap();
+    let reply = references
+        .entries
+        .iter()
+        .find(|entry| entry.number == 2)
+        .expect("article 2");
+    assert_eq!(reply.value, "<root@test.invalid>");
+
+    // An article with no References still gets a line, or the response would look like a
+    // shorter range than was asked for.
+    assert_eq!(references.entries.len(), 3);
+    assert_eq!(
+        references
+            .entries
+            .iter()
+            .find(|entry| entry.number == 1)
+            .map(|entry| entry.value.as_str()),
+        Some("")
+    );
+}
+
+#[test]
+fn falls_back_from_hdr_to_xhdr() {
+    // The same arrangement OVER/XOVER already had: a server old enough to lack one
+    // spelling gets the other, and the answer is remembered.
+    let server = TestServer::with(
+        Corpus::sample(),
+        ServerConfig::new().capabilities(CapabilityProfile::NoOver),
+    )
+    .unwrap();
+    let mut client = connect(&server);
+    client
+        .select_group(&GroupName::parse("misc.test").unwrap())
+        .unwrap();
+
+    let subjects = client
+        .header_field(
+            &nntp_proto::HeaderName::parse("Subject").unwrap(),
+            Range::between(1, 3).into(),
+        )
+        .expect("XHDR should have answered");
+    assert_eq!(subjects.entries.len(), 3);
+}
+
+#[test]
+fn a_header_field_by_message_id_needs_no_selected_group() {
+    let server = TestServer::start().unwrap();
+    let mut client = connect(&server);
+
+    let entries = client
+        .header_field(
+            &nntp_proto::HeaderName::parse("Subject").unwrap(),
+            MessageId::parse("<root@test.invalid>").unwrap().into(),
+        )
+        .unwrap();
+
+    assert_eq!(entries.entries.len(), 1);
+    // RFC 3977 §8.5.2: the server sends 0 rather than a number it may not have.
+    assert_eq!(entries.entries[0].number, 0);
+    assert_eq!(entries.entries[0].value, "A plain test article");
+}
+
+#[test]
+fn a_header_field_range_without_a_group_is_refused_before_it_is_sent() {
+    let server = TestServer::start().unwrap();
+    let mut client = connect(&server);
+
+    let error = client
+        .header_field(
+            &nntp_proto::HeaderName::parse("Subject").unwrap(),
+            Range::between(1, 3).into(),
+        )
+        .unwrap_err();
+
+    assert!(
+        matches!(error, ClientError::NoGroupSelected { .. }),
+        "{error:?}"
+    );
+}
+
+#[test]
+fn lists_the_article_numbers_a_group_actually_holds() {
+    // The watermarks say which numbers a group spans; expiry leaves gaps, and LISTGROUP is
+    // the only way to know which of them exist. comp.lang.rust spans six numbers and
+    // holds two.
+    let server = TestServer::start().unwrap();
+    let mut client = connect(&server);
+
+    let (summary, numbers) = client
+        .article_numbers(Some(&GroupName::parse("comp.lang.rust").unwrap()), None)
+        .unwrap();
+
+    assert_eq!(summary.name.as_str(), "comp.lang.rust");
+    assert_eq!((summary.low, summary.high), (4237, 4242));
+    assert_eq!(numbers, vec![4237, 4242]);
+
+    // It selects the group, which is what the command does.
+    assert_eq!(
+        client.selected_group().map(|group| group.name.as_str()),
+        Some("comp.lang.rust")
+    );
+}
+
+#[test]
+fn walks_a_group_with_next_and_last() {
+    // How a group is read when the server offers no overview at all.
+    let server = TestServer::start().unwrap();
+    let mut client = connect(&server);
+    client
+        .select_group(&GroupName::parse("misc.test").unwrap())
+        .unwrap();
+
+    let second = client.next_article().unwrap();
+    assert_eq!(second.number, Some(2));
+
+    let back = client.previous_article().unwrap();
+    assert_eq!(back.number, Some(1));
+
+    // The start of the group is an error, not a silent stop.
+    let error = client.previous_article().unwrap_err();
+    assert!(!error.is_connection_fatal(), "{error:?}");
+}
+
+#[test]
+fn stepping_without_a_group_is_refused_before_it_is_sent() {
+    let server = TestServer::start().unwrap();
+    let mut client = connect(&server);
+
+    assert!(matches!(
+        client.next_article().unwrap_err(),
+        ClientError::NoGroupSelected { .. }
+    ));
+}
+
+#[test]
+fn reports_when_each_group_was_created() {
+    let server = TestServer::start().unwrap();
+    let mut client = connect(&server);
+
+    let times = client.group_creation_times(None).unwrap();
+
+    assert!(!times.entries.is_empty());
+    assert!(times.skipped.is_empty(), "{:?}", times.skipped);
+    assert!(
+        times
+            .entries
+            .iter()
+            .any(|entry| entry.name.as_str() == "misc.test")
+    );
+}
+
+#[test]
+fn reports_which_header_fields_hdr_accepts() {
+    let server = TestServer::start().unwrap();
+    let mut client = connect(&server);
+
+    let fields = client.available_header_fields().unwrap();
+
+    // A colon alone means "any field in the article" (RFC 3977 §8.6), which is the honest
+    // answer for a server that stores whole articles.
+    assert_eq!(fields, vec![":".to_owned()]);
+}
+
+#[test]
+fn lists_groups_created_since_a_date() {
+    let server = TestServer::start().unwrap();
+    let mut client = connect(&server);
+
+    // The corpus dates its groups to 2001-09-09, so a date before that finds them all and
+    // a date after finds none. The timestamp is the *server's* clock, which is why this is
+    // an absolute date rather than "an hour ago".
+    let long_ago = chrono::DateTime::from_timestamp(1_000_000_000 - 86_400, 0).expect("a date");
+    let recently = chrono::DateTime::from_timestamp(1_000_000_000 + 86_400, 0).expect("a date");
+
+    let all = client.new_groups(long_ago).unwrap();
+    assert!(!all.entries.is_empty());
+    assert!(all.skipped.is_empty(), "{:?}", all.skipped);
+
+    let none = client.new_groups(recently).unwrap();
+    assert!(
+        none.entries.is_empty(),
+        "nothing was created after the corpus's dates: {:?}",
+        none.entries
+    );
+}

@@ -810,3 +810,96 @@ fn fetching_by_message_id_works_without_a_selected_group() {
     let _ = client.quit();
     let _ = fresh.quit();
 }
+
+/// `HDR References` agrees with `OVER`, on a real server.
+///
+/// The pairing that matters. Threading wants `References` for a whole range, and `HDR` is a
+/// fraction of `OVER`'s bytes for exactly that — but only if the two agree. A server whose
+/// overview database is stale, or whose `XHDR` reads a different field, would thread
+/// differently depending on which command the reader happened to use, and no offline
+/// fixture can catch that because both sides of it would be ours.
+///
+/// The counts are the finding, as with every other test in this file.
+#[test]
+#[ignore = "needs a real news server; see the module documentation"]
+fn real_hdr_agrees_with_over_about_references() {
+    let (settings, mut client) = connect();
+    let summary = select_group(&mut client, &settings);
+    let Some((low, high)) = summary.range() else {
+        panic!("{} is empty", settings.group);
+    };
+
+    let first = high.saturating_sub(199).max(low);
+    let range = Range::between(first, high);
+
+    let over = client.overview(range).expect("OVER");
+    let hdr = client
+        .header_field(
+            &nntp_proto::HeaderName::parse("References").expect("a header name"),
+            range.into(),
+        )
+        .expect("HDR References");
+
+    eprintln!(
+        "{}: {} records from OVER, {} lines from HDR over {}",
+        settings.group,
+        over.entries.len(),
+        hdr.entries.len(),
+        range.to_argument()
+    );
+    if !hdr.skipped.is_empty() {
+        eprintln!("  {} HDR line(s) could not be parsed", hdr.skipped.len());
+    }
+
+    let by_number: std::collections::BTreeMap<u64, &str> = hdr
+        .entries
+        .iter()
+        .map(|entry| (entry.number, entry.value.as_str()))
+        .collect();
+
+    let mut compared = 0usize;
+    let mut disagreed = Vec::new();
+
+    for record in &over.entries {
+        let Some(from_hdr) = by_number.get(&record.number) else {
+            // A server may omit an article from one response and not the other if it
+            // expired between the two commands. Not a disagreement about its content.
+            continue;
+        };
+        compared += 1;
+
+        // Compared as the *set* of message-ids rather than as text: whitespace and folding
+        // differ legitimately between the two responses, and only the ids mean anything.
+        let over_ids: Vec<&str> = record.references.iter().map(MessageId::as_str).collect();
+        let hdr_ids: Vec<String> = nntp_proto::MessageId::parse_list(from_hdr)
+            .iter()
+            .map(|id| id.as_str().to_owned())
+            .collect();
+
+        if over_ids != hdr_ids.iter().map(String::as_str).collect::<Vec<_>>() {
+            disagreed.push((record.number, over_ids.join(" "), from_hdr.to_owned()));
+        }
+    }
+
+    eprintln!(
+        "  {compared} article(s) compared, {} disagreed",
+        disagreed.len()
+    );
+    for (number, from_over, from_hdr) in disagreed.iter().take(5) {
+        eprintln!("  article {number}:\n    OVER: {from_over}\n    HDR:  {from_hdr}");
+    }
+
+    assert!(
+        compared > 0,
+        "nothing could be compared: OVER returned {} records and HDR {} lines",
+        over.entries.len(),
+        hdr.entries.len()
+    );
+    assert!(
+        disagreed.is_empty(),
+        "{} article(s) thread differently depending on which command was used",
+        disagreed.len()
+    );
+
+    let _ = client.quit();
+}

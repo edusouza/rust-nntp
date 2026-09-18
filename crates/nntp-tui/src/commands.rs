@@ -158,6 +158,19 @@ pub fn doctor(config: &Config, args: &ServerArgs, group: Option<&str>) -> anyhow
         Err(error) => writeln!(out, "overview fmt: unavailable — {error}")?,
     }
 
+    // What `HDR` will accept, which decides whether one header can be fetched across a
+    // range — much cheaper than `OVER` when only `References` is wanted. A server that
+    // does not implement `LIST HEADERS` is not a problem, so it is reported and not
+    // dwelt on.
+    match client.available_header_fields() {
+        Ok(fields) if fields == [":"] => {
+            writeln!(out, "hdr fields:  any header in the article")?;
+        }
+        Ok(fields) if fields.is_empty() => writeln!(out, "hdr fields:  none reported")?,
+        Ok(fields) => writeln!(out, "hdr fields:  {}", fields.join(", "))?,
+        Err(error) => writeln!(out, "hdr fields:  unavailable — {error}")?,
+    }
+
     if let Some(name) = group {
         probe_group(&mut client, name, out)?;
     }

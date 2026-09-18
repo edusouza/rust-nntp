@@ -6,9 +6,9 @@ use chrono::{DateTime, Utc};
 use nntp_proto::block::DataBlock;
 use nntp_proto::response::codes;
 use nntp_proto::{
-    ActiveEntry, Article, ArticleSpec, Capabilities, Command, Draft, GroupName, GroupSummary,
-    ListKeyword, ListResult, MessageId, NewsgroupEntry, OverviewFmt, OverviewRecord, Range,
-    RangeOrId, ResponseCode, StatusLine, Wildmat, date,
+    ActiveEntry, ActiveTimesEntry, Article, ArticleSpec, Capabilities, Command, Draft, GroupName,
+    GroupSummary, HeaderEntry, HeaderName, ListKeyword, ListResult, MessageId, NewsgroupEntry,
+    OverviewFmt, OverviewRecord, Range, RangeOrId, ResponseCode, StatusLine, Wildmat, date,
 };
 
 use crate::connection::Connection;
@@ -55,6 +55,23 @@ enum OverviewStyle {
     Unavailable,
 }
 
+/// Which spelling of "one header across a range" this server answers.
+///
+/// The same shape as [`OverviewStyle`] and for the same reason: `HDR` is RFC 3977 and
+/// `XHDR` is what came before it, servers vary, and the answer is worth remembering rather
+/// than rediscovering on every request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HeaderStyle {
+    /// Not yet determined.
+    Unknown,
+    /// RFC 3977 `HDR`.
+    Hdr,
+    /// RFC 2980 `XHDR`.
+    XHdr,
+    /// Neither is available.
+    Unavailable,
+}
+
 /// An article's identity as reported by a status line: `223 number message-id`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ArticleId {
@@ -92,6 +109,7 @@ pub struct Client<S> {
     group: Option<GroupSummary>,
     overview_fmt: Option<OverviewFmt>,
     overview_style: OverviewStyle,
+    header_style: HeaderStyle,
 }
 
 impl<S: Read + Write> Client<S> {
@@ -138,6 +156,7 @@ impl<S: Read + Write> Client<S> {
             group: None,
             overview_fmt: None,
             overview_style: OverviewStyle::Unknown,
+            header_style: HeaderStyle::Unknown,
         })
     }
 
@@ -159,6 +178,7 @@ impl<S: Read + Write> Client<S> {
             group: None,
             overview_fmt: None,
             overview_style: OverviewStyle::Unknown,
+            header_style: HeaderStyle::Unknown,
         }
     }
 
@@ -654,6 +674,317 @@ impl<S: Read + Write> Client<S> {
             return Err(ClientError::from_status("HELP", &line));
         }
         Ok(self.connection.read_block()?.to_text())
+    }
+
+    /// Fetches one header field across a range, a line at a time (`HDR`, RFC 3977 §8.5).
+    ///
+    /// The cheap way to ask a question about many articles at once. `OVER` returns eight
+    /// fields per article; when only `References` is wanted — threading a whole group is
+    /// the case this exists for — `HDR References low-high` is a fraction of the bytes.
+    ///
+    /// Falls back to `XHDR` when the server does not know `HDR`, remembering the answer,
+    /// exactly as [`Self::overview_streaming`] does for `OVER`.
+    ///
+    /// # Errors
+    ///
+    /// [`ClientError::NoGroupSelected`] for a range with no group selected,
+    /// [`ClientError::CommandNotSupported`] when the server has neither spelling, and
+    /// connection failures.
+    pub fn header_field_streaming(
+        &mut self,
+        field: &HeaderName,
+        target: RangeOrId,
+        mut on_entry: impl FnMut(core::result::Result<HeaderEntry, String>),
+    ) -> Result<()> {
+        // A range names articles in the selected group; a message-id names one anywhere.
+        let needs_group = !matches!(target, RangeOrId::MessageId(_));
+        if needs_group && self.group.is_none() {
+            return Err(ClientError::NoGroupSelected { command: "HDR" });
+        }
+
+        let style = match self.header_style {
+            HeaderStyle::Unknown if self.capabilities.has_hdr() => HeaderStyle::Hdr,
+            // A capability list that answers and omits HDR is a server that means it.
+            HeaderStyle::Unknown if !self.capabilities.is_empty() => HeaderStyle::XHdr,
+            other => other,
+        };
+
+        let (command, name) = match style {
+            HeaderStyle::XHdr => (
+                Command::XHdr {
+                    field: field.clone(),
+                    target: target.clone(),
+                },
+                "XHDR",
+            ),
+            HeaderStyle::Unavailable => {
+                return Err(ClientError::CommandNotSupported { command: "HDR" });
+            }
+            HeaderStyle::Hdr | HeaderStyle::Unknown => (
+                Command::Hdr {
+                    field: field.clone(),
+                    target: target.clone(),
+                },
+                "HDR",
+            ),
+        };
+
+        let line = self.connection.command(&command)?;
+
+        // Either code from either spelling. RFC 3977 §8.5.2 gives `HDR` its own `225`
+        // while RFC 2980 §2.9 had `XHDR` share `221` with `HEAD`, and servers have been
+        // seen to answer the other one; insisting on the letter of the newer document
+        // would refuse a response that is perfectly usable.
+        if matches!(line.code, codes::HEADERS_FOLLOW | codes::HEAD_FOLLOWS) {
+            self.header_style = match style {
+                HeaderStyle::XHdr => HeaderStyle::XHdr,
+                _ => HeaderStyle::Hdr,
+            };
+            self.connection.read_block_streaming(|raw| {
+                on_entry(
+                    HeaderEntry::parse(raw)
+                        .ok_or_else(|| String::from_utf8_lossy(raw).into_owned()),
+                );
+            })?;
+            return Ok(());
+        }
+
+        // As with OVER: only 500 and 503 say anything about the *command*. A 501 is a
+        // complaint about these arguments and must not disable the feature for the session.
+        let verb_unsupported = matches!(
+            line.code,
+            codes::UNKNOWN_COMMAND | codes::FEATURE_NOT_SUPPORTED
+        );
+
+        if verb_unsupported && name == "HDR" {
+            tracing::debug!("server does not implement HDR; falling back to XHDR");
+            self.header_style = HeaderStyle::XHdr;
+            return self.header_field_streaming(field, target, on_entry);
+        }
+        if verb_unsupported {
+            tracing::debug!("server implements neither HDR nor XHDR");
+            self.header_style = HeaderStyle::Unavailable;
+        }
+
+        Err(ClientError::from_status(name, &line))
+    }
+
+    /// Fetches one header field across a range, collected.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::header_field_streaming`].
+    pub fn header_field(
+        &mut self,
+        field: &HeaderName,
+        target: RangeOrId,
+    ) -> Result<ListResult<HeaderEntry>> {
+        let mut entries = Vec::new();
+        let mut skipped = Vec::new();
+
+        self.header_field_streaming(field, target, |entry| match entry {
+            Ok(entry) => entries.push(entry),
+            Err(line) => skipped.push(line),
+        })?;
+
+        Ok(ListResult { entries, skipped })
+    }
+
+    /// The article numbers a group actually holds (`LISTGROUP`, RFC 3977 §6.1.2).
+    ///
+    /// The watermarks say which numbers a group *spans*; expiry and cancellation leave
+    /// gaps, so this is the only way to know which of them exist. Selects the group as a
+    /// side effect, which is what the command does.
+    ///
+    /// # Errors
+    ///
+    /// [`ClientError::NoSuchGroup`], [`ClientError::NoGroupSelected`] when no group is
+    /// named and none is selected, and connection failures.
+    pub fn article_numbers(
+        &mut self,
+        group: Option<&GroupName>,
+        range: Option<Range>,
+    ) -> Result<(GroupSummary, Vec<u64>)> {
+        if group.is_none() && self.group.is_none() {
+            return Err(ClientError::NoGroupSelected {
+                command: "LISTGROUP",
+            });
+        }
+
+        let line = self.connection.command(&Command::ListGroup {
+            group: group.cloned(),
+            range,
+        })?;
+
+        if line.code != codes::GROUP_SELECTED {
+            return Err(match line.code {
+                codes::NO_SUCH_GROUP => ClientError::NoSuchGroup {
+                    group: group.map_or_else(
+                        || "the selected group".to_owned(),
+                        |group| group.as_str().to_owned(),
+                    ),
+                    text: line.text.clone(),
+                },
+                _ => ClientError::from_status("LISTGROUP", &line),
+            });
+        }
+
+        let summary = GroupSummary::parse(&line, group)?;
+        let block = self.connection.read_block()?;
+
+        // A line that is not a number is skipped rather than fatal: the numbers that did
+        // parse are still the truth about the group, and one malformed line is not worth
+        // losing them over.
+        let numbers = block
+            .lines()
+            .iter()
+            .filter_map(|line| std::str::from_utf8(line).ok()?.trim().parse::<u64>().ok())
+            .collect();
+
+        self.group = Some(summary.clone());
+        Ok((summary, numbers))
+    }
+
+    /// Steps to the next article in the selected group (`NEXT`, RFC 3977 §6.1.4).
+    ///
+    /// How a group is walked when the server offers no overview at all. The server tracks
+    /// the position, so this moves it.
+    ///
+    /// # Errors
+    ///
+    /// [`ClientError::NoGroupSelected`], [`ClientError::NoSuchArticle`] at the end of the
+    /// group, and connection failures.
+    pub fn next_article(&mut self) -> Result<ArticleId> {
+        self.step("NEXT", Command::Next)
+    }
+
+    /// Steps to the previous article in the selected group (`LAST`, RFC 3977 §6.1.3).
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::next_article`], at the start of the group.
+    pub fn previous_article(&mut self) -> Result<ArticleId> {
+        self.step("LAST", Command::Last)
+    }
+
+    fn step(&mut self, name: &'static str, command: Command) -> Result<ArticleId> {
+        if self.group.is_none() {
+            return Err(ClientError::NoGroupSelected { command: name });
+        }
+
+        let line = self.connection.command(&command)?;
+        if line.code != codes::ARTICLE_EXISTS {
+            return Err(ClientError::from_status(name, &line));
+        }
+        Ok(ArticleId::parse(&line))
+    }
+
+    /// When each group was created, and by whom (`LIST ACTIVE.TIMES`, RFC 3977 §7.6.4).
+    ///
+    /// Optional, and a server that does not keep the information says so with `503`.
+    ///
+    /// # Errors
+    ///
+    /// [`ClientError::CommandNotSupported`] when the server does not keep it, and
+    /// connection failures.
+    pub fn group_creation_times(
+        &mut self,
+        pattern: Option<&Wildmat>,
+    ) -> Result<ListResult<ActiveTimesEntry>> {
+        let command = Command::List(ListKeyword::ActiveTimes(pattern.cloned()));
+        let line = self.connection.command(&command)?;
+
+        if line.code != codes::INFORMATION_FOLLOWS {
+            return Err(match line.code {
+                codes::UNKNOWN_COMMAND | codes::FEATURE_NOT_SUPPORTED => {
+                    ClientError::CommandNotSupported {
+                        command: "LIST ACTIVE.TIMES",
+                    }
+                }
+                _ => ClientError::from_status("LIST ACTIVE.TIMES", &line),
+            });
+        }
+
+        let block = self.connection.read_block()?;
+        let mut entries = Vec::new();
+        let mut skipped = Vec::new();
+
+        for raw in block.lines() {
+            match ActiveTimesEntry::parse(raw) {
+                Ok(entry) => entries.push(entry),
+                Err(_) => skipped.push(String::from_utf8_lossy(raw).into_owned()),
+            }
+        }
+
+        Ok(ListResult { entries, skipped })
+    }
+
+    /// Which header fields `HDR` will accept (`LIST HEADERS`, RFC 3977 §8.6).
+    ///
+    /// A server may answer `:` alone, meaning "any field in the article", which is
+    /// returned as it arrived rather than expanded into a list nobody can enumerate.
+    ///
+    /// # Errors
+    ///
+    /// [`ClientError::CommandNotSupported`] when the server does not implement it, and
+    /// connection failures.
+    pub fn available_header_fields(&mut self) -> Result<Vec<String>> {
+        let line = self
+            .connection
+            .command(&Command::List(ListKeyword::Headers))?;
+
+        if line.code != codes::INFORMATION_FOLLOWS {
+            return Err(match line.code {
+                codes::UNKNOWN_COMMAND | codes::FEATURE_NOT_SUPPORTED => {
+                    ClientError::CommandNotSupported {
+                        command: "LIST HEADERS",
+                    }
+                }
+                _ => ClientError::from_status("LIST HEADERS", &line),
+            });
+        }
+
+        Ok(self
+            .connection
+            .read_block()?
+            .lines()
+            .iter()
+            .map(|line| String::from_utf8_lossy(line).trim().to_owned())
+            .filter(|line| !line.is_empty())
+            .collect())
+    }
+
+    /// Groups created since a moment in time (`NEWGROUPS`, RFC 3977 §7.3).
+    ///
+    /// The cheap half of keeping a group list fresh: a full `LIST ACTIVE` against a
+    /// full-feed server is megabytes, and this is usually nothing. It does not report
+    /// groups that have been *removed*, so a full refresh is still needed occasionally.
+    ///
+    /// The timestamp is compared against the **server's** clock, not this machine's, which
+    /// is why [`Self::server_date`] exists and why `doctor` reports the difference.
+    ///
+    /// # Errors
+    ///
+    /// Connection failures, or a server refusal.
+    pub fn new_groups(&mut self, since: DateTime<Utc>) -> Result<ListResult<ActiveEntry>> {
+        let line = self.connection.command(&Command::NewGroups(since))?;
+
+        if line.code != codes::NEW_GROUPS_FOLLOW {
+            return Err(ClientError::from_status("NEWGROUPS", &line));
+        }
+
+        let block = self.connection.read_block()?;
+        let mut entries = Vec::new();
+        let mut skipped = Vec::new();
+
+        for raw in block.lines() {
+            match ActiveEntry::parse(raw) {
+                Ok(entry) => entries.push(entry),
+                Err(_) => skipped.push(String::from_utf8_lossy(raw).into_owned()),
+            }
+        }
+
+        Ok(ListResult { entries, skipped })
     }
 
     /// Whether this connection can post at all, and why not if it cannot.
