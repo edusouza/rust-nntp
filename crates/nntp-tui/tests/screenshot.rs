@@ -90,8 +90,11 @@ fn representative_app() -> App {
         nntp_proto::GroupSummary::parse(&summary, None).unwrap(),
     )));
 
-    app.on_event(Event::Overview {
-        group: GroupName::parse("comp.lang.rust").unwrap(),
+    let group = GroupName::parse("comp.lang.rust").unwrap();
+    let token = app.begin_overview_fetch();
+    app.on_event(Event::OverviewChunk {
+        group: group.clone(),
+        token,
         records: vec![
             record(4237, "café and crates", "bjorn@example.no", ""),
             record(
@@ -103,6 +106,7 @@ fn representative_app() -> App {
         ],
         skipped: 0,
     });
+    app.on_event(Event::OverviewComplete { group, token });
 
     let block = DataBlock::parse(
         b"From: =?UTF-8?B?w4VzYSBMaW5kcXZpc3Q=?= <asa@example.se>\r\n\

@@ -52,6 +52,57 @@ pub fn decode_header_value(bytes: &[u8]) -> String {
     out
 }
 
+/// Encodes a header field value as RFC 2047 encoded words, if it needs it at all.
+///
+/// The mirror of [`decode_header_value`], and the reason it exists is posting: a header
+/// field is ASCII (RFC 5536 §2.2), so a subject written by somebody whose name or language
+/// has an accent in it cannot be sent verbatim. Plenty of servers would accept the raw
+/// bytes; sending them anyway would make this reader one of the programs that put mojibake
+/// into other people's newsreaders.
+///
+/// Pure ASCII is returned unchanged — wrapping `Re: hello` in an encoded word would be
+/// legal, unreadable in a client that does not decode it, and pointless.
+///
+/// "B" (base64) rather than "Q": "Q" is more readable for a value that is *mostly* ASCII,
+/// and unreadable the moment it is not, and having one encoder is worth more here than
+/// saving bytes on a subject line.
+pub fn encode_header_value(value: &str) -> String {
+    if value.is_ascii() {
+        return value.to_owned();
+    }
+
+    // RFC 2047 §2: an encoded word is at most 75 characters including the markers, and a
+    // long value becomes several of them separated by a space. 15 markers + 4/3 expansion
+    // leaves 45 input bytes per word, rounded down to a multiple of 3 so that no word ends
+    // in base64 padding it does not need.
+    const PREFIX: &str = "=?UTF-8?B?";
+    const SUFFIX: &str = "?=";
+    const BYTES_PER_WORD: usize = 45;
+
+    let mut words = Vec::new();
+    let mut chunk = Vec::new();
+
+    // Split on character boundaries, never in the middle of one: half a code point in one
+    // encoded word and half in the next decodes to a replacement character.
+    for character in value.chars() {
+        let mut buffer = [0u8; 4];
+        let encoded = character.encode_utf8(&mut buffer).as_bytes();
+        if chunk.len() + encoded.len() > BYTES_PER_WORD {
+            words.push(std::mem::take(&mut chunk));
+        }
+        chunk.extend_from_slice(encoded);
+    }
+    if !chunk.is_empty() {
+        words.push(chunk);
+    }
+
+    words
+        .iter()
+        .map(|chunk| format!("{PREFIX}{}{SUFFIX}", BASE64_STANDARD.encode(chunk)))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 /// Decodes bytes labelled with a charset name, such as a MIME `charset=` parameter.
 ///
 /// An unknown or absent label falls back to [`decode_8bit_lossy`]. The label may carry an
@@ -333,6 +384,55 @@ pub fn decode_base64(bytes: &[u8]) -> Option<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ascii_header_values_are_left_alone() {
+        assert_eq!(encode_header_value("Re: hello"), "Re: hello");
+        assert_eq!(encode_header_value(""), "");
+    }
+
+    #[test]
+    fn encoded_words_round_trip_through_the_decoder() {
+        // The pairing that matters: whatever this writes, this crate must be able to read.
+        for original in [
+            "café and crates",
+            "Åsa Lindqvist <asa@example.se>",
+            "Olá, tudo bem?",
+            "Ré: uma pergunta sobre ação",
+            "\u{4e2d}\u{6587}\u{4e3b}\u{9898}",
+            // Long enough to be split across several encoded words.
+            &"Mensagem com acentuação repetida ".repeat(8),
+        ] {
+            let encoded = encode_header_value(original);
+            assert!(encoded.is_ascii(), "{encoded}");
+            assert_eq!(
+                decode_header_value(encoded.as_bytes()),
+                *original,
+                "round trip failed for {original}"
+            );
+        }
+    }
+
+    #[test]
+    fn no_encoded_word_exceeds_the_seventy_five_character_limit() {
+        // RFC 2047 §2. A word over the limit is the kind of thing a strict server rejects
+        // and a lenient one passes on to somebody else's strict reader.
+        let long = "Assunto muito comprido com acentuação ".repeat(10);
+        for word in encode_header_value(&long).split(' ') {
+            assert!(word.len() <= 75, "{} characters: {word}", word.len());
+        }
+    }
+
+    #[test]
+    fn a_split_never_cuts_a_character_in_half() {
+        // Four-byte code points, deliberately: a naive split by byte count lands in the
+        // middle of one and each half decodes to a replacement character.
+        let emoji = "\u{1f600}".repeat(40);
+        assert_eq!(
+            decode_header_value(encode_header_value(&emoji).as_bytes()),
+            emoji
+        );
+    }
 
     #[test]
     fn passes_plain_ascii_through() {

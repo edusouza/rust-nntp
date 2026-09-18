@@ -45,6 +45,19 @@ impl Harness {
     }
 
     fn with_read_state(server: TestServer, read: ReadStore) -> Self {
+        Self::build(server, read, 500)
+    }
+
+    /// A harness whose worker splits overview fetches into `chunk`-sized pieces.
+    ///
+    /// The corpus is small, so the only way to see a fetch arrive in more than one piece
+    /// is to make the pieces small. The chunk size is a configuration key precisely
+    /// because what is sensible depends on the server.
+    fn with_chunk(server: TestServer, chunk: u64) -> Self {
+        Self::build(server, ReadStore::empty(PathBuf::from("unused")), chunk)
+    }
+
+    fn build(server: TestServer, read: ReadStore, chunk: u64) -> Self {
         let target = target_for(&server);
         let (request_tx, request_rx) = mpsc::channel();
         let (event_tx, event_rx) = mpsc::channel();
@@ -53,7 +66,7 @@ impl Harness {
 
         // The harness shares the app's cancel flag with the worker, exactly as the run
         // loop does, so a test can cancel the way a keystroke would.
-        worker::spawn(target, 500, request_rx, event_tx, app.cancel.clone())
+        worker::spawn(target, chunk, request_rx, event_tx, app.cancel.clone())
             .expect("spawn the worker");
 
         let initial = app.initial_requests();
@@ -78,7 +91,11 @@ impl Harness {
                 return;
             }
             match self.events.recv_timeout(Duration::from_millis(100)) {
-                Ok(event) => self.app.on_event(event),
+                Ok(event) => {
+                    for request in self.app.on_event(event) {
+                        self.requests.send(request).expect("send");
+                    }
+                }
                 Err(RecvTimeoutError::Timeout) => self.app.tick(),
                 Err(RecvTimeoutError::Disconnected) => break,
             }
@@ -151,6 +168,267 @@ fn loads_the_group_list_on_start_up() {
     );
     // Sparse numbering: the watermarks span six numbers for two articles.
     assert_eq!(rust.article_bound(), 6);
+}
+
+#[test]
+fn overview_records_arrive_in_pieces_newest_first() {
+    // #8. Two claims, and both are what a user actually sees: the article list fills
+    // while the fetch is still running, and the first thing to fill it is the newest end
+    // of the range — the part a reader came for.
+    let mut harness = Harness::with_chunk(serve(ServerConfig::new()), 1);
+    harness.settle("the group list", |app| !app.groups.is_empty());
+
+    harness.press(KeyCode::Char('/'));
+    harness.type_text("misc.test");
+    harness.press(KeyCode::Enter);
+    harness.press(KeyCode::Enter);
+
+    let mut chunks = 0usize;
+    let mut first_chunk = Vec::new();
+    let mut listed_before_the_end = 0usize;
+    let deadline = Instant::now() + TIMEOUT;
+
+    loop {
+        assert!(
+            Instant::now() < deadline,
+            "timed out after {chunks} chunk(s): {}",
+            harness.app.status
+        );
+
+        match harness.events.recv_timeout(Duration::from_millis(100)) {
+            Ok(event) => {
+                let finished = matches!(event, Event::OverviewComplete { .. });
+                if let Event::OverviewChunk { ref records, .. } = event {
+                    chunks += 1;
+                    if chunks == 1 {
+                        first_chunk = records.iter().map(|record| record.number).collect();
+                    }
+                }
+
+                harness.app.on_event(event);
+
+                if finished {
+                    break;
+                }
+                listed_before_the_end = listed_before_the_end.max(harness.app.articles.len());
+            }
+            Err(RecvTimeoutError::Timeout) => harness.app.tick(),
+            Err(RecvTimeoutError::Disconnected) => panic!("the worker stopped"),
+        }
+    }
+
+    assert!(chunks >= 2, "the fetch was not split: {chunks} chunk(s)");
+    assert_eq!(first_chunk, vec![3], "the newest chunk arrives first");
+    assert!(
+        listed_before_the_end > 0,
+        "nothing was listed until the fetch finished, which is the bug #8 is about"
+    );
+    assert_eq!(
+        harness
+            .app
+            .articles
+            .iter()
+            .map(|record| record.number)
+            .collect::<Vec<_>>(),
+        vec![1, 2, 3],
+        "and the assembled list is in article-number order"
+    );
+    assert_eq!(harness.app.selected_article().map(|r| r.number), Some(3));
+    assert_eq!(harness.app.inflight, 0);
+}
+
+#[test]
+fn a_reply_is_threaded_under_the_article_it_answers() {
+    // #10, end to end: the References header comes off a real OVER response rather than
+    // out of a fixture built by hand, which is the part the unit tests cannot say.
+    let mut harness = Harness::new(serve(ServerConfig::new()));
+    harness.settle("the group list", |app| !app.groups.is_empty());
+
+    harness.press(KeyCode::Char('/'));
+    harness.type_text("misc.test");
+    harness.press(KeyCode::Enter);
+    harness.press(KeyCode::Enter);
+    harness.settle("the article list", |app| app.articles.len() == 3);
+
+    let shape = |app: &App| -> Vec<(u64, usize)> {
+        app.article_rows()
+            .iter()
+            .filter_map(|row| app.articles.get(row.index).map(|r| (r.number, row.depth)))
+            .collect()
+    };
+
+    // Article 2 replies to article 1; article 3 refers to nothing.
+    assert_eq!(shape(&harness.app), vec![(1, 0), (2, 1), (3, 0)]);
+
+    // `z` folds the reply away and `t` drops back to a flat list.
+    harness.app.article_cursor = 0;
+    harness.press(KeyCode::Char('z'));
+    assert_eq!(shape(&harness.app), vec![(1, 0), (3, 0)]);
+
+    harness.press(KeyCode::Char('t'));
+    assert_eq!(shape(&harness.app), vec![(1, 0), (2, 0), (3, 0)]);
+}
+
+#[test]
+fn composes_a_follow_up_and_posts_it() {
+    // #11 end to end, minus the editor: the state machine pre-fills the follow-up, the
+    // worker offers it, and the fake server says what it received. What the editor would
+    // do — hand back edited text — is done here directly, because a test that spawns an
+    // editor tests the editor.
+    let mut harness = Harness::new(serve(ServerConfig::new()));
+    harness.app.from = Some("A Tester <tester@example.org>".to_owned());
+    harness.settle("the group list", |app| !app.groups.is_empty());
+
+    harness.press(KeyCode::Char('/'));
+    harness.type_text("misc.test");
+    harness.press(KeyCode::Enter);
+    harness.press(KeyCode::Enter);
+    harness.settle("the article list", |app| !app.articles.is_empty());
+
+    // Open the oldest article and follow up to it.
+    harness.app.article_cursor = 0;
+    harness.press(KeyCode::Enter);
+    harness.settle("the article", |app| app.article.is_some());
+
+    harness.press(KeyCode::Char('f'));
+    let request = harness
+        .app
+        .take_compose()
+        .expect("a follow-up should have been prepared");
+    assert!(
+        request.template.contains("Subject: Re: "),
+        "{}",
+        request.template
+    );
+    assert!(
+        request.template.contains("References: <root@test.invalid>"),
+        "the parent's message-id must be in the chain: {}",
+        request.template
+    );
+
+    // What the editor hands back.
+    let edited = format!("{}My answer.\n", request.template);
+    for outgoing in harness
+        .app
+        .on_composed(Some((edited, PathBuf::from("unused-draft"))))
+    {
+        harness.requests.send(outgoing).expect("send");
+    }
+
+    harness.settle("the posting", |app| {
+        app.messages
+            .iter()
+            .any(|message| message.contains("posted"))
+    });
+
+    let posted = harness._server.posted();
+    assert_eq!(posted.len(), 1, "{:?}", harness.app.messages);
+    assert_eq!(
+        posted[0].header("From").as_deref(),
+        Some("A Tester <tester@example.org>")
+    );
+    assert_eq!(posted[0].header("Newsgroups").as_deref(), Some("misc.test"));
+    assert!(
+        posted[0].header("References").is_some(),
+        "the reply must thread under its parent for everybody else too"
+    );
+    assert!(posted[0].body_text().contains("My answer."));
+    assert!(
+        posted[0].body_text().contains('>'),
+        "the parent should be quoted: {}",
+        posted[0].body_text()
+    );
+
+    // Posting into the group on screen reloads it, so the reader is briefly busy again.
+    harness.settle("the reload that follows a posting", |app| app.inflight == 0);
+}
+
+#[test]
+fn a_rejected_article_reports_the_servers_words_and_keeps_the_draft() {
+    let mut harness = Harness::new(
+        TestServer::with(
+            Corpus::sample(),
+            ServerConfig::new().quirks(Quirks {
+                refuse_post: Some("this group is moderated".to_owned()),
+                ..Quirks::default()
+            }),
+        )
+        .expect("start the server"),
+    );
+    harness.app.from = Some("A Tester <tester@example.org>".to_owned());
+    harness.settle("the group list", |app| !app.groups.is_empty());
+
+    for outgoing in harness.app.on_composed(Some((
+        "From: A Tester <tester@example.org>\n\
+         Newsgroups: misc.test\n\
+         Subject: Will be refused\n\
+         \n\
+         Body.\n"
+            .to_owned(),
+        PathBuf::from("/tmp/the-draft.article"),
+    ))) {
+        harness.requests.send(outgoing).expect("send");
+    }
+
+    harness.settle("the rejection", |app| {
+        app.messages
+            .iter()
+            .any(|message| message.contains("moderated"))
+    });
+
+    assert!(
+        harness
+            .app
+            .messages
+            .iter()
+            .any(|message| message.contains("the-draft.article")),
+        "the draft must still be findable: {:?}",
+        harness.app.messages
+    );
+    // The connection survived a refusal, so the reader is still usable.
+    assert!(harness.app.connected);
+    assert_eq!(harness.app.inflight, 0);
+}
+
+#[test]
+fn an_article_appears_in_the_list_after_it_is_posted() {
+    // "Why doesn't my message appear, even though it was posted?" — asked from a real
+    // session, and it had two causes. The server filed the article nowhere, and the
+    // article list is a snapshot of the last fetch, so even a server that kept it would
+    // not have shown it without a refetch. Both are the reader's problem to survive.
+    let mut harness = Harness::new(serve(ServerConfig::new()));
+    harness.app.from = Some("A Tester <tester@example.org>".to_owned());
+    harness.settle("the group list", |app| !app.groups.is_empty());
+
+    harness.press(KeyCode::Char('/'));
+    harness.type_text("misc.test");
+    harness.press(KeyCode::Enter);
+    harness.press(KeyCode::Enter);
+    harness.settle("the article list", |app| app.articles.len() == 3);
+
+    for outgoing in harness.app.on_composed(Some((
+        "From: A Tester <tester@example.org>\n\
+         Newsgroups: misc.test\n\
+         Subject: Something I just wrote\n\
+         \n\
+         And it should be on screen.\n"
+            .to_owned(),
+        PathBuf::from("unused-draft"),
+    ))) {
+        harness.requests.send(outgoing).expect("send");
+    }
+
+    harness.settle("the posted article to appear in the list", |app| {
+        app.articles
+            .iter()
+            .any(|record| record.subject == "Something I just wrote")
+    });
+
+    assert_eq!(harness.app.articles.len(), 4);
+
+    // The list shows it before the fetch has finished — that is #8 working — so settle
+    // the rest of the reload before asserting the reader is idle again.
+    harness.settle("the reload to finish", |app| app.inflight == 0);
 }
 
 #[test]

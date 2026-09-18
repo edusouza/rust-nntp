@@ -42,7 +42,7 @@ impl Target {
 /// Returns an error if no server can be identified: neither a configured one nor a
 /// `--host`.
 pub fn resolve(config: &Config, args: &ServerArgs) -> anyhow::Result<Target> {
-    let (label, mut server) = match config.server(args.server.as_deref()) {
+    let (label, server) = match config.server(args.server.as_deref()) {
         Ok((name, server)) => (name.to_owned(), server.clone()),
         // A --host on its own is enough; the configuration is then irrelevant.
         Err(error) => {
@@ -51,6 +51,24 @@ pub fn resolve(config: &Config, args: &ServerArgs) -> anyhow::Result<Target> {
             }
             ("command line".to_owned(), ServerConfig::default())
         }
+    };
+
+    // `--host` pointing somewhere else, with no `--server` naming whose settings to use,
+    // starts from nothing rather than from whichever server the configuration happened to
+    // supply. The credentials are the reason: they were given for *that* host, and a
+    // password for one server must not be offered to another because its name was typed on
+    // the command line. `--server es --host 127.0.0.1` still carries them, because naming
+    // the server is how a person says "those settings, this machine".
+    let (label, mut server) = match &args.host {
+        Some(host) if args.server.is_none() && *host != server.host => {
+            tracing::debug!(
+                configured = %server.host,
+                requested = %host,
+                "--host names another server; the configured credentials are not carried over"
+            );
+            ("command line".to_owned(), ServerConfig::default())
+        }
+        _ => (label, server),
     };
 
     if let Some(host) = &args.host {
@@ -65,6 +83,9 @@ pub fn resolve(config: &Config, args: &ServerArgs) -> anyhow::Result<Target> {
     }
     if let Some(security) = args.security_override() {
         server.security = security;
+    }
+    if let Some(from) = &args.from {
+        server.from = Some(from.clone());
     }
     if let Some(username) = &args.username {
         server.username = Some(username.clone());
@@ -179,6 +200,7 @@ mod tests {
             tls: false,
             starttls: false,
             no_tls: false,
+            from: None,
             username: None,
             password_command: None,
             password_env: None,
@@ -186,6 +208,30 @@ mod tests {
             ca_file: None,
             tls_server_name: None,
         }
+    }
+
+    #[test]
+    fn the_from_flag_overrides_the_configured_identity() {
+        // The case that made this necessary: a server given entirely on the command line
+        // has no configured identity to post as, so without the flag the reader can read
+        // from a fake server but cannot write to it.
+        let config = Config::default();
+        let target = resolve(
+            &config,
+            &ServerArgs {
+                host: Some("127.0.0.1".to_owned()),
+                port: Some(1119),
+                no_tls: true,
+                from: Some("A Tester <tester@example.org>".to_owned()),
+                ..ServerArgs::default()
+            },
+        )
+        .expect("resolve");
+
+        assert_eq!(
+            target.server.from.as_deref(),
+            Some("A Tester <tester@example.org>")
+        );
     }
 
     const CONFIGURED: &str = r#"
@@ -245,6 +291,71 @@ mod tests {
             target.server.password_command.as_deref(),
             Some("pass show news")
         );
+    }
+
+    #[test]
+    fn a_host_flag_does_not_carry_another_servers_credentials() {
+        // Found by pointing the reader at the local fake server with an Eternal September
+        // account in the configuration file: the reader tried to authenticate to
+        // 127.0.0.1 as `bob`. The plaintext guard refused, which is the only reason the
+        // password did not leave the machine — over `--tls` it would have.
+        //
+        // A password is given for one host. Naming another host on the command line is not
+        // permission to offer it there.
+        let target = resolve(
+            &config(CONFIGURED),
+            &ServerArgs {
+                host: Some("127.0.0.1".to_owned()),
+                port: Some(1119),
+                no_tls: true,
+                ..args()
+            },
+        )
+        .unwrap();
+
+        assert_eq!(target.label, "command line");
+        assert_eq!(target.server.host, "127.0.0.1");
+        assert_eq!(target.server.username, None, "the username went along");
+        assert_eq!(
+            target.server.password_command, None,
+            "the password went along"
+        );
+    }
+
+    #[test]
+    fn naming_the_server_is_how_credentials_are_carried_somewhere_else() {
+        // The counterpart, and the documented use: `--server es --host 127.0.0.1` is how
+        // somebody says "those settings, this machine" when reproducing a problem. Naming
+        // the server is the consent that `--host` on its own is not.
+        let target = resolve(
+            &config(CONFIGURED),
+            &ServerArgs {
+                server: Some("es".to_owned()),
+                host: Some("127.0.0.1".to_owned()),
+                no_tls: true,
+                ..args()
+            },
+        )
+        .unwrap();
+
+        assert_eq!(target.server.username.as_deref(), Some("bob"));
+    }
+
+    #[test]
+    fn a_host_flag_naming_the_configured_host_keeps_its_settings() {
+        // Same host, so nothing travels anywhere it was not already going: `--host` here
+        // is a way of confirming the target, not of redirecting it.
+        let target = resolve(
+            &config(CONFIGURED),
+            &ServerArgs {
+                host: Some("news.eternal-september.org".to_owned()),
+                ..args()
+            },
+        )
+        .unwrap();
+
+        assert_eq!(target.label, "es");
+        assert_eq!(target.server.username.as_deref(), Some("bob"));
     }
 
     #[test]

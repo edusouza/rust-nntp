@@ -51,6 +51,14 @@ pub struct ServerConfig {
     /// Whether and how to encrypt the connection.
     pub security: SecurityConfig,
 
+    /// Who to post as: the `From` header of anything written on this server.
+    ///
+    /// Per server, because an identity is. There is deliberately no default — a guess
+    /// assembled from the login name and the machine's host name is how articles end up
+    /// signed `user@localhost`, and a reader that will not post until told who you are is
+    /// better than one that posts as somebody who does not exist.
+    pub from: Option<String>,
+
     /// Username for `AUTHINFO USER`.
     pub username: Option<String>,
 
@@ -106,6 +114,7 @@ impl Default for ServerConfig {
             host: String::new(),
             port: None,
             security: SecurityConfig::default(),
+            from: None,
             username: None,
             password: None,
             password_command: None,
@@ -209,6 +218,13 @@ pub struct UiConfig {
     ///
     /// The `u` key toggles it either way; this is only the state the reader opens in.
     pub unread_only: bool,
+
+    /// Whether the article list starts grouped into conversations.
+    ///
+    /// On by default: a newsreader that shows replies next to what they reply to is what
+    /// `slrn`, `tin` and the rest have done for thirty years, and a flat list of a busy
+    /// group is a list of fragments. The `t` key switches either way.
+    pub threaded: bool,
 }
 
 impl Default for UiConfig {
@@ -219,6 +235,7 @@ impl Default for UiConfig {
             date_format: "%Y-%m-%d %H:%M".to_owned(),
             mark_read_on_open: true,
             unread_only: false,
+            threaded: true,
         }
     }
 }
@@ -402,6 +419,10 @@ read_timeout_secs = 60
 write_timeout_secs = 30
 
 # A second server, to show that several can coexist.
+# Who your articles are posted as. There is no default: a guess would put somebody
+# else's address on your posts.
+# from = "Your Name <you@example.org>"
+
 [servers.local-test]
 host = "127.0.0.1"
 port = 1119
@@ -423,6 +444,8 @@ date_format = "{date_format}"
 mark_read_on_open = {mark_read_on_open}
 # Whether the article list starts showing only unread articles. `u` toggles it.
 unread_only = {unread_only}
+# Whether the article list starts grouped into conversations. `t` toggles it.
+threaded = {threaded}
 "#,
             max_line_bytes = LimitsConfig::default().max_line_bytes,
             max_block_bytes = LimitsConfig::default().max_block_bytes,
@@ -432,6 +455,7 @@ unread_only = {unread_only}
             date_format = UiConfig::default().date_format,
             mark_read_on_open = UiConfig::default().mark_read_on_open,
             unread_only = UiConfig::default().unread_only,
+            threaded = UiConfig::default().threaded,
         )
     }
 }

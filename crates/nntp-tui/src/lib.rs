@@ -26,6 +26,7 @@
 
 pub mod cli;
 pub mod commands;
+pub mod compose;
 pub mod config;
 pub mod logging;
 pub mod readstate;
@@ -43,6 +44,8 @@ use crate::config::Config;
 /// identified, or if the chosen command fails. Failures carry an `anyhow` context chain,
 /// so printing with `{:#}` gives the whole story rather than just the last link.
 pub fn run(cli: &Cli) -> anyhow::Result<()> {
+    cli.check()?;
+
     // `config` is the one subcommand that must work without a valid configuration file:
     // it is how a broken one gets diagnosed.
     if let Some(Command::Config { action }) = &cli.command {
@@ -52,8 +55,8 @@ pub fn run(cli: &Cli) -> anyhow::Result<()> {
     let config = Config::load(cli.config.as_deref())?;
 
     match &cli.command {
-        // No subcommand: open the reader against the configured server.
-        None => open_reader(&config, &cli::ServerArgs::default()),
+        // No subcommand: open the reader, against whatever the top-level flags name.
+        None => open_reader(&config, &cli.server),
         Some(Command::Tui { server }) => open_reader(&config, server),
 
         Some(Command::Doctor { server, group }) => {

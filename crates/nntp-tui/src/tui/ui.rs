@@ -38,10 +38,20 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App) {
     draw_article(frame, app, article);
     draw_status(frame, app, status);
 
+    // The overlay clamps its own scroll, because how many lines a text occupies depends on
+    // wrapping and so on the width — which only the renderer knows. Reported back so that
+    // `End` leaves the position somewhere the next key press can move from.
     match app.overlay {
         Overlay::None => {}
-        Overlay::Help => draw_overlay(frame, "Keys", help_text(), body),
-        Overlay::Messages => draw_overlay(frame, "Messages", messages_text(app), body),
+        Overlay::Help => {
+            let scroll = draw_overlay(frame, app, "Keys", help_text(), body);
+            app.set_overlay_scroll(scroll);
+        }
+        Overlay::Messages => {
+            let text = messages_text(app);
+            let scroll = draw_overlay(frame, app, "Messages", text, body);
+            app.set_overlay_scroll(scroll);
+        }
     }
 }
 
@@ -156,21 +166,35 @@ fn draw_articles(frame: &mut Frame<'_>, app: &App, area: Rect) {
         }
     });
 
-    let visible = app.visible_articles();
+    let rows = app.article_rows();
+    let visible: Vec<usize> = rows.iter().map(|row| row.index).collect();
 
-    let items: Vec<ListItem<'_>> = visible
+    let items: Vec<ListItem<'_>> = rows
         .iter()
-        .filter_map(|index| app.articles.get(*index))
-        .map(|record| {
+        .filter_map(|row| app.articles.get(row.index).map(|record| (row, record)))
+        .map(|(row, record)| {
             let subject = if record.subject.is_empty() {
                 "(no subject)".to_owned()
             } else {
                 record.subject.clone()
             };
-            // A reply is marked rather than indented: real threads arrive out of order
-            // and with missing parents, so an indent would be a lie until v0.2 builds
-            // the tree properly.
-            let reply = if record.is_reply() { "› " } else { "  " };
+
+            // The indent is the thread. It is capped well below the algorithm's own
+            // depth limit because this pane is a third of the screen: past a few levels
+            // the subject would be pushed off the right-hand edge, and an unreadable
+            // subject costs more than a lost level of nesting.
+            const MAX_INDENT: usize = 6;
+            let indent = "  ".repeat(row.depth.min(MAX_INDENT));
+
+            // A folded thread says how much it is hiding. Without the number a fold is
+            // indistinguishable from a thread that simply has no replies.
+            let marker = if row.collapsed {
+                format!("+{} ", row.hidden)
+            } else if row.depth > 0 {
+                "\u{203a} ".to_owned()
+            } else {
+                "  ".to_owned()
+            };
 
             // Unread is marked, read is not. The other way round would put a mark on
             // almost every line in a group you follow, which is no mark at all.
@@ -184,7 +208,8 @@ fn draw_articles(frame: &mut Frame<'_>, app: &App, area: Rect) {
 
             ListItem::new(Line::from(vec![
                 Span::from(mark).fg(ACCENT),
-                Span::from(reply).dim(),
+                Span::from(indent).dim(),
+                Span::from(marker).dim(),
                 subject,
             ]))
         })
@@ -381,7 +406,13 @@ fn draw_status(frame: &mut Frame<'_>, app: &App, area: Rect) {
 }
 
 /// Draws a centred overlay over the panes.
-fn draw_overlay(frame: &mut Frame<'_>, title: &str, text: Text<'static>, area: Rect) {
+fn draw_overlay(
+    frame: &mut Frame<'_>,
+    app: &App,
+    title: &str,
+    text: Text<'static>,
+    area: Rect,
+) -> usize {
     // The overlay takes three quarters of the area, bounded to a readable size and then
     // bounded again by the terminal itself, so a window too small for the preferred
     // minimum still renders something instead of panicking.
@@ -407,6 +438,34 @@ fn draw_overlay(frame: &mut Frame<'_>, title: &str, text: Text<'static>, area: R
         height,
     };
 
+    // How much of it fits, so that a text taller than the overlay can be scrolled rather
+    // than silently cut off at the bottom. The lines are counted after wrapping, which is
+    // why this is here and not in the state machine.
+    let inner_width = centred.width.saturating_sub(2).max(1);
+    let inner_height = centred.height.saturating_sub(2) as usize;
+    let wrapped: usize = text
+        .lines
+        .iter()
+        .map(|line| {
+            let width = line.width().max(1);
+            width.div_ceil(inner_width as usize)
+        })
+        .sum();
+    let max_scroll = wrapped.saturating_sub(inner_height);
+    let scroll = app.overlay_scroll.min(max_scroll);
+
+    // A cut-off list that does not say it is cut off is the actual problem; the title is
+    // where a reader is already looking.
+    let title = if max_scroll > 0 {
+        format!(
+            " {title} — {}/{} lines, \u{2191}\u{2193} to scroll, Esc to close ",
+            (scroll + inner_height).min(wrapped),
+            wrapped
+        )
+    } else {
+        format!(" {title} — Esc to close ")
+    };
+
     // Clear first, or the panes show through the overlay.
     frame.render_widget(Clear, centred);
     frame.render_widget(
@@ -415,15 +474,18 @@ fn draw_overlay(frame: &mut Frame<'_>, title: &str, text: Text<'static>, area: R
                 Block::bordered()
                     .border_type(BorderType::Double)
                     .border_style(Style::new().fg(ACCENT))
-                    .title(format!(" {title} — Esc to close ")),
+                    .title(title),
             )
-            .wrap(Wrap { trim: false }),
+            .wrap(Wrap { trim: false })
+            .scroll((u16::try_from(scroll).unwrap_or(u16::MAX), 0)),
         centred,
     );
+
+    scroll
 }
 
 fn help_text() -> Text<'static> {
-    const ROWS: [(&str, &str); 18] = [
+    const ROWS: [(&str, &str); 22] = [
         ("Tab / Shift-Tab", "next / previous pane"),
         ("h l  ← →", "move focus left / right"),
         ("j k  ↓ ↑", "move down / up"),
@@ -433,6 +495,13 @@ fn help_text() -> Text<'static> {
         ("Enter", "open the group or article under the cursor"),
         ("n / p", "next / previous article, opening it"),
         ("u", "show only unread articles, or everything"),
+        ("t", "group the list into conversations, or show it flat"),
+        (
+            "z",
+            "fold the replies under the cursor away, or bring them back",
+        ),
+        ("w", "write a new article in the selected group"),
+        ("f", "follow up to the article on screen"),
         ("M", "mark the article under the cursor read / unread"),
         ("c", "catch up: mark the whole group read"),
         ("/", "filter groups by name or description"),
@@ -534,6 +603,28 @@ mod tests {
             .unwrap()
     }
 
+    /// Delivers a whole overview fetch the way the worker does: one chunk, then the
+    /// completion.
+    ///
+    /// Most tests care that the records end up listed, not about how many pieces they
+    /// arrived in; the tests that care about the pieces build the events themselves.
+    fn deliver_overview(
+        app: &mut App,
+        group: &str,
+        records: Vec<nntp_proto::OverviewRecord>,
+        skipped: usize,
+    ) {
+        let group = nntp_proto::GroupName::parse(group).unwrap();
+        let token = app.begin_overview_fetch();
+        app.on_event(Event::OverviewChunk {
+            group: group.clone(),
+            token,
+            records,
+            skipped,
+        });
+        app.on_event(Event::OverviewComplete { group, token });
+    }
+
     fn group_row(name: &str, low: u64, high: u64) -> GroupRow {
         GroupRow {
             name: nntp_proto::GroupName::parse(name).unwrap(),
@@ -622,15 +713,16 @@ mod tests {
             3,
         ))));
         app.read.mark_read("misc.test", 2);
-        app.on_event(Event::Overview {
-            group: nntp_proto::GroupName::parse("misc.test").unwrap(),
-            records: vec![
+        deliver_overview(
+            &mut app,
+            "misc.test",
+            vec![
                 overview_record(1, "unread one"),
                 overview_record(2, "already read"),
                 overview_record(3, "unread two"),
             ],
-            skipped: 0,
-        });
+            0,
+        );
 
         let screen = render(&mut app, 100, 20);
         assert!(screen.contains("•  unread one"), "{screen}");
@@ -641,6 +733,52 @@ mod tests {
     }
 
     #[test]
+    fn a_thread_is_drawn_indented_and_a_fold_says_what_it_hides() {
+        let mut app = app();
+        app.on_event(Event::GroupOpened(Box::new(group_summary(
+            "misc.test",
+            1,
+            3,
+        ))));
+
+        let group = nntp_proto::GroupName::parse("misc.test").unwrap();
+        let token = app.begin_overview_fetch();
+        let reply = |number: u64, subject: &str, references: &str| {
+            let line = format!("{number}\t{subject}\ta@x\t\t<{number}@x>\t{references}\t10\t1");
+            nntp_proto::OverviewRecord::parse(line.as_bytes(), &nntp_proto::OverviewFmt::standard())
+                .unwrap()
+        };
+        app.on_event(Event::OverviewChunk {
+            group: group.clone(),
+            token,
+            records: vec![
+                reply(1, "the question", ""),
+                reply(2, "Re: the question", "<1@x>"),
+            ],
+            skipped: 0,
+        });
+        app.on_event(Event::OverviewComplete { group, token });
+
+        let screen = render(&mut app, 100, 20);
+        assert!(
+            screen.contains("\u{2022}  \u{203a} Re: the question"),
+            "the reply should be indented under its parent\n{screen}"
+        );
+
+        // Folded, the reply is gone and the count is on the parent's line.
+        app.focus = Pane::Articles;
+        app.article_cursor = 0;
+        app.on_key(ratatui::crossterm::event::KeyEvent::new(
+            ratatui::crossterm::event::KeyCode::Char('z'),
+            ratatui::crossterm::event::KeyModifiers::NONE,
+        ));
+
+        let screen = render(&mut app, 100, 20);
+        assert!(screen.contains("+1 the question"), "{screen}");
+        assert!(!screen.contains("Re: the question"), "{screen}");
+    }
+
+    #[test]
     fn a_finished_group_under_the_unread_filter_says_so() {
         let mut app = app();
         app.on_event(Event::GroupOpened(Box::new(group_summary(
@@ -648,11 +786,12 @@ mod tests {
             1,
             2,
         ))));
-        app.on_event(Event::Overview {
-            group: nntp_proto::GroupName::parse("misc.test").unwrap(),
-            records: vec![overview_record(1, "one"), overview_record(2, "two")],
-            skipped: 0,
-        });
+        deliver_overview(
+            &mut app,
+            "misc.test",
+            vec![overview_record(1, "one"), overview_record(2, "two")],
+            0,
+        );
         app.read.mark_range_read("misc.test", 1, 2);
         app.unread_only = true;
 
@@ -739,7 +878,44 @@ mod tests {
         let screen = render(&mut app, 100, 24);
         assert!(screen.contains("Keys"), "{screen}");
         assert!(screen.contains("Esc to close"), "{screen}");
-        assert!(screen.contains("filter groups"), "{screen}");
+        assert!(screen.contains("next / previous pane"), "{screen}");
+    }
+
+    #[test]
+    fn a_help_list_taller_than_the_terminal_can_be_scrolled_and_says_so() {
+        // The key list outgrew a 24-line terminal, which plenty of people still use. An
+        // overlay that cuts off its bottom third without a word is worse than no help.
+        let mut app = app();
+        app.overlay = Overlay::Help;
+
+        let screen = render(&mut app, 100, 24);
+        assert!(screen.contains("to scroll"), "{screen}");
+        // The last row of the list. Not "quit": the status bar says that too.
+        let last_row = "Ctrl-C";
+        assert!(
+            !screen.contains(last_row),
+            "the end should be off-screen: {screen}"
+        );
+
+        app.on_key(ratatui::crossterm::event::KeyEvent::new(
+            ratatui::crossterm::event::KeyCode::End,
+            ratatui::crossterm::event::KeyModifiers::NONE,
+        ));
+        let screen = render(&mut app, 100, 24);
+        assert!(
+            screen.contains(last_row),
+            "scrolling to the end shows it: {screen}"
+        );
+    }
+
+    #[test]
+    fn a_help_list_that_fits_says_nothing_about_scrolling() {
+        let mut app = app();
+        app.overlay = Overlay::Help;
+
+        let screen = render(&mut app, 100, 40);
+        assert!(!screen.contains("to scroll"), "{screen}");
+        assert!(screen.contains("Ctrl-C"), "{screen}");
     }
 
     #[test]

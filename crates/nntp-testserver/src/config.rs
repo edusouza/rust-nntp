@@ -4,6 +4,8 @@
 //! Every quirk here was chosen because a real server does it and a client that assumes
 //! otherwise breaks against it.
 
+use std::time::Duration;
+
 /// What the server sends as its opening banner.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GreetingMode {
@@ -45,6 +47,12 @@ pub struct Quirks {
     /// Real servers do this, and a client that only ever sends the open form then sees an
     /// empty group.
     pub reject_open_ended_ranges: bool,
+
+    /// Refuse every article offered to `POST` with `441` and this text.
+    ///
+    /// The refusal a client has to survive: the article was read in full and then turned
+    /// down, so the connection is fine and the draft must not be lost.
+    pub refuse_post: Option<String>,
 
     /// Close the connection after this many commands, mid-session.
     pub close_after_commands: Option<usize>,
@@ -94,6 +102,15 @@ pub struct ServerConfig {
     /// makes the server advertise an upgrade it cannot perform, which is itself a useful
     /// thing to test.
     pub starttls: bool,
+
+    /// How long a connection may sit idle before the server closes it.
+    ///
+    /// Short by default because the accept loop joins its session threads at shutdown, so
+    /// a test whose client goes away would otherwise hold the whole suite for as long as
+    /// this. Thirty seconds is the wrong number for a *person*, though: reading one
+    /// article takes longer than that, and the standalone binary sets a value measured in
+    /// minutes for exactly that reason.
+    pub idle_timeout: Duration,
 }
 
 /// A username and password the server will accept.
@@ -115,6 +132,7 @@ impl Default for ServerConfig {
             quirks: Quirks::default(),
             server_name: "test.invalid".to_owned(),
             starttls: false,
+            idle_timeout: Duration::from_secs(30),
         }
     }
 }
@@ -154,6 +172,13 @@ impl ServerConfig {
     #[must_use]
     pub fn quirks(mut self, quirks: Quirks) -> Self {
         self.quirks = quirks;
+        self
+    }
+
+    /// Sets how long a connection may sit idle before it is closed.
+    #[must_use]
+    pub const fn idle_timeout(mut self, idle_timeout: Duration) -> Self {
+        self.idle_timeout = idle_timeout;
         self
     }
 

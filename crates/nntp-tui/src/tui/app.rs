@@ -5,16 +5,17 @@
 //! nothing here blocks. That is what makes the behaviour testable — the tests at the
 //! bottom of this file drive the whole reader without a terminal or a socket.
 
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
+use std::path::PathBuf;
 
-use nntp_proto::{ArticleSpec, GroupSummary, OverviewRecord, Range};
+use nntp_proto::{ArticleSpec, GroupSummary, OverviewRecord, Range, ThreadNode};
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use nntp_client::Cancel;
 
 use crate::config::UiConfig;
 use crate::readstate::ReadStore;
-use crate::tui::protocol::{Event, GroupRow, Request};
+use crate::tui::protocol::{Event, FetchToken, GroupRow, Request};
 
 /// How many messages to keep for the message pane.
 const LOG_CAPACITY: usize = 200;
@@ -95,6 +96,22 @@ pub struct ArticleView {
     /// Only that one is *present*: nothing here verifies anything, and a reader implying
     /// otherwise would be worse than one that stays quiet.
     pub signed: bool,
+
+    /// The article's own message-id, for the `References` chain of a follow-up.
+    pub message_id: Option<nntp_proto::MessageId>,
+    /// The chain it already carries, oldest first.
+    pub references: Vec<nntp_proto::MessageId>,
+    /// Where a follow-up should go: `Followup-To` if the author set one, otherwise the
+    /// groups the article was posted to.
+    ///
+    /// Resolved here rather than at the point of composing, because it is a fact about the
+    /// article and RFC 5536 §3.2.6 is easy to get wrong twice.
+    pub followup_groups: Vec<String>,
+    /// Whether `Followup-To: poster` asked for a mail reply rather than a posting.
+    ///
+    /// This reader cannot send mail, so a follow-up is refused rather than quietly posted
+    /// to a group the author asked it not to go to.
+    pub followup_to_poster: bool,
 }
 
 impl ArticleView {
@@ -146,6 +163,25 @@ impl ArticleView {
             body.push("(no text in this article)".to_owned());
         }
 
+        // RFC 5536 §3.2.6: Followup-To names where replies go, and the reserved value
+        // `poster` means "mail me instead, do not post".
+        let followup_to = article.headers.get_decoded("Followup-To");
+        let followup_to_poster = followup_to
+            .as_deref()
+            .is_some_and(|value| value.trim().eq_ignore_ascii_case("poster"));
+
+        let groups_header = if followup_to_poster {
+            None
+        } else {
+            followup_to.or_else(|| article.headers.get_decoded("Newsgroups"))
+        };
+        let followup_groups = groups_header
+            .unwrap_or_default()
+            .split(',')
+            .map(|group| group.trim().to_owned())
+            .filter(|group| !group.is_empty())
+            .collect();
+
         Self {
             number: article.number,
             subject: article.subject(),
@@ -155,8 +191,43 @@ impl ArticleView {
             body,
             attachments,
             signed: article.is_signed(),
+            message_id: article.message_id(),
+            references: article.references(),
+            followup_groups,
+            followup_to_poster,
         }
     }
+}
+
+/// An article the user has asked to write.
+///
+/// Carries the text the editor should open with. Everything the reader knows how to fill
+/// in — who from, which group, what it answers, what it quotes — is filled in here, so the
+/// editor opens on something closer to finished than to blank.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ComposeRequest {
+    /// The text to open the editor on.
+    pub template: String,
+    /// What is being written, for the status line: `a new article` or `a follow-up`.
+    pub what: &'static str,
+}
+
+/// One line of the article pane.
+///
+/// Flat and threaded views produce the same kind of row; only `depth` and the fold fields
+/// differ, so the renderer has one code path and the state machine has one cursor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ArticleRow {
+    /// Index into `App::articles`.
+    pub index: usize,
+    /// How far to indent: 0 for a thread root, and always 0 in the flat view.
+    pub depth: usize,
+    /// Replies folded away under this row, or 0 if none are.
+    pub hidden: usize,
+    /// Whether this article has replies at all, folded or not.
+    pub has_replies: bool,
+    /// Whether this article's replies are folded away.
+    pub collapsed: bool,
 }
 
 /// The whole interface state.
@@ -166,6 +237,12 @@ pub struct App {
     pub focus: Pane,
     /// What is covering the layout.
     pub overlay: Overlay,
+    /// First visible line of the overlay.
+    ///
+    /// The key list outgrew a 24-line terminal, which is still the size of a great many
+    /// of them. An overlay that silently cuts off the bottom third of the help is worse
+    /// than no help.
+    pub overlay_scroll: usize,
 
     /// Every group the server carries.
     pub groups: Vec<GroupRow>,
@@ -185,6 +262,33 @@ pub struct App {
     pub article_cursor: usize,
     /// Whether the article list hides articles that have been read.
     pub unread_only: bool,
+    /// Whether the article list is grouped into conversations.
+    pub threaded: bool,
+    /// The threads [`Self::articles`] falls into, rebuilt whenever the records change.
+    ///
+    /// Cached rather than computed per draw: threading is the one derived value in here
+    /// that is not linear in the number of records, and the article pane is redrawn on
+    /// every keystroke.
+    threads: Vec<ThreadNode>,
+    /// Article numbers whose replies are folded away, by number rather than by index
+    /// because a refetch changes indices and a reader's folds should survive one.
+    collapsed: HashSet<u64>,
+
+    /// The overview fetch whose records the article list is showing.
+    ///
+    /// Records arrive in chunks, so the list is assembled over time and something has to
+    /// say which fetch is being assembled. `None` means no fetch is outstanding and any
+    /// chunk that turns up belongs to one that has been superseded.
+    overview_token: Option<FetchToken>,
+    /// Mints the next token. Monotonic, never reused within a run.
+    next_token: u64,
+    /// Chunks accepted for [`Self::overview_token`] so far.
+    overview_chunks: usize,
+    /// Unparsable overview lines seen so far for [`Self::overview_token`].
+    ///
+    /// Accumulated rather than reported per chunk: a malformed group would otherwise
+    /// produce one message per chunk, and the interesting number is the total.
+    overview_skipped: usize,
 
     /// Which articles have been read, per group.
     ///
@@ -210,6 +314,30 @@ pub struct App {
     pub error: Option<String>,
     /// Recent messages, newest first.
     pub messages: VecDeque<String>,
+
+    /// A composing session the run loop has not started yet.
+    ///
+    /// The state machine decides *what* to compose and pre-fills it; running an editor is
+    /// IO and belongs to the run loop, which is the only part that owns the terminal
+    /// (ADR-0008). Taken with [`Self::take_compose`].
+    pub compose: Option<ComposeRequest>,
+    /// The groups the article being posted is addressed to.
+    ///
+    /// Kept so that the list can be refreshed when it lands in the group on screen: the
+    /// article list is a snapshot of the last fetch, so without this the article a person
+    /// has just written is the one article missing from it.
+    posting_groups: Vec<String>,
+    /// The draft file behind the article currently being posted.
+    ///
+    /// Held until the server accepts it. Anything else — a rejection, a dropped
+    /// connection, a crash — leaves the file where it is, which is how a draft survives.
+    pub posting: Option<PathBuf>,
+    /// Who articles are posted as.
+    ///
+    /// Per server rather than global, because an identity is: the address you post from on
+    /// a private server is rarely the one you post from on a public one. Set by the run
+    /// loop from the resolved server, the same way [`Self::cancel`] is.
+    pub from: Option<String>,
 
     /// How many requests are outstanding, for the spinner.
     pub inflight: usize,
@@ -248,6 +376,7 @@ impl App {
         Self {
             focus: Pane::Groups,
             overlay: Overlay::None,
+            overlay_scroll: 0,
             groups: Vec::new(),
             group_cursor: 0,
             filter: String::new(),
@@ -256,6 +385,13 @@ impl App {
             articles: Vec::new(),
             article_cursor: 0,
             unread_only: config.unread_only,
+            threaded: config.threaded,
+            threads: Vec::new(),
+            collapsed: HashSet::new(),
+            overview_token: None,
+            next_token: 0,
+            overview_chunks: 0,
+            overview_skipped: 0,
             read,
             article: None,
             body_scroll: 0,
@@ -265,6 +401,10 @@ impl App {
             status: "connecting…".to_owned(),
             error: None,
             messages: VecDeque::new(),
+            compose: None,
+            posting: None,
+            posting_groups: Vec::new(),
+            from: None,
             inflight: 0,
             cancel: Cancel::new(),
             spinner: 0,
@@ -315,20 +455,101 @@ impl App {
 
     /// Indices into [`Self::articles`] that the article list shows, in order.
     ///
-    /// Everything unless [`Self::unread_only`] is on, in which case only the unread. The
-    /// same shape as [`Self::visible_groups`], deliberately: one filtering pattern in the
-    /// interface rather than two.
+    /// Everything unless [`Self::unread_only`] is on, in which case only the unread, and
+    /// in thread order when [`Self::threaded`] is on. The same shape as
+    /// [`Self::visible_groups`], deliberately: one filtering pattern in the interface
+    /// rather than two, and one thing the cursor is an index into.
     pub fn visible_articles(&self) -> Vec<usize> {
-        if !self.unread_only {
-            return (0..self.articles.len()).collect();
+        self.article_rows()
+            .into_iter()
+            .map(|row| row.index)
+            .collect()
+    }
+
+    /// The article list as rows to draw, in order.
+    ///
+    /// The threaded and flat views differ only here; everything else — the cursor, the
+    /// unread filter, marking read — works off the same list of indices either way.
+    pub fn article_rows(&self) -> Vec<ArticleRow> {
+        if !self.threaded {
+            return self
+                .articles
+                .iter()
+                .enumerate()
+                .filter(|(_, record)| !self.unread_only || self.is_unread(record.number))
+                .map(|(index, _)| ArticleRow {
+                    index,
+                    depth: 0,
+                    hidden: 0,
+                    has_replies: false,
+                    collapsed: false,
+                })
+                .collect();
         }
 
-        self.articles
-            .iter()
-            .enumerate()
-            .filter(|(_, record)| self.is_unread(record.number))
-            .map(|(index, _)| index)
-            .collect()
+        let mut rows = Vec::new();
+        for root in &self.threads {
+            self.push_rows(root, 0, &mut rows);
+        }
+        rows
+    }
+
+    /// Flattens one thread into rows, depth first.
+    ///
+    /// Two rules worth stating, because both are visible:
+    ///
+    /// - **Depth is the node's real depth in the thread**, whether or not its ancestors
+    ///   are drawn. A reply to a read article under the unread filter therefore keeps its
+    ///   indent, and turning the filter on and off does not slide the list sideways.
+    /// - **A fold only applies to a row that is drawn.** If the unread filter hides the
+    ///   article you collapsed, its unread replies are shown anyway: the filter's job is
+    ///   to show you what you have not read, and a fold must not be able to hide it.
+    fn push_rows(&self, node: &ThreadNode, depth: usize, rows: &mut Vec<ArticleRow>) {
+        let drawn = node
+            .article
+            .and_then(|index| {
+                self.articles
+                    .get(index)
+                    .map(|record| (index, record.number))
+            })
+            .filter(|(_, number)| !self.unread_only || self.is_unread(*number));
+
+        if let Some((index, number)) = drawn {
+            let collapsed = self.collapsed.contains(&number);
+            let hidden = if collapsed {
+                node.children.iter().map(ThreadNode::len).sum()
+            } else {
+                0
+            };
+
+            rows.push(ArticleRow {
+                index,
+                depth,
+                hidden,
+                has_replies: !node.children.is_empty(),
+                collapsed,
+            });
+
+            if collapsed {
+                return;
+            }
+        }
+
+        for child in &node.children {
+            self.push_rows(child, depth + 1, rows);
+        }
+    }
+
+    /// Rebuilds the thread tree from the records on display.
+    ///
+    /// Called whenever [`Self::articles`] changes, which is the only thing the tree
+    /// depends on — collapse state is applied at draw time, so folds survive a refetch.
+    fn rebuild_threads(&mut self) {
+        self.threads = if self.threaded {
+            nntp_proto::thread(&self.articles)
+        } else {
+            Vec::new()
+        };
     }
 
     /// The overview record under the cursor.
@@ -397,8 +618,12 @@ impl App {
         self.dirty = true;
     }
 
-    /// Applies an event from the worker.
-    pub fn on_event(&mut self, event: Event) {
+    /// Applies an event from the worker, returning any requests it produced.
+    ///
+    /// Almost every event produces none: the interface asks, the worker answers. The
+    /// exception is posting, where the answer changes the group on screen and the reader
+    /// has to go and look again — see [`Event::Posted`].
+    pub fn on_event(&mut self, event: Event) -> Vec<Request> {
         self.dirty = true;
 
         match event {
@@ -438,31 +663,63 @@ impl App {
                 self.group = Some(*summary);
             }
 
-            Event::Overview {
+            Event::OverviewChunk {
                 group,
+                token,
                 records,
                 skipped,
             } => {
-                self.inflight = self.inflight.saturating_sub(1);
-
-                // A reply for a group the user has navigated away from must not be shown
-                // under the current group's heading.
-                let current = self.group.as_ref().map(|summary| &summary.name);
-                if current != Some(&group) {
-                    self.note(format!("discarded a late overview reply for {group}"));
-                    return;
+                // A chunk of a superseded fetch is dropped without a word: the fetch that
+                // replaced it says so once, when its own completion arrives, and one note
+                // per chunk would bury everything else in the message pane.
+                if !self.accepts_overview(&group, token) {
+                    return Vec::new();
                 }
 
-                if skipped > 0 {
+                self.overview_skipped += skipped;
+                self.absorb_overview(records);
+
+                // Only when the first records land, so that a user who has gone back to
+                // the group list mid-fetch is not dragged into the article pane by each
+                // chunk that arrives.
+                if self.overview_chunks == 0 {
+                    self.focus = Pane::Articles;
+                }
+                self.overview_chunks += 1;
+
+                self.status = format!("{group}: {} articles listed…", self.articles.len());
+            }
+
+            Event::OverviewComplete { group, token } => {
+                // The request was counted when it was issued, so its completion brings the
+                // count down whether or not anything is still interested in the records.
+                self.inflight = self.inflight.saturating_sub(1);
+
+                if !self.accepts_overview(&group, token) {
+                    // Two different situations, and saying "discarded" for both reads as
+                    // data loss for the one where nothing was lost. A superseded fetch is
+                    // routine now that posting reloads the group: post twice and the first
+                    // reload is overtaken by the second.
+                    let showing = self.group.as_ref().map(|summary| &summary.name);
+                    if showing == Some(&group) {
+                        self.note(format!("{group}: a reload was overtaken by a newer one"));
+                    } else {
+                        self.note(format!(
+                            "{group}: an overview reply arrived after you had moved on"
+                        ));
+                    }
+                    return Vec::new();
+                }
+
+                if self.overview_skipped > 0 {
                     self.note(format!(
-                        "{group}: {skipped} overview line(s) could not be parsed"
+                        "{group}: {} overview line(s) could not be parsed",
+                        self.overview_skipped
                     ));
                 }
 
-                self.articles = records;
-                // Newest last, and the newest is what a reader wants to see first.
-                self.article_cursor = self.visible_articles().len().saturating_sub(1);
                 self.focus = Pane::Articles;
+                self.overview_token = None;
 
                 let unread = self
                     .articles
@@ -497,6 +754,25 @@ impl App {
                 self.focus = Pane::Body;
             }
 
+            Event::Posted { text } => {
+                self.inflight = self.inflight.saturating_sub(1);
+                // The draft file goes only now: the article exists somewhere other than
+                // this machine, so the copy here is the one thing nobody needs any more.
+                if let Some(path) = self.posting.take() {
+                    crate::compose::discard(&path);
+                }
+                self.status = format!("posted: {text}");
+                self.note(format!("posted: {text}"));
+
+                let groups = std::mem::take(&mut self.posting_groups);
+                // The article list is a snapshot of the last fetch, so the article just
+                // written is the one article missing from it. Refetching is the difference
+                // between "it says it posted" and seeing it in the group.
+                if let Some(requests) = self.refresh_after_posting(&groups) {
+                    return requests;
+                }
+            }
+
             Event::Progress(message) => self.status = message,
 
             Event::Cancelled { context } => {
@@ -505,6 +781,7 @@ impl App {
                 // about the connection is there because the next request will visibly
                 // reconnect, and a reconnection nobody explained looks like a fault.
                 self.status = format!("{context} cancelled");
+                self.report_unsent_draft();
                 self.note(format!(
                     "{context} cancelled; the connection was dropped and will be remade \
                      on the next request"
@@ -516,6 +793,7 @@ impl App {
                 let text = format!("{context}: {message}");
                 self.error = Some(text.clone());
                 self.note(text);
+                self.report_unsent_draft();
             }
 
             Event::Disconnected(reason) => {
@@ -523,6 +801,7 @@ impl App {
                 self.inflight = 0;
                 self.error = Some(format!("disconnected: {reason}"));
                 self.note(format!("disconnected: {reason}"));
+                self.report_unsent_draft();
             }
 
             Event::Stopped => {
@@ -531,6 +810,35 @@ impl App {
                 self.note("the worker stopped");
             }
         }
+
+        Vec::new()
+    }
+
+    /// Refetches the group on screen when an article has just been posted to it.
+    ///
+    /// `None` when the article went somewhere else — a crosspost to groups the reader is
+    /// not looking at changes nothing on screen, and refetching would be a round trip
+    /// nobody asked for.
+    fn refresh_after_posting(&mut self, groups: &[String]) -> Option<Vec<Request>> {
+        let group = self.group.as_ref()?.name.clone();
+        let name = group.to_string();
+        if !groups.contains(&name) {
+            return None;
+        }
+
+        self.status = format!("posted; reloading {name}…");
+        self.inflight += 1;
+        let token = self.begin_overview_fetch();
+
+        // `OpenGroup` rather than a range: the article just posted is *past* the high
+        // watermark this reader knows about, so a range built from what is on screen
+        // cannot include it. Selecting the group again is what asks the server for the
+        // watermarks it has now.
+        Some(vec![Request::OpenGroup {
+            group,
+            count: self.initial_articles,
+            token,
+        }])
     }
 
     /// Applies a key press, returning any requests it produced.
@@ -603,6 +911,10 @@ impl App {
             KeyCode::Char('u') => self.toggle_unread_only(),
             KeyCode::Char('M') => self.toggle_read_under_cursor(),
             KeyCode::Char('c') => self.catch_up(),
+            KeyCode::Char('t') => self.toggle_threading(),
+            KeyCode::Char('z') => self.toggle_fold_under_cursor(),
+            KeyCode::Char('w') => self.start_article(),
+            KeyCode::Char('f') => self.start_follow_up(),
 
             _ => self.dirty = false,
         }
@@ -630,24 +942,70 @@ impl App {
 
     fn overlay_key(&mut self, key: KeyEvent) -> Vec<Request> {
         match key.code {
-            KeyCode::Esc | KeyCode::Char('q') | KeyCode::Enter => self.overlay = Overlay::None,
+            KeyCode::Esc | KeyCode::Char('q') | KeyCode::Enter => self.close_overlay(),
             KeyCode::Char('?') | KeyCode::F(1) => {
-                self.overlay = if self.overlay == Overlay::Help {
-                    Overlay::None
+                if self.overlay == Overlay::Help {
+                    self.close_overlay();
                 } else {
-                    Overlay::Help
-                };
+                    self.overlay = Overlay::Help;
+                    self.overlay_scroll = 0;
+                }
             }
             KeyCode::Char('m') => {
-                self.overlay = if self.overlay == Overlay::Messages {
-                    Overlay::None
+                if self.overlay == Overlay::Messages {
+                    self.close_overlay();
                 } else {
-                    Overlay::Messages
-                };
+                    self.overlay = Overlay::Messages;
+                    self.overlay_scroll = 0;
+                }
             }
+
+            // The overlay scrolls with the same keys as everything else, because a list
+            // that is taller than the terminal and does not scroll is a list with a
+            // hidden bottom half.
+            KeyCode::Down | KeyCode::Char('j') => self.scroll_overlay(1),
+            KeyCode::Up | KeyCode::Char('k') => self.scroll_overlay(-1),
+            KeyCode::PageDown => self.scroll_overlay(self.overlay_page()),
+            KeyCode::PageUp => self.scroll_overlay(-self.overlay_page()),
+            KeyCode::Home | KeyCode::Char('g') => self.overlay_scroll = 0,
+            KeyCode::End | KeyCode::Char('G') => self.overlay_scroll = usize::MAX,
+
             _ => self.dirty = false,
         }
         Vec::new()
+    }
+
+    fn close_overlay(&mut self) {
+        self.overlay = Overlay::None;
+        self.overlay_scroll = 0;
+    }
+
+    fn overlay_page(&self) -> isize {
+        // The overlay is a little shorter than the pane it covers; one line of overlap
+        // keeps a reader's place across a page.
+        self.body_height.saturating_sub(2).max(1) as isize
+    }
+
+    /// Scrolls the overlay, clamped by the renderer rather than here.
+    ///
+    /// The state machine does not know how many lines the overlay has — that depends on
+    /// wrapping, which depends on the width. `usize::MAX` therefore means "the end", and
+    /// [`crate::tui::ui`] brings it back inside the text it just laid out.
+    fn scroll_overlay(&mut self, delta: isize) {
+        if delta < 0 {
+            self.overlay_scroll = self.overlay_scroll.saturating_sub(delta.unsigned_abs());
+        } else {
+            self.overlay_scroll = self.overlay_scroll.saturating_add(delta.unsigned_abs());
+        }
+    }
+
+    /// Reports where the overlay actually ended up, once the renderer has clamped it.
+    ///
+    /// The only thing the renderer tells the state machine, and it exists so that `End`
+    /// does not leave the scroll position at `usize::MAX` for the next key press to
+    /// subtract from.
+    pub fn set_overlay_scroll(&mut self, scroll: usize) {
+        self.overlay_scroll = scroll;
     }
 
     fn filter_key(&mut self, key: KeyEvent) -> Vec<Request> {
@@ -726,19 +1084,27 @@ impl App {
                 if group.is_empty() {
                     self.status = format!("{} is empty", group.name);
                     self.articles.clear();
+                    self.threads.clear();
+                    self.collapsed.clear();
                     self.article = None;
                     return Vec::new();
                 }
 
                 self.articles.clear();
+                self.threads.clear();
+                // Folds belong to the group they were made in: article numbers mean
+                // something else in the next one.
+                self.collapsed.clear();
                 self.article = None;
                 self.article_cursor = 0;
                 self.status = format!("opening {}…", group.name);
                 self.inflight += 1;
+                let token = self.begin_overview_fetch();
 
                 vec![Request::OpenGroup {
                     group: group.name,
                     count: self.initial_articles,
+                    token,
                 }]
             }
 
@@ -783,6 +1149,231 @@ impl App {
         };
     }
 
+    /// `w`: write a new article in the selected group.
+    fn start_article(&mut self) {
+        let Some(from) = self.posting_identity() else {
+            return;
+        };
+        let Some(group) = self.group.as_ref().map(|summary| summary.name.to_string()) else {
+            self.status = "select a group first".to_owned();
+            return;
+        };
+
+        let mut draft = nntp_proto::Draft::default();
+        draft.set_header("From", from);
+        draft.set_header("Newsgroups", group.clone());
+        draft.set_header("Subject", "");
+
+        self.compose = Some(ComposeRequest {
+            template: template_for(&draft),
+            what: "a new article",
+        });
+        self.status = format!("composing an article for {group}…");
+    }
+
+    /// `f`: follow up to the article on screen.
+    fn start_follow_up(&mut self) {
+        let Some(from) = self.posting_identity() else {
+            return;
+        };
+        let Some(article) = self.article.as_ref() else {
+            self.status = "open an article to follow up to".to_owned();
+            return;
+        };
+
+        if article.followup_to_poster {
+            // RFC 5536 §3.2.6. Posting anyway would put the reply exactly where the author
+            // asked it not to go, and this reader cannot send the mail that was asked for.
+            self.status = "Followup-To: poster — the author asked for a mail reply".to_owned();
+            self.note(
+                "this article asks for replies by mail rather than to the group; \
+                 nothing was composed"
+                    .to_owned(),
+            );
+            return;
+        }
+
+        let groups = if article.followup_groups.is_empty() {
+            self.group
+                .as_ref()
+                .map(|summary| vec![summary.name.to_string()])
+                .unwrap_or_default()
+        } else {
+            article.followup_groups.clone()
+        };
+
+        if groups.is_empty() {
+            self.status = "no group to follow up in".to_owned();
+            return;
+        }
+
+        let draft = nntp_proto::Draft::follow_up(
+            &nntp_proto::FollowUp {
+                message_id: article.message_id.as_ref(),
+                references: &article.references,
+                subject: &article.subject,
+                author: &article.author,
+                newsgroups: groups.clone(),
+                body: &article.body.join("\n"),
+            },
+            &from,
+        );
+
+        self.compose = Some(ComposeRequest {
+            template: template_for(&draft),
+            what: "a follow-up",
+        });
+        self.status = format!("composing a follow-up to {}…", groups.join(", "));
+    }
+
+    /// Who to post as, or a message saying why nothing can be posted.
+    fn posting_identity(&mut self) -> Option<String> {
+        match self.from.as_ref().filter(|from| !from.trim().is_empty()) {
+            Some(from) => Some(from.clone()),
+            None => {
+                // Naming the key is the difference between a dead end and a fix: there is
+                // no sensible default for somebody's name and address.
+                self.status = "set `from` for this server to post".to_owned();
+                self.note(
+                    "posting needs an identity: add `from = \"Your Name <you@example.org>\"` \
+                     under this server in the configuration file"
+                        .to_owned(),
+                );
+                None
+            }
+        }
+    }
+
+    /// Takes the composing session the run loop should start, if there is one.
+    pub fn take_compose(&mut self) -> Option<ComposeRequest> {
+        self.compose.take()
+    }
+
+    /// Applies whatever came back from the editor.
+    ///
+    /// `None` means the editor was abandoned or could not be run; the caller reports why.
+    /// A draft with problems goes back to the user as messages rather than to the server
+    /// as a `441`, and the draft file stays where it is.
+    pub fn on_composed(&mut self, composed: Option<(String, PathBuf)>) -> Vec<Request> {
+        self.dirty = true;
+
+        let Some((text, path)) = composed else {
+            self.status = "nothing was posted".to_owned();
+            return Vec::new();
+        };
+
+        let draft = nntp_proto::Draft::parse(&text);
+        let problems = draft.problems();
+        if !problems.is_empty() {
+            self.status = format!("the article was not sent: {} problem(s)", problems.len());
+            for problem in &problems {
+                self.note(format!("draft: {problem}"));
+            }
+            self.note(format!("the draft is at {}", path.display()));
+            return Vec::new();
+        }
+
+        self.posting = Some(path);
+        self.posting_groups = draft
+            .newsgroups()
+            .into_iter()
+            .map(ToOwned::to_owned)
+            .collect();
+        self.status = format!("posting to {}…", draft.newsgroups().join(", "));
+        self.inflight += 1;
+
+        vec![Request::Post {
+            draft: Box::new(draft),
+        }]
+    }
+
+    /// Says where the draft is, when a posting did not go through.
+    ///
+    /// The file is left alone — it is only removed once the server has taken the article —
+    /// so this is the part that makes it findable. Reported once: the path repeated on
+    /// every subsequent failure would bury the reason.
+    fn report_unsent_draft(&mut self) {
+        if let Some(path) = self.posting.take() {
+            self.note(format!(
+                "the article was not posted; the draft is at {}",
+                path.display()
+            ));
+        }
+    }
+
+    /// `t`: group the article list into conversations, or show it flat again.
+    ///
+    /// The article under the cursor stays under the cursor, because the two views order
+    /// the same articles differently and landing somewhere else on a key press meant to
+    /// change the *shape* of the list would be disorienting.
+    fn toggle_threading(&mut self) {
+        let anchor = self.selected_article().map(|record| record.number);
+        self.threaded = !self.threaded;
+        self.rebuild_threads();
+
+        self.article_cursor = anchor
+            .and_then(|number| self.row_of(number))
+            .unwrap_or_else(|| self.visible_articles().len().saturating_sub(1));
+
+        self.status = if self.threaded {
+            format!("{} threads", self.threads.len())
+        } else {
+            format!("showing {} articles flat", self.articles.len())
+        };
+    }
+
+    /// `z`: fold the replies under the cursor away, or bring them back.
+    fn toggle_fold_under_cursor(&mut self) {
+        if !self.threaded {
+            self.status = "threading is off (t)".to_owned();
+            return;
+        }
+
+        let Some(row) = self.article_rows().into_iter().nth(self.article_cursor) else {
+            return;
+        };
+        let Some(number) = self.articles.get(row.index).map(|record| record.number) else {
+            return;
+        };
+
+        if !row.has_replies {
+            self.status = format!("article {number} has no replies");
+            return;
+        }
+
+        if self.collapsed.remove(&number) {
+            self.status = format!("article {number}: replies shown");
+        } else {
+            self.collapsed.insert(number);
+            // Counted after folding, not before: the row only reports what it is hiding
+            // once it is hiding it, and guessing from the rows below would get a nested
+            // fold wrong.
+            let hidden = self
+                .article_rows()
+                .into_iter()
+                .find(|candidate| candidate.index == row.index)
+                .map_or(0, |candidate| candidate.hidden);
+            self.status = format!(
+                "article {number}: {} folded",
+                plural(hidden, "reply", "replies")
+            );
+        }
+
+        // Folding removes rows below the cursor, so the cursor itself cannot move — but
+        // unfolding can put the list somewhere the cursor is no longer inside.
+        self.article_cursor = self.row_of(number).unwrap_or(self.article_cursor);
+        self.clamp_article_cursor();
+    }
+
+    /// Which row an article number is on, if it is on one.
+    fn row_of(&self, number: u64) -> Option<usize> {
+        self.article_rows().into_iter().position(|row| {
+            self.articles
+                .get(row.index)
+                .is_some_and(|record| record.number == number)
+        })
+    }
+
     /// `M`: mark the article under the cursor read, or unread if it already was read.
     fn toggle_read_under_cursor(&mut self) {
         let Some(number) = self.selected_article().map(|record| record.number) else {
@@ -824,6 +1415,97 @@ impl App {
         self.read.mark_range_read(&name, low, high);
         self.status = format!("{name}: caught up to article {high}");
         self.clamp_article_cursor();
+    }
+
+    /// Starts a new overview fetch and returns the token that identifies it.
+    ///
+    /// Everything the previous fetch was accumulating is dropped here rather than when
+    /// its last chunk arrives, because the user has already moved on and its remaining
+    /// chunks are on their way.
+    ///
+    /// Public because anything that builds a [`Request::OpenGroup`] or
+    /// [`Request::LoadOverview`] has to take the token from here. Records carrying a token
+    /// this has not issued are treated as belonging to a superseded fetch and dropped,
+    /// which is the whole point — but it does mean a request minted without one goes
+    /// nowhere visible.
+    pub fn begin_overview_fetch(&mut self) -> FetchToken {
+        self.next_token += 1;
+        let token = FetchToken::new(self.next_token);
+        self.overview_token = Some(token);
+        self.overview_chunks = 0;
+        self.overview_skipped = 0;
+        token
+    }
+
+    /// Whether records from this fetch are still wanted.
+    ///
+    /// Two conditions, and both matter. The token catches a superseded fetch of the group
+    /// that is still on screen — a refresh while the previous one is arriving — which the
+    /// group name cannot see. The group name catches records for a group the user has
+    /// left, which is the older guarantee and stays true even if a token were ever reused.
+    fn accepts_overview(&self, group: &nntp_proto::GroupName, token: FetchToken) -> bool {
+        self.overview_token == Some(token)
+            && self.group.as_ref().map(|summary| &summary.name) == Some(group)
+    }
+
+    /// Merges a chunk of overview records into the list on display.
+    ///
+    /// The cursor is the delicate part. A cursor sitting on the newest article follows the
+    /// newest, because that is where a reader who has not moved expects to stay; a cursor
+    /// the user has moved stays on the article it is on, even though arriving records
+    /// change its index. Anything else would move somebody's place while they are reading.
+    fn absorb_overview(&mut self, mut records: Vec<OverviewRecord>) {
+        if records.is_empty() {
+            return;
+        }
+
+        let visible = self.visible_articles();
+        // An empty list counts as pinned: the first chunk should land on its newest
+        // article rather than on its oldest.
+        let pinned_to_newest = self.article_cursor + 1 >= visible.len();
+        let anchor = self.selected_article().map(|record| record.number);
+
+        match (self.articles.first(), records.last()) {
+            (None, _) => self.articles = records,
+
+            // The common case. Chunks arrive newest first, so each one is entirely older
+            // than everything already held and goes straight on the front — no sort, no
+            // comparison per record.
+            (Some(oldest_held), Some(newest_arriving))
+                if newest_arriving.number < oldest_held.number =>
+            {
+                records.append(&mut self.articles);
+                self.articles = records;
+            }
+
+            // Overlapping or out of order: a refresh across a range already on screen.
+            // The arriving copy wins, since it is the more recent view of the same
+            // article — `sort_by_key` is stable and the arriving records are placed
+            // first, so `dedup_by_key`, which keeps the first of each run, keeps them.
+            _ => {
+                records.append(&mut self.articles);
+                records.sort_by_key(|record| record.number);
+                records.dedup_by_key(|record| record.number);
+                self.articles = records;
+            }
+        }
+
+        self.rebuild_threads();
+
+        let visible = self.visible_articles();
+        self.article_cursor = if pinned_to_newest {
+            visible.len().saturating_sub(1)
+        } else {
+            anchor
+                .and_then(|number| {
+                    visible.iter().position(|index| {
+                        self.articles
+                            .get(*index)
+                            .is_some_and(|record| record.number == number)
+                    })
+                })
+                .unwrap_or_else(|| self.article_cursor.min(visible.len().saturating_sub(1)))
+        };
     }
 
     /// Brings the article cursor back inside the visible list.
@@ -889,12 +1571,15 @@ impl App {
                 let first = high
                     .saturating_sub(self.initial_articles.saturating_sub(1))
                     .max(low);
-                self.status = format!("reloading {}…", summary.name);
+                let group = summary.name.clone();
+                self.status = format!("reloading {group}…");
                 self.inflight += 1;
+                let token = self.begin_overview_fetch();
 
                 vec![Request::LoadOverview {
-                    group: summary.name.clone(),
+                    group,
                     range: Range::between(first, high),
+                    token,
                 }]
             }
         }
@@ -943,6 +1628,29 @@ impl App {
     }
 }
 
+/// The text an editor opens on.
+///
+/// Headers, a blank line, then the body — the shape of an article, so that somebody who
+/// knows what one looks like can edit it without being told anything. No instructions, no
+/// comment lines to strip: a comment syntax would be one more thing to get wrong, and a
+/// stray instruction line posted to a group is worse than a blank template.
+fn template_for(draft: &nntp_proto::Draft) -> String {
+    let mut text = String::new();
+    for (name, value) in &draft.headers {
+        text.push_str(&format!("{name}: {value}\n"));
+    }
+    text.push('\n');
+    text.push_str(&draft.body);
+    text
+}
+
+/// `n` with the right noun after it.
+///
+/// "1 replies folded" is the kind of detail that makes an interface feel unfinished.
+fn plural(count: usize, one: &str, many: &str) -> String {
+    format!("{count} {}", if count == 1 { one } else { many })
+}
+
 /// Moves a cursor by `delta` within `0..count`, clamping at both ends.
 ///
 /// Clamping rather than wrapping: a list that jumps from the end back to the beginning
@@ -959,6 +1667,8 @@ fn shift(current: usize, delta: isize, count: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use nntp_proto::{GroupName, OverviewFmt, PostingStatus, StatusLine};
+
+    use crate::tui::protocol::FetchToken;
 
     use super::*;
 
@@ -1010,20 +1720,56 @@ mod tests {
         OverviewRecord::parse(line.as_bytes(), &OverviewFmt::standard()).unwrap()
     }
 
+    /// An article with the given header block and body.
+    fn article_with_headers(headers: &str, body: &str) -> nntp_proto::Article {
+        let block =
+            nntp_proto::DataBlock::parse(format!("{headers}\r\n{body}\r\n.\r\n").as_bytes());
+        nntp_proto::Article::from_block(&block)
+    }
+
+    /// A record that replies to the given article numbers.
+    fn reply(number: u64, subject: &str, references: &[u64]) -> OverviewRecord {
+        let refs = references
+            .iter()
+            .map(|n| format!("<{n}@x>"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let line = format!("{number}\t{subject}\ta@x\t\t<{number}@x>\t{refs}\t10\t1");
+        OverviewRecord::parse(line.as_bytes(), &OverviewFmt::standard()).unwrap()
+    }
+
+    /// Delivers a whole overview fetch the way the worker does: one chunk, then the
+    /// completion.
+    ///
+    /// Most tests care that the records end up listed, not about how many pieces they
+    /// arrived in; the tests that care about the pieces build the events themselves.
+    fn deliver_overview(app: &mut App, group: &str, records: Vec<OverviewRecord>, skipped: usize) {
+        let group = nntp_proto::GroupName::parse(group).unwrap();
+        let token = app.begin_overview_fetch();
+        app.on_event(Event::OverviewChunk {
+            group: group.clone(),
+            token,
+            records,
+            skipped,
+        });
+        app.on_event(Event::OverviewComplete { group, token });
+    }
+
     /// Drives an app through to a group with articles listed.
     fn app_with_articles() -> App {
         let mut app = app();
         app.on_event(Event::Groups(some_groups()));
         app.on_event(Event::GroupOpened(Box::new(summary("misc.test", 1, 3, 3))));
-        app.on_event(Event::Overview {
-            group: GroupName::parse("misc.test").unwrap(),
-            records: vec![
+        deliver_overview(
+            &mut app,
+            "misc.test",
+            vec![
                 record(1, "oldest"),
                 record(2, "middle"),
                 record(3, "newest"),
             ],
-            skipped: 0,
-        });
+            0,
+        );
         app
     }
 
@@ -1163,11 +1909,12 @@ mod tests {
             1_000,
             101,
         ))));
-        app.on_event(Event::Overview {
-            group: GroupName::parse("misc.test").unwrap(),
-            records: vec![record(999, "one"), record(1_000, "two")],
-            skipped: 0,
-        });
+        deliver_overview(
+            &mut app,
+            "misc.test",
+            vec![record(999, "one"), record(1_000, "two")],
+            0,
+        );
 
         app.on_key(key(KeyCode::Char('c')));
 
@@ -1508,11 +2255,12 @@ mod tests {
         app.on_key(key(KeyCode::Char('/')));
 
         app.on_event(Event::GroupOpened(Box::new(summary("misc.test", 1, 3, 3))));
-        app.on_event(Event::Overview {
-            group: GroupName::parse("misc.test").unwrap(),
-            records: vec![record(1, "one"), record(2, "two")],
-            skipped: 0,
-        });
+        deliver_overview(
+            &mut app,
+            "misc.test",
+            vec![record(1, "one"), record(2, "two")],
+            0,
+        );
         assert_eq!(app.focus, Pane::Articles, "the reply moved the focus");
 
         app.on_key(key(KeyCode::Down));
@@ -1594,6 +2342,8 @@ mod tests {
             vec![Request::OpenGroup {
                 group: GroupName::parse("comp.lang.rust").unwrap(),
                 count: UiConfig::default().initial_articles,
+                // The first fetch of the run.
+                token: FetchToken::new(1),
             }]
         );
         assert_eq!(app.inflight, 1);
@@ -1629,29 +2379,681 @@ mod tests {
     fn a_late_overview_reply_for_another_group_is_discarded() {
         // Otherwise the article list shows one group's articles under another's heading.
         let mut app = app_with_articles();
-        app.on_event(Event::Overview {
-            group: GroupName::parse("comp.lang.rust").unwrap(),
-            records: vec![record(99, "from the wrong group")],
-            skipped: 0,
-        });
+        deliver_overview(
+            &mut app,
+            "comp.lang.rust",
+            vec![record(99, "from the wrong group")],
+            0,
+        );
 
         assert_eq!(app.articles.len(), 3);
         assert!(
-            app.messages.iter().any(|m| m.contains("discarded")),
+            app.messages.iter().any(|m| m.contains("moved on")),
             "{:?}",
             app.messages
         );
     }
 
     #[test]
+    fn records_are_listed_as_each_chunk_arrives() {
+        // The point of #8: the pane fills while the rest is still on the wire, rather
+        // than staying empty until the whole range has been fetched.
+        let mut app = app();
+        app.on_event(Event::GroupOpened(Box::new(summary("misc.test", 1, 4, 4))));
+        let group = GroupName::parse("misc.test").unwrap();
+        let token = app.begin_overview_fetch();
+
+        app.on_event(Event::OverviewChunk {
+            group: group.clone(),
+            token,
+            records: vec![record(3, "newest"), record(4, "newer still")],
+            skipped: 0,
+        });
+
+        assert_eq!(app.articles.len(), 2, "listed before the fetch finished");
+        assert_eq!(app.focus, Pane::Articles);
+        assert_eq!(app.inflight, 0, "the completion is what ends the request");
+
+        app.on_event(Event::OverviewChunk {
+            group: group.clone(),
+            token,
+            records: vec![record(1, "oldest"), record(2, "older")],
+            skipped: 0,
+        });
+        app.on_event(Event::OverviewComplete { group, token });
+
+        // Chunks arrive newest first and are merged back into article-number order.
+        assert_eq!(
+            app.articles.iter().map(|r| r.number).collect::<Vec<_>>(),
+            vec![1, 2, 3, 4]
+        );
+    }
+
+    #[test]
+    fn a_cursor_on_the_newest_article_follows_the_newest() {
+        let mut app = app();
+        app.on_event(Event::GroupOpened(Box::new(summary("misc.test", 1, 4, 4))));
+        let group = GroupName::parse("misc.test").unwrap();
+        let token = app.begin_overview_fetch();
+
+        app.on_event(Event::OverviewChunk {
+            group: group.clone(),
+            token,
+            records: vec![record(3, "newest"), record(4, "newer still")],
+            skipped: 0,
+        });
+        assert_eq!(app.selected_article().map(|r| r.number), Some(4));
+
+        // Older records land in front of it. The cursor's index changes; the article it
+        // is on must not.
+        app.on_event(Event::OverviewChunk {
+            group,
+            token,
+            records: vec![record(1, "oldest"), record(2, "older")],
+            skipped: 0,
+        });
+
+        assert_eq!(app.article_cursor, 3);
+        assert_eq!(app.selected_article().map(|r| r.number), Some(4));
+    }
+
+    #[test]
+    fn a_cursor_the_user_moved_stays_on_its_article() {
+        // Records arriving underneath a reader must not move their place.
+        let mut app = app();
+        app.on_event(Event::GroupOpened(Box::new(summary("misc.test", 1, 4, 4))));
+        let group = GroupName::parse("misc.test").unwrap();
+        let token = app.begin_overview_fetch();
+
+        app.on_event(Event::OverviewChunk {
+            group: group.clone(),
+            token,
+            records: vec![record(3, "newest"), record(4, "newer still")],
+            skipped: 0,
+        });
+
+        app.focus = Pane::Articles;
+        app.on_key(key(KeyCode::Up));
+        assert_eq!(app.selected_article().map(|r| r.number), Some(3));
+
+        app.on_event(Event::OverviewChunk {
+            group,
+            token,
+            records: vec![record(1, "oldest"), record(2, "older")],
+            skipped: 0,
+        });
+
+        assert_eq!(
+            app.selected_article().map(|r| r.number),
+            Some(3),
+            "the cursor stayed on article 3 at its new index"
+        );
+        assert_eq!(app.article_cursor, 2);
+    }
+
+    #[test]
+    fn a_chunk_of_a_superseded_fetch_of_the_same_group_is_dropped() {
+        // The group name cannot catch this one: both fetches are for the group on screen.
+        // Without the token, a refresh started mid-fetch would have the abandoned fetch's
+        // records merged into the new one's list.
+        let mut app = app();
+        app.on_event(Event::GroupOpened(Box::new(summary("misc.test", 1, 4, 4))));
+        let group = GroupName::parse("misc.test").unwrap();
+
+        let abandoned = app.begin_overview_fetch();
+        let current = app.begin_overview_fetch();
+        assert_ne!(abandoned, current);
+
+        app.on_event(Event::OverviewChunk {
+            group: group.clone(),
+            token: abandoned,
+            records: vec![record(1, "from the abandoned fetch")],
+            skipped: 0,
+        });
+        assert!(app.articles.is_empty(), "{:?}", app.status);
+
+        app.on_event(Event::OverviewChunk {
+            group,
+            token: current,
+            records: vec![record(2, "from the current fetch")],
+            skipped: 0,
+        });
+        assert_eq!(
+            app.articles.iter().map(|r| r.number).collect::<Vec<_>>(),
+            vec![2]
+        );
+    }
+
+    #[test]
+    fn a_record_that_arrives_twice_is_listed_once() {
+        // A refresh re-fetches a range already on screen. Two copies of one article in
+        // the list would be a visible bug, and the newer copy is the truer one.
+        let mut app = app_with_articles();
+        let group = GroupName::parse("misc.test").unwrap();
+        let token = app.begin_overview_fetch();
+
+        app.on_event(Event::OverviewChunk {
+            group: group.clone(),
+            token,
+            records: vec![record(2, "edited subject"), record(4, "brand new")],
+            skipped: 0,
+        });
+        app.on_event(Event::OverviewComplete { group, token });
+
+        assert_eq!(
+            app.articles.iter().map(|r| r.number).collect::<Vec<_>>(),
+            vec![1, 2, 3, 4]
+        );
+        assert_eq!(
+            app.articles
+                .iter()
+                .find(|r| r.number == 2)
+                .map(|r| r.subject.as_str()),
+            Some("edited subject"),
+            "the copy that just arrived wins"
+        );
+    }
+
+    #[test]
+    fn an_empty_group_finishes_with_an_empty_list() {
+        // "Nothing here" and "not arrived yet" have to look different, so the completion
+        // is sent even when no chunk carried anything.
+        let mut app = app_with_articles();
+        app.on_event(Event::GroupOpened(Box::new(summary(
+            "comp.lang.rust",
+            1,
+            0,
+            0,
+        ))));
+        let group = GroupName::parse("comp.lang.rust").unwrap();
+        let token = app.begin_overview_fetch();
+        app.articles.clear();
+
+        app.on_event(Event::OverviewComplete { group, token });
+
+        assert!(app.articles.is_empty());
+        assert!(app.status.contains("0 articles listed"), "{}", app.status);
+    }
+
+    #[test]
+    fn unparseable_lines_are_counted_across_chunks_and_reported_once() {
+        // One message per chunk would bury everything else in the message pane on a
+        // group the server serves badly.
+        let mut app = app();
+        app.on_event(Event::GroupOpened(Box::new(summary("misc.test", 1, 4, 4))));
+        let group = GroupName::parse("misc.test").unwrap();
+        let token = app.begin_overview_fetch();
+
+        for number in [3, 1] {
+            app.on_event(Event::OverviewChunk {
+                group: group.clone(),
+                token,
+                records: vec![record(number, "fine")],
+                skipped: 2,
+            });
+        }
+        assert!(
+            !app.messages
+                .iter()
+                .any(|m| m.contains("could not be parsed")),
+            "not reported per chunk: {:?}",
+            app.messages
+        );
+
+        app.on_event(Event::OverviewComplete { group, token });
+
+        let reported = app
+            .messages
+            .iter()
+            .filter(|m| m.contains("could not be parsed"))
+            .collect::<Vec<_>>();
+        assert_eq!(reported.len(), 1, "{:?}", app.messages);
+        assert!(reported[0].contains('4'), "{:?}", reported);
+    }
+
+    /// An app showing one thread: a root, two replies, and one unrelated article.
+    fn app_with_a_thread() -> App {
+        let mut app = app();
+        app.on_event(Event::GroupOpened(Box::new(summary("misc.test", 1, 4, 4))));
+        deliver_overview(
+            &mut app,
+            "misc.test",
+            vec![
+                reply(1, "the question", &[]),
+                reply(2, "Re: the question", &[1]),
+                reply(3, "Re: the question", &[1, 2]),
+                reply(4, "something else", &[]),
+            ],
+            0,
+        );
+        app
+    }
+
+    #[test]
+    fn replies_are_indented_under_what_they_answer() {
+        let app = app_with_a_thread();
+        assert!(app.threaded, "threading is the default");
+
+        let rows = app.article_rows();
+        let shape: Vec<(u64, usize)> = rows
+            .iter()
+            .filter_map(|row| app.articles.get(row.index).map(|r| (r.number, row.depth)))
+            .collect();
+
+        assert_eq!(shape, vec![(1, 0), (2, 1), (3, 2), (4, 0)]);
+    }
+
+    #[test]
+    fn threading_reorders_the_list_but_not_the_cursor() {
+        // `t` changes the shape of the list, so landing on a different article would be a
+        // surprise. The article under the cursor stays under it.
+        let mut app = app_with_a_thread();
+        app.focus = Pane::Articles;
+        app.article_cursor = 1;
+        assert_eq!(app.selected_article().map(|r| r.number), Some(2));
+
+        app.on_key(key(KeyCode::Char('t')));
+        assert!(!app.threaded);
+        assert_eq!(app.selected_article().map(|r| r.number), Some(2));
+
+        app.on_key(key(KeyCode::Char('t')));
+        assert!(app.threaded);
+        assert_eq!(app.selected_article().map(|r| r.number), Some(2));
+    }
+
+    #[test]
+    fn the_flat_view_is_article_number_order() {
+        let mut app = app_with_a_thread();
+        app.on_key(key(KeyCode::Char('t')));
+
+        let numbers: Vec<u64> = app
+            .article_rows()
+            .iter()
+            .filter_map(|row| app.articles.get(row.index).map(|r| r.number))
+            .collect();
+
+        assert_eq!(numbers, vec![1, 2, 3, 4]);
+        assert!(app.article_rows().iter().all(|row| row.depth == 0));
+    }
+
+    #[test]
+    fn folding_hides_the_replies_and_says_how_many() {
+        let mut app = app_with_a_thread();
+        app.focus = Pane::Articles;
+        app.article_cursor = 0;
+
+        app.on_key(key(KeyCode::Char('z')));
+
+        let rows = app.article_rows();
+        let numbers: Vec<u64> = rows
+            .iter()
+            .filter_map(|row| app.articles.get(row.index).map(|r| r.number))
+            .collect();
+        assert_eq!(numbers, vec![1, 4], "the two replies are folded away");
+        assert_eq!(rows.first().map(|row| row.hidden), Some(2));
+        assert!(app.status.contains('2'), "{}", app.status);
+
+        // And back again.
+        app.on_key(key(KeyCode::Char('z')));
+        assert_eq!(app.article_rows().len(), 4);
+    }
+
+    #[test]
+    fn folding_leaves_the_cursor_on_the_article_it_folded() {
+        let mut app = app_with_a_thread();
+        app.focus = Pane::Articles;
+        app.article_cursor = 0;
+
+        app.on_key(key(KeyCode::Char('z')));
+        assert_eq!(app.selected_article().map(|r| r.number), Some(1));
+
+        app.on_key(key(KeyCode::Char('z')));
+        assert_eq!(app.selected_article().map(|r| r.number), Some(1));
+    }
+
+    #[test]
+    fn folding_an_article_with_no_replies_says_so_rather_than_doing_nothing() {
+        let mut app = app_with_a_thread();
+        app.focus = Pane::Articles;
+        app.article_cursor = 3;
+        assert_eq!(app.selected_article().map(|r| r.number), Some(4));
+
+        app.on_key(key(KeyCode::Char('z')));
+
+        assert_eq!(app.article_rows().len(), 4);
+        assert!(app.status.contains("no replies"), "{}", app.status);
+    }
+
+    #[test]
+    fn a_fold_cannot_hide_an_unread_reply_from_the_unread_filter() {
+        // The filter's job is to show what has not been read. A fold on an article the
+        // filter itself hides must not take its unread replies with it.
+        let mut app = app_with_a_thread();
+        app.focus = Pane::Articles;
+        app.article_cursor = 0;
+        app.on_key(key(KeyCode::Char('z')));
+
+        app.read.mark_read("misc.test", 1);
+        app.unread_only = true;
+
+        let numbers: Vec<u64> = app
+            .article_rows()
+            .iter()
+            .filter_map(|row| app.articles.get(row.index).map(|r| r.number))
+            .collect();
+
+        assert_eq!(numbers, vec![2, 3, 4]);
+    }
+
+    #[test]
+    fn folds_do_not_survive_moving_to_another_group() {
+        // Article numbers mean something else in the next group, so a fold carried over
+        // would land on an unrelated article.
+        let mut app = app_with_a_thread();
+        app.focus = Pane::Articles;
+        app.article_cursor = 0;
+        app.on_key(key(KeyCode::Char('z')));
+        assert_eq!(app.article_rows().len(), 2);
+
+        app.on_event(Event::Groups(some_groups()));
+        app.focus = Pane::Groups;
+        app.on_key(key(KeyCode::Enter));
+        app.on_event(Event::GroupOpened(Box::new(summary("misc.test", 1, 4, 4))));
+        deliver_overview(
+            &mut app,
+            "misc.test",
+            vec![
+                reply(1, "the question", &[]),
+                reply(2, "Re: the question", &[1]),
+            ],
+            0,
+        );
+
+        assert_eq!(app.article_rows().len(), 2, "nothing is folded");
+        assert_eq!(app.article_rows().get(1).map(|row| row.depth), Some(1));
+    }
+
+    #[test]
+    fn folding_with_threading_off_says_what_to_press() {
+        let mut app = app_with_a_thread();
+        app.on_key(key(KeyCode::Char('t')));
+        app.focus = Pane::Articles;
+
+        app.on_key(key(KeyCode::Char('z')));
+
+        assert!(app.status.contains('t'), "{}", app.status);
+        assert_eq!(app.article_rows().len(), 4);
+    }
+
+    #[test]
+    fn a_thread_assembled_from_two_chunks_is_still_a_thread() {
+        // The reply can arrive before the article it answers, since chunks come newest
+        // first. Threading is rebuilt as records land, so the order they arrive in must
+        // not change the result.
+        let mut app = app();
+        app.on_event(Event::GroupOpened(Box::new(summary("misc.test", 1, 2, 2))));
+        let group = GroupName::parse("misc.test").unwrap();
+        let token = app.begin_overview_fetch();
+
+        app.on_event(Event::OverviewChunk {
+            group: group.clone(),
+            token,
+            records: vec![reply(2, "Re: the question", &[1])],
+            skipped: 0,
+        });
+        assert_eq!(app.article_rows().first().map(|row| row.depth), Some(0));
+
+        app.on_event(Event::OverviewChunk {
+            group: group.clone(),
+            token,
+            records: vec![reply(1, "the question", &[])],
+            skipped: 0,
+        });
+        app.on_event(Event::OverviewComplete { group, token });
+
+        let shape: Vec<(u64, usize)> = app
+            .article_rows()
+            .iter()
+            .filter_map(|row| app.articles.get(row.index).map(|r| (r.number, row.depth)))
+            .collect();
+        assert_eq!(shape, vec![(1, 0), (2, 1)]);
+    }
+
+    /// An app with an identity, so posting is possible at all.
+    fn app_that_can_post() -> App {
+        let mut app = app_with_a_thread();
+        app.from = Some("A Poster <poster@example.org>".to_owned());
+        app
+    }
+
+    #[test]
+    fn writing_an_article_pre_fills_what_the_reader_already_knows() {
+        let mut app = app_that_can_post();
+
+        app.on_key(key(KeyCode::Char('w')));
+
+        let request = app.take_compose().expect("a composing session");
+        assert!(
+            request
+                .template
+                .contains("From: A Poster <poster@example.org>")
+        );
+        assert!(request.template.contains("Newsgroups: misc.test"));
+        assert!(request.template.contains("Subject:"));
+        // Headers, a blank line, then the body: the shape of an article.
+        assert!(request.template.contains("\n\n"), "{:?}", request.template);
+    }
+
+    #[test]
+    fn posting_without_an_identity_says_which_key_to_set() {
+        // A guessed From is how articles end up signed `user@localhost`.
+        let mut app = app_with_a_thread();
+        app.from = None;
+
+        app.on_key(key(KeyCode::Char('w')));
+
+        assert!(app.take_compose().is_none());
+        assert!(app.status.contains("from"), "{}", app.status);
+        assert!(
+            app.messages.iter().any(|m| m.contains("configuration")),
+            "{:?}",
+            app.messages
+        );
+    }
+
+    #[test]
+    fn a_follow_up_quotes_the_article_and_carries_its_references() {
+        let mut app = app_that_can_post();
+        app.on_event(Event::Article(Box::new(article_with_headers(
+            "Message-ID: <parent@example.org>\r\n\
+             References: <root@example.org>\r\n\
+             Newsgroups: misc.test\r\n\
+             From: Original Poster <op@example.org>\r\n\
+             Subject: the question\r\n",
+            "What do you think?",
+        ))));
+
+        app.on_key(key(KeyCode::Char('f')));
+
+        let request = app.take_compose().expect("a composing session");
+        assert!(
+            request.template.contains("Subject: Re: the question"),
+            "{}",
+            request.template
+        );
+        assert!(
+            request
+                .template
+                .contains("References: <root@example.org> <parent@example.org>"),
+            "{}",
+            request.template
+        );
+        assert!(request.template.contains("Newsgroups: misc.test"));
+        assert!(
+            request.template.contains("> What do you think?"),
+            "{}",
+            request.template
+        );
+        assert!(request.template.contains("wrote:"), "{}", request.template);
+    }
+
+    #[test]
+    fn a_follow_up_goes_where_followup_to_says() {
+        let mut app = app_that_can_post();
+        app.on_event(Event::Article(Box::new(article_with_headers(
+            "Message-ID: <parent@example.org>\r\n\
+             Newsgroups: misc.test,comp.lang.rust\r\n\
+             Followup-To: misc.test\r\n\
+             From: op@example.org\r\n\
+             Subject: crossposted\r\n",
+            "Body.",
+        ))));
+
+        app.on_key(key(KeyCode::Char('f')));
+
+        let request = app.take_compose().expect("a composing session");
+        assert!(
+            request.template.contains("Newsgroups: misc.test\n"),
+            "a crosspost must follow up only where the author asked: {}",
+            request.template
+        );
+        assert!(
+            !request.template.contains("comp.lang.rust"),
+            "{}",
+            request.template
+        );
+    }
+
+    #[test]
+    fn followup_to_poster_is_refused_rather_than_posted_to_the_group() {
+        // RFC 5536 §3.2.6: the author asked for mail. This reader cannot send mail, and
+        // posting anyway would put the reply exactly where it was asked not to go.
+        let mut app = app_that_can_post();
+        app.on_event(Event::Article(Box::new(article_with_headers(
+            "Message-ID: <parent@example.org>\r\n\
+             Newsgroups: misc.test\r\n\
+             Followup-To: poster\r\n\
+             From: op@example.org\r\n\
+             Subject: mail me\r\n",
+            "Body.",
+        ))));
+
+        app.on_key(key(KeyCode::Char('f')));
+
+        assert!(app.take_compose().is_none());
+        assert!(app.status.contains("poster"), "{}", app.status);
+    }
+
+    #[test]
+    fn following_up_with_nothing_open_says_so() {
+        let mut app = app_that_can_post();
+        app.on_key(key(KeyCode::Char('f')));
+
+        assert!(app.take_compose().is_none());
+        assert!(app.status.contains("open an article"), "{}", app.status);
+    }
+
+    #[test]
+    fn a_composed_article_becomes_a_post_request() {
+        let mut app = app_that_can_post();
+
+        let requests = app.on_composed(Some((
+            "From: A Poster <poster@example.org>\n\
+             Newsgroups: misc.test\n\
+             Subject: Testing\n\
+             \n\
+             Hello.\n"
+                .to_owned(),
+            PathBuf::from("/tmp/draft.article"),
+        )));
+
+        assert_eq!(requests.len(), 1);
+        assert!(matches!(requests.first(), Some(Request::Post { .. })));
+        assert_eq!(app.inflight, 1);
+    }
+
+    #[test]
+    fn a_draft_with_problems_is_reported_and_not_sent() {
+        // The problems belong in front of the user, not in a 441 after a round trip.
+        let mut app = app_that_can_post();
+
+        let requests = app.on_composed(Some((
+            "Subject: no From, no Newsgroups\n\nBody.\n".to_owned(),
+            PathBuf::from("/tmp/draft.article"),
+        )));
+
+        assert!(requests.is_empty());
+        assert_eq!(app.inflight, 0);
+        assert!(
+            app.messages.iter().any(|m| m.contains("From")),
+            "{:?}",
+            app.messages
+        );
+        assert!(
+            app.messages.iter().any(|m| m.contains("draft.article")),
+            "the draft's path must be findable: {:?}",
+            app.messages
+        );
+    }
+
+    #[test]
+    fn a_failed_posting_says_where_the_draft_is() {
+        let mut app = app_that_can_post();
+        app.on_composed(Some((
+            "From: a@x\nNewsgroups: misc.test\nSubject: s\n\nBody.\n".to_owned(),
+            PathBuf::from("/tmp/draft.article"),
+        )));
+
+        app.on_event(Event::Failed {
+            context: "posting to misc.test".to_owned(),
+            message: "441 no colon-space in \"From\" header".to_owned(),
+        });
+
+        assert!(
+            app.messages.iter().any(|m| m.contains("draft.article")),
+            "{:?}",
+            app.messages
+        );
+        assert_eq!(app.inflight, 0);
+    }
+
+    #[test]
+    fn an_abandoned_composition_posts_nothing() {
+        let mut app = app_that_can_post();
+        assert!(app.on_composed(None).is_empty());
+        assert_eq!(app.inflight, 0);
+    }
+
+    #[test]
+    fn a_superseded_reload_does_not_read_as_data_loss() {
+        // Routine now that posting reloads the group: post twice and the first reload is
+        // overtaken by the second. "Discarded" for that would send somebody looking for
+        // the articles it lost, and it lost none.
+        let mut app = app_with_a_thread();
+        let group = GroupName::parse("misc.test").unwrap();
+
+        let overtaken = app.begin_overview_fetch();
+        let _current = app.begin_overview_fetch();
+
+        app.on_event(Event::OverviewComplete {
+            group,
+            token: overtaken,
+        });
+
+        let note = app
+            .messages
+            .front()
+            .cloned()
+            .unwrap_or_else(|| "no message".to_owned());
+        assert!(note.contains("overtaken"), "{note}");
+        assert!(!note.contains("discarded"), "{note}");
+    }
+
+    #[test]
     fn unparseable_overview_lines_are_reported_not_hidden() {
         let mut app = app();
         app.on_event(Event::GroupOpened(Box::new(summary("misc.test", 1, 3, 3))));
-        app.on_event(Event::Overview {
-            group: GroupName::parse("misc.test").unwrap(),
-            records: vec![record(1, "fine")],
-            skipped: 2,
-        });
+        deliver_overview(&mut app, "misc.test", vec![record(1, "fine")], 2);
 
         assert!(
             app.messages
@@ -1799,6 +3201,8 @@ mod tests {
             vec![Request::LoadOverview {
                 group: GroupName::parse("misc.test").unwrap(),
                 range: Range::between(1, 3),
+                // `app_with_articles` already delivered one fetch, so this is the second.
+                token: FetchToken::new(2),
             }]
         );
     }

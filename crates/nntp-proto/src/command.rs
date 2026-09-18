@@ -91,7 +91,8 @@ impl ListKeyword {
 /// Every command this crate can encode.
 ///
 /// The set is deliberately limited to what a reader needs; transit commands (`IHAVE`,
-/// `CHECK`, `TAKETHIS`) are out of scope, and `POST` is planned for v0.2.
+/// `CHECK`, `TAKETHIS`) are out of scope. `POST` is here because following up is part of
+/// reading a newsgroup; injecting other people's articles is not.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum Command {
@@ -148,6 +149,12 @@ pub enum Command {
         /// Which articles to retrieve it for.
         target: RangeOrId,
     },
+    /// `POST` — the first half of RFC 3977 §6.3.1's two-step exchange.
+    ///
+    /// The article itself is *not* part of the command: the server answers `340` first,
+    /// and only then is the article sent as a data block. Encoding the two together would
+    /// make it possible to send an article to a server that has just refused to take one.
+    Post,
     /// `XHDR field [range|message-id]` — the RFC 2980 predecessor of `HDR`.
     XHdr {
         /// The header field to retrieve.
@@ -183,6 +190,7 @@ impl Command {
             Self::XOver(_) => "XOVER",
             Self::Hdr { .. } => "HDR",
             Self::XHdr { .. } => "XHDR",
+            Self::Post => "POST",
         }
     }
 
@@ -215,6 +223,8 @@ impl Command {
             | Self::Last
             | Self::Next
             | Self::Stat(_)
+            // `340` introduces nothing; the *client* sends the block next.
+            | Self::Post
             | Self::Date => false,
         }
     }
@@ -290,6 +300,7 @@ impl Command {
             Self::Body(spec) => push_with_optional_arg(&mut line, "BODY", spec.to_argument()),
             Self::Stat(spec) => push_with_optional_arg(&mut line, "STAT", spec.to_argument()),
             Self::Date => line.push_str("DATE"),
+            Self::Post => line.push_str("POST"),
             Self::Help => line.push_str("HELP"),
             Self::NewGroups(since) => {
                 // RFC 3977 §7.3.1 permits a four-digit year and recommends GMT.

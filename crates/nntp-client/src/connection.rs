@@ -121,6 +121,40 @@ impl<S: Read + Write> Connection<S> {
         Ok(())
     }
 
+    /// Sends a multi-line data block: the lines, dot-stuffed, then the terminator.
+    ///
+    /// The mirror of [`Self::read_block`], and the dot-stuffing is the whole reason it is
+    /// a method rather than three lines at the call site. A body line that begins with `.`
+    /// — a `.signature`, a quoted shell prompt, an ASCII drawing — terminates the article
+    /// early unless it is doubled (RFC 3977 §3.1.1), which truncates what everybody else
+    /// receives and is invisible to the sender.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError::Io`] if the write fails. The caller reads the response.
+    pub fn send_block(&mut self, lines: &[Vec<u8>]) -> Result<()> {
+        self.ensure_synchronised()?;
+
+        let mut out = Vec::new();
+        for line in lines {
+            out.extend_from_slice(&nntp_proto::block::stuff(line));
+            out.extend_from_slice(b"\r\n");
+        }
+        out.extend_from_slice(b".\r\n");
+
+        tracing::trace!(lines = lines.len(), bytes = out.len(), ">> block");
+
+        self.stream
+            .get_mut()
+            .write_all(&out)
+            .map_err(ClientError::from_io)?;
+        self.stream
+            .get_mut()
+            .flush()
+            .map_err(ClientError::from_io)?;
+        Ok(())
+    }
+
     /// Reads a status line.
     ///
     /// # Errors

@@ -26,13 +26,13 @@ divergence it found is noted under `GROUP`.
 | Command | Status | Notes |
 | --- | --- | --- |
 | `GROUP` | ✅ | Including the `low > high` spelling of an empty group. A `411` never names the group (INN answers `411 No such newsgroup`), so the requested name is always substituted rather than read from the response; the server's own text is kept, since a `411` sometimes means "access denied". |
-| `LISTGROUP` | 🟡 | Encoded and served by the test server; the client has no method for it yet. |
-| `LAST` / `NEXT` | 🟡 | Encoded and served by the test server; the client has no method for it yet. |
+| `LISTGROUP` | ✅ | `article_numbers` — which numbers a group *holds*, rather than the range they lie in, which is the only way to see the gaps expiry leaves. Selects the group, as the command does. |
+| `LAST` / `NEXT` | ✅ | `previous_article` / `next_article` — how a group is walked when the server offers no overview at all. |
 | `ARTICLE` | ✅ | |
 | `HEAD` | ✅ | |
 | `BODY` | ✅ | |
 | `STAT` | ✅ | Article number `0` is reported as "not applicable" rather than as article zero. |
-| `POST` | 🚫 v0.1 | Planned for v0.2. |
+| `POST` | ✅ | The two-step exchange, dot-stuffed. The draft is validated before `POST` is sent, so a server that counts refused offers is not given one for a missing `Subject`. `440`/`441` are reported with the server's own text and leave the connection usable. |
 | `IHAVE` | 🚫 | Transit command, not used by readers. |
 
 ### Information (§7)
@@ -41,23 +41,23 @@ divergence it found is noted under `GROUP`.
 | --- | --- | --- |
 | `DATE` | ✅ | |
 | `HELP` | ✅ | |
-| `NEWGROUPS` | 🟡 | Encoded with a four-digit year in GMT. |
+| `NEWGROUPS` | ✅ | `new_groups` — the cheap half of keeping a group list fresh. Compared against the *server's* clock, which is why `doctor` reports the skew. Does not report groups that have been removed, so a full refresh is still needed occasionally. |
 | `NEWNEWS` | ⬜ | Optional and frequently disabled by servers. |
 | `LIST ACTIVE` | ✅ | Streaming variant available. Note: `high` precedes `low`, unlike `GROUP`. |
-| `LIST ACTIVE.TIMES` | 🟡 | Encoded, parsed and served; the client has no method for it yet. |
+| `LIST ACTIVE.TIMES` | ✅ | `group_creation_times`. Optional; a server that does not keep it answers `503`, reported as `CommandNotSupported`. |
 | `LIST NEWSGROUPS` | ✅ | Tab- and space-separated descriptions both accepted. |
 | `LIST OVERVIEW.FMT` | ✅ | Fetched once per session and cached; a refusal falls back to the standard layout. |
-| `LIST HEADERS` | 🟡 | Encoded. |
+| `LIST HEADERS` | ✅ | `available_header_fields`. A server may answer `:` alone, meaning any field in the article; that is returned as it arrived rather than expanded into a list nobody can enumerate. |
 | `LIST DISTRIB.PATS` | 🚫 | Posting-only. |
 | `OVER` | ✅ | Streaming variant available; falls back to `XOVER` on refusal. |
-| `HDR` | 🟡 | Encoded. |
+| `HDR` | ✅ | `header_field` and a streaming variant. One field across a range, at a fraction of `OVER`'s bytes — what threading a whole group needs. Falls back to `XHDR`, remembering the answer. Accepts `225` or `221`: RFC 3977 §8.5.2 gives `HDR` its own code, RFC 2980 had `XHDR` share `HEAD`'s, and servers mix them. |
 
 ## RFC 2980 — Common NNTP extensions (pre-RFC-3977)
 
 | Command | Status | Notes |
 | --- | --- | --- |
 | `XOVER` | ✅ | Chosen directly when capabilities omit `OVER`, or after `OVER` is refused; the choice is remembered. |
-| `XHDR` | 🟡 | Encoded. |
+| `XHDR` | ✅ | Chosen when capabilities omit `HDR`, or after `HDR` is refused; the choice is remembered, exactly as for `XOVER`. |
 | `XPAT` | ⬜ | Server-side search; useful but rarely enabled. |
 | `AUTHINFO SIMPLE` | 🚫 | Obsolete and insecure. |
 | `XGTITLE`, `XINDEX`, `XTHREAD` | 🚫 | Server-specific. |

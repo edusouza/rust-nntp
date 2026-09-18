@@ -9,6 +9,189 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **The commands that were parsed but never issued now have client methods** ([#16]). Six
+  of them had wire grammar in `nntp-proto` and tests to match, and nothing that could
+  actually send one — an honest state to be in, and not one to stay in. The coverage matrix
+  has no yellow rows left.
+
+  | Method | Command | Why it is worth having |
+  | --- | --- | --- |
+  | `header_field` (+ streaming) | `HDR`, falling back to `XHDR` | One field across a range, at a fraction of `OVER`'s bytes — what threading a whole group needs |
+  | `article_numbers` | `LISTGROUP` | Which numbers a group *holds*, rather than the range they lie in: the only way to see the gaps expiry leaves |
+  | `next_article` / `previous_article` | `NEXT` / `LAST` | How a group is walked when the server offers no overview at all |
+  | `group_creation_times` | `LIST ACTIVE.TIMES` | When a group was created, and by whom |
+  | `available_header_fields` | `LIST HEADERS` | Which fields `HDR` will accept; `doctor` now reports it |
+  | `new_groups` | `NEWGROUPS` | The cheap half of keeping a group list fresh |
+
+  `HDR` accepts `225` **or** `221`: RFC 3977 §8.5.2 gives it its own code, RFC 2980 had
+  `XHDR` share `HEAD`'s, and servers mix them — insisting on the letter of the newer
+  document would refuse a response that is perfectly usable. `nntp-testserver` answers
+  whichever code the relevant specification gives, because a fake that blurs the two would
+  teach a client that the distinction does not exist.
+
+  `nntp-testserver` gained `HDR`/`XHDR`, `LIST HEADERS` and `NEWGROUPS`, which it had never
+  served. The opt-in real-server suite gained a tenth test: that `HDR References` and `OVER`
+  agree about the same articles, compared as sets of message-ids rather than as text. If
+  they disagreed, a group would thread differently depending on which command the reader
+  happened to use, and no offline fixture could catch it because both sides of it would be
+  ours.
+
+- **Posting, in the editor you already use** ([#11]). `w` writes a new article in the
+  selected group and `f` follows up to the one on screen; both open `$VISUAL` or `$EDITOR`
+  on a pre-filled article and offer what comes back. A reader that could not answer was
+  half a reader.
+
+  Set `from = "Your Name <you@example.org>"` under the server in the configuration file, or
+  `--from` when the server is given entirely on the command line and there is no configured
+  identity to take.
+  There is deliberately no default: a `From` assembled from the login name and the
+  machine's host name is how articles end up signed `user@localhost`, and a reader that
+  refuses to post until it is told who you are is better than one that posts as somebody
+  who does not exist.
+
+  **What the reader fills in for you.** One `Re: ` and only one — `Re: Re: Re:` is what
+  happens when every client adds its own. The `References` chain, so the reply threads
+  under its parent in *everybody else's* reader. `Followup-To` in place of `Newsgroups`
+  when the parent set one, which is the whole point of that header and is usually a
+  crosspost asking to be answered in one group. The parent quoted, with its signature
+  dropped — quoting somebody's `.signature` back at them is the most reliable way to be
+  told off on Usenet. And `Followup-To: poster` is refused rather than quietly posted to
+  the group: the author asked for mail, and this reader cannot send mail.
+
+  **The draft is never lost.** It is written into the reader's own data directory before
+  the editor opens and deleted only once the server has accepted the article. A rejection,
+  a dropped connection, a crash, a power cut mid-edit — all of them leave the file where it
+  is, and the reader says where. "Never lose a draft" cannot be bolted on after a failure;
+  it has to be where the file is written.
+
+  **Checked here, not by the server.** A missing `Newsgroups`, an empty `Subject`, a body
+  that is only whitespace, a `Path` or `Xref` header the server owns — all reported at once,
+  in front of you, before anything is sent. A `441` arrives after the article has been
+  offered and usually says one terse thing. When the server does refuse, its own words are
+  shown verbatim, because they are the only explanation there will be.
+
+  Non-ASCII is handled in both directions now: a subject with an accent in it goes out as
+  RFC 2047 encoded words, and a body that is not ASCII gets the MIME headers that say what
+  it is. This project spent a lot of effort on not *showing* people mojibake; sending it
+  would have been a poor joke.
+
+  Body lines beginning with `.` are dot-stuffed, so a `.signature` line does not truncate
+  the article — invisibly to the sender, since the server answers `240` either way.
+
+### Changed
+
+- **The key-list overlay scrolls** (`↑` `↓`, `PageUp`/`PageDown`, `g`/`G`), and says how
+  much of it is on screen. With posting and threading it outgrew a 24-line terminal, and an
+  overlay that silently cuts off its bottom third is worse than no help at all.
+
+### Fixed
+
+- **A posted article now comes back.** `nntp-testserver` accepted an article, answered
+  `240`, and filed it nowhere — so the group it was posted to never showed it, which is the
+  one thing somebody testing the posting path wants to see. It is now stored in the groups
+  it names, with a number after that group's high watermark, and comes back from `GROUP`,
+  `OVER` and `ARTICLE` like any other. An article for a group the server does not carry is
+  refused rather than accepted and dropped.
+
+  The reader had a second, independent reason to hide it: the article list is a snapshot of
+  the last fetch, so the article a person has just written was the one article missing from
+  it. Posting into the group on screen now reloads it — by selecting the group again rather
+  than refetching a range, since the new article is *past* the watermark the reader knows
+  about and no range built from what is on screen could include it.
+
+- **`nntp-testserver` no longer drops a connection a person is using.** Its sockets had a
+  thirty-second timeout, which keeps an abandoned connection from holding the test suite's
+  shutdown and is far too short for somebody reading an article: against the standalone
+  binary the connection died between one keystroke and the next, and the reader reported
+  whatever the platform calls an aborted socket — on Windows, a sentence about software on
+  the host computer aborting an established connection.
+
+  The timeout is now configurable, still thirty seconds for tests, and half an hour in the
+  standalone binary, where a person is at the other end. A server that does give up now
+  sends `400` before closing, so the client can say what happened instead of relaying an
+  operating-system message.
+
+- **`--host` no longer carries another server's credentials.** With an account configured,
+  `nntp-tui --host 127.0.0.1 --no-tls` used that account's username and password against
+  `127.0.0.1` — the configured server was picked up implicitly and only the host was
+  replaced. The plaintext guard refused to send the password, which is the only reason it
+  did not leave the machine; over `--tls` it would have gone to whatever host was named.
+
+  A password is given for one host, and typing another host's name is not permission to
+  offer it there. `--host` without `--server` now starts from nothing. Naming the server —
+  `--server es --host 127.0.0.1` — still carries its settings, because that is somebody
+  saying "those settings, this machine", and it is the documented way to reproduce a
+  problem locally.
+
+  Found by pointing the reader at the local fake server with a real account in the
+  configuration file.
+
+- **The reader takes connection flags without naming a subcommand.** `nntp-tui --host
+  127.0.0.1 --port 1119 --no-tls` answered `error: unexpected argument '--host' found`:
+  the flags belonged to the `tui` subcommand alone, even though the reader is what runs
+  when no subcommand is given. The README, the user guide and the real-server runbook all
+  documented the form that did not work, which is three documents agreeing against the
+  interface. Both forms work now, and giving the flags before a *different* subcommand is
+  refused with a message rather than silently ignored.
+
+- **`nntp-testserver` now advertises `POST`** when it will accept articles. It answered
+  `340` to `POST` while leaving the capability out of `CAPABILITIES`, which is a shape of
+  server that does not exist — and a fake that behaves that way teaches a client the wrong
+  lesson. Found by the first client that checked the capability before offering an article.
+
+- **Threaded article list** ([#10]). Replies used to be marked with a chevron and left
+  where the server's numbering put them, so a conversation was scattered through the list
+  in arrival order. The list is now grouped into conversations, with replies indented under
+  what they answer. `t` switches between threaded and flat; `z` folds the replies under the
+  cursor away and brings them back; `threaded = false` under `[ui]` opens the reader flat.
+
+  The marker rather than an indent *was* the right call for v0.1, and this is why: real
+  `References` chains are broken. Parents expire, are cancelled, or were never carried by
+  this server; senders trim or reverse the chain; gateways rewrite it. So the grouping is
+  [Jamie Zawinski's algorithm](https://www.jwz.org/doc/threading.html), which exists for
+  exactly that traffic:
+
+  - a reply whose parent is missing still groups with its siblings, under a placeholder
+    for the article nobody has — kept only when it holds more than one reply, since with
+    one it would say nothing;
+  - a thread with no `References` anywhere is rescued by subject, after stripping `Re:` in
+    the languages a reader actually meets, the `Re[2]:` counter form and a leading
+    `[list-tag]`. Deliberately narrow, because merging on subject alone is how unrelated
+    articles end up in one another's conversations;
+  - a `References` cycle is broken rather than followed, and every article in it is still
+    shown;
+  - nesting is capped, and the cap is applied iteratively *before* the tree is built —
+    otherwise a group carrying one very long reply chain would overflow the stack instead
+    of drawing a deep thread. The articles are kept either way.
+
+  Two rules in the reader are worth knowing because they are visible. Indentation is the
+  article's real depth in its thread whether or not its ancestors are drawn, so turning
+  the unread filter on and off does not slide the list sideways. And a fold only applies
+  to a row that is drawn: if the unread filter hides the article you folded, its unread
+  replies are shown anyway, because the filter's job is to show what you have not read.
+
+- **Overview records appear as they arrive** ([#8]). Opening a group used to fetch the
+  whole range before showing anything: the status bar moved, the article pane stayed
+  empty, and on a group with a hundred thousand articles it stayed empty for a long time.
+  The interface was never blocked, but to a reader "not blocked" and "nothing on screen"
+  look the same.
+
+  Each chunk is now sent as it is read and merged into the list on display, **newest chunk
+  first** — fetching forwards would fill the pane with the oldest end of the range and
+  leave what the reader came for until last.
+
+  The cursor is the delicate part of arriving records. A cursor sitting on the newest
+  article follows the newest; a cursor the user has moved stays on the article it is on,
+  even though records landing in front of it change its index. Anything else moves
+  somebody's place while they are reading.
+
+  Telling one fetch from another needs more than the group name, because refreshing a
+  group while its previous fetch is still arriving produces two fetches of the same name.
+  Each one now carries a `FetchToken` minted by the interface and echoed by the worker,
+  and records from a superseded fetch are dropped rather than merged into the current
+  list — the same guarantee as the existing "late reply for another group" rule, extended
+  to the case the group name cannot see.
+
 - **MIME multipart bodies and `format=flowed`** ([#12]). The reader used to show the raw
   body: boundary lines, part headers, base64 and the HTML copy of a message that had also
   arrived as plain text. Now the body is a part tree, and the reader shows the part a
@@ -346,7 +529,10 @@ records what was checked, against which server, on what date ([#4]).
 [#3]: https://github.com/edusouza/rust-nntp/issues/3
 [#4]: https://github.com/edusouza/rust-nntp/issues/4
 [#7]: https://github.com/edusouza/rust-nntp/issues/7
+[#8]: https://github.com/edusouza/rust-nntp/issues/8
 [#9]: https://github.com/edusouza/rust-nntp/issues/9
-[#9]: https://github.com/edusouza/rust-nntp/issues/9
+[#10]: https://github.com/edusouza/rust-nntp/issues/10
+[#11]: https://github.com/edusouza/rust-nntp/issues/11
 [#12]: https://github.com/edusouza/rust-nntp/issues/12
+[#16]: https://github.com/edusouza/rust-nntp/issues/16
 [#17]: https://github.com/edusouza/rust-nntp/issues/17

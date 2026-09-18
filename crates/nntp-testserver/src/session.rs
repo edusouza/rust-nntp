@@ -4,9 +4,10 @@
 //! be tested over in-memory buffers, the same trick the client uses.
 
 use std::io::{BufRead, BufReader, Read, Write};
+use std::sync::{RwLock, RwLockReadGuard};
 
 use crate::config::{CapabilityProfile, GreetingMode, ServerConfig};
-use crate::corpus::{Corpus, Group};
+use crate::corpus::{Article, Corpus, Group};
 
 /// Whether the session continues after a command.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -18,7 +19,59 @@ pub enum Flow {
     /// The client sent `STARTTLS` and has been told to proceed; the caller must now
     /// perform the handshake and start a fresh command phase over the encrypted stream.
     UpgradeToTls,
+    /// The client sent `POST` and has been told `340`; the caller must now read the
+    /// article as a data block and hand it to [`Session::accept_article`].
+    ///
+    /// The command dispatcher only writes, so reading the block belongs to whichever loop
+    /// owns the input — and both of them, plaintext and TLS, get it the same way.
+    ReadArticle,
 }
+
+/// An article a client posted, as the server received it.
+///
+/// Kept so that a test can assert on what actually arrived rather than on what the client
+/// believes it sent — which is the only way to catch a dot-stuffing bug, since the sender
+/// cannot see its own truncation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PostedArticle {
+    /// The lines as received, unstuffed and without terminators.
+    pub lines: Vec<Vec<u8>>,
+}
+
+impl PostedArticle {
+    /// A header value, ignoring case.
+    pub fn header(&self, name: &str) -> Option<String> {
+        let prefix = format!("{}:", name.to_ascii_lowercase());
+        self.lines
+            .iter()
+            .take_while(|line| !line.is_empty())
+            .find(|line| {
+                String::from_utf8_lossy(line)
+                    .to_ascii_lowercase()
+                    .starts_with(&prefix)
+            })
+            .map(|line| {
+                String::from_utf8_lossy(line)
+                    .split_once(':')
+                    .map_or_else(String::new, |(_, value)| value.trim().to_owned())
+            })
+    }
+
+    /// The body, as text.
+    pub fn body_text(&self) -> String {
+        let body: Vec<String> = self
+            .lines
+            .iter()
+            .skip_while(|line| !line.is_empty())
+            .skip(1)
+            .map(|line| String::from_utf8_lossy(line).into_owned())
+            .collect();
+        body.join("\n")
+    }
+}
+
+/// Where a server keeps what clients have posted to it.
+pub type Postbox = std::sync::Arc<std::sync::Mutex<Vec<PostedArticle>>>;
 
 /// Why a session stopped.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -48,17 +101,24 @@ struct State {
 /// A single client session.
 #[derive(Debug)]
 pub struct Session<'a> {
-    corpus: &'a Corpus,
+    corpus: &'a RwLock<Corpus>,
     config: &'a ServerConfig,
     state: State,
+    postbox: Option<Postbox>,
 }
 
 impl<'a> Session<'a> {
     /// Starts a session.
-    pub fn new(corpus: &'a Corpus, config: &'a ServerConfig) -> Self {
+    ///
+    /// The corpus is behind a lock because a client can add to it: an article accepted by
+    /// `POST` is filed into the group it names, so it comes back from `GROUP`, `OVER` and
+    /// `ARTICLE` like any other. A fake server that takes an article and then denies all
+    /// knowledge of it cannot be used to check that posting works.
+    pub fn new(corpus: &'a RwLock<Corpus>, config: &'a ServerConfig) -> Self {
         Self {
             corpus,
             config,
+            postbox: None,
             state: State {
                 truncate_next_block: config.quirks.truncate_next_block,
                 // A server that advertises READER is already in reader mode.
@@ -66,6 +126,11 @@ impl<'a> Session<'a> {
                 ..State::default()
             },
         }
+    }
+
+    /// Keeps posted articles where the caller can inspect them.
+    pub fn set_postbox(&mut self, postbox: Postbox) {
+        self.postbox = Some(postbox);
     }
 
     /// Whether this session is running over an encrypted transport.
@@ -107,6 +172,13 @@ impl<'a> Session<'a> {
                 Flow::Continue => {}
                 Flow::Close => return Ok(Outcome::Closed),
                 Flow::UpgradeToTls => return Ok(Outcome::UpgradeToTls),
+                Flow::ReadArticle => {
+                    let article = read_article(input)?;
+                    match self.accept_article(article, output)? {
+                        Flow::Close => return Ok(Outcome::Closed),
+                        _ => continue,
+                    }
+                }
             }
         }
     }
@@ -167,6 +239,12 @@ impl<'a> Session<'a> {
                         ));
                     }
                     return Ok(Outcome::UpgradeToTls);
+                }
+                Flow::ReadArticle => {
+                    let article = read_article(reader)?;
+                    if self.accept_article(article, reader.get_mut())? == Flow::Close {
+                        return Ok(Outcome::Closed);
+                    }
                 }
             }
         }
@@ -251,6 +329,9 @@ impl<'a> Session<'a> {
                 self.fetch(output, &verb, &args).map(|()| Flow::Continue)
             }
             "OVER" | "XOVER" => self.over(output, &verb, &args).map(|()| Flow::Continue),
+            "HDR" | "XHDR" => self.hdr(output, &verb, &args).map(|()| Flow::Continue),
+            "NEWGROUPS" => self.newgroups(output, &args).map(|()| Flow::Continue),
+            "POST" => self.post(output),
             "NEXT" | "LAST" => self.step(output, &verb).map(|()| Flow::Continue),
             other => self
                 .status(output, 500, &format!("command {other} not recognised"))
@@ -280,6 +361,190 @@ impl<'a> Session<'a> {
 
         self.status(output, 382, "continue with TLS negotiation")?;
         Ok(Flow::UpgradeToTls)
+    }
+
+    /// `HDR` / `XHDR`: one header field across a range (RFC 3977 §8.5, RFC 2980 §2.9).
+    fn hdr(&mut self, output: &mut impl Write, verb: &str, args: &[&str]) -> std::io::Result<()> {
+        if verb == "HDR" && self.config.capabilities == CapabilityProfile::NoOver {
+            // A server old enough to lack OVER lacks HDR too, and answering one without
+            // the other would be a server shape that does not exist.
+            return self.status(output, 500, "command not recognised");
+        }
+
+        let Some(field) = args.first() else {
+            return self.status(output, 501, "HDR needs a header name");
+        };
+        let field = (*field).to_owned();
+
+        // The message-id form needs no selected group.
+        if let Some(arg) = args.get(1)
+            && arg.starts_with('<')
+        {
+            let line = {
+                let corpus = self.corpus();
+                corpus
+                    .find_by_id(arg)
+                    .map(|(_, _, article)| header_line(0, article, &field))
+            };
+            let Some(line) = line else {
+                return self.status(output, 430, "no such article");
+            };
+            let code = headers_follow_code(verb);
+            self.status(output, code, &format!("{field} header follows"))?;
+            return self.block(output, [line.as_slice()]);
+        }
+
+        let Some(group) = self.selected_group(&self.corpus()).cloned() else {
+            return self.status(output, 412, "no newsgroup selected");
+        };
+
+        let (low, high) = match args.get(1) {
+            None => match self.state.current_article {
+                Some(number) => (number, Some(number)),
+                None => return self.status(output, 420, "no article selected"),
+            },
+            Some(spec) => match parse_range(spec) {
+                Some(range) => range,
+                None => return self.status(output, 501, "bad range"),
+            },
+        };
+        let high = high.unwrap_or(u64::MAX);
+
+        let lines: Vec<Vec<u8>> = group
+            .articles
+            .iter()
+            .filter(|(number, _)| **number >= low && **number <= high)
+            .map(|(number, article)| header_line(*number, article, &field))
+            .collect();
+
+        let code = headers_follow_code(verb);
+        self.status(output, code, &format!("{field} header follows"))?;
+        self.block(output, lines.iter().map(Vec::as_slice))
+    }
+
+    /// `NEWGROUPS`: groups created since a date (RFC 3977 §7.3).
+    fn newgroups(&mut self, output: &mut impl Write, args: &[&str]) -> std::io::Result<()> {
+        let Some(since) = parse_newgroups_date(args) else {
+            return self.status(output, 501, "NEWGROUPS needs yyyymmdd hhmmss [GMT]");
+        };
+
+        let lines: Vec<Vec<u8>> = {
+            let corpus = self.corpus();
+            corpus
+                .groups()
+                .iter()
+                .filter(|group| group.created >= since)
+                .map(|group| {
+                    let (low, high) = group.watermarks();
+                    format!("{} {} {} {}", group.name, high, low, group.posting.flag()).into_bytes()
+                })
+                .collect()
+        };
+
+        self.status(output, 231, "list of new newsgroups follows")?;
+        self.block(output, lines.iter().map(Vec::as_slice))
+    }
+
+    /// `POST`: the first half of the exchange. The article arrives next.
+    fn post(&mut self, output: &mut impl Write) -> std::io::Result<Flow> {
+        if self.config.greeting == GreetingMode::NoPosting {
+            self.status(output, 440, "posting not permitted")?;
+            return Ok(Flow::Continue);
+        }
+
+        self.status(output, 340, "send the article; end with a lone .")?;
+        Ok(Flow::ReadArticle)
+    }
+
+    /// The second half: what the client sent, and whether it is taken.
+    ///
+    /// # Errors
+    ///
+    /// Propagates IO errors from the transport.
+    pub fn accept_article(
+        &mut self,
+        lines: Vec<Vec<u8>>,
+        output: &mut impl Write,
+    ) -> std::io::Result<Flow> {
+        let article = PostedArticle { lines };
+
+        if let Some(reason) = &self.config.quirks.refuse_post {
+            // Refused *after* reading it, which is what a real server does: it cannot know
+            // the article is unacceptable until it has one.
+            let reason = reason.clone();
+            self.status(output, 441, &reason)?;
+            return Ok(Flow::Continue);
+        }
+
+        for required in ["From", "Newsgroups", "Subject"] {
+            if article
+                .header(required)
+                .is_none_or(|value| value.trim().is_empty())
+            {
+                self.status(output, 441, &format!("missing {required} header"))?;
+                return Ok(Flow::Continue);
+            }
+        }
+
+        let message_id = article.header("Message-ID").unwrap_or_else(|| {
+            // A server assigns one when the poster did not, which is the usual case: a
+            // reader that generated its own would have to guarantee it is unique on a
+            // network it cannot see.
+            format!(
+                "<{}.{}@test.invalid>",
+                self.state.commands_served,
+                std::process::id()
+            )
+        });
+
+        // Filed into the groups it names, so it comes back from `GROUP`, `OVER` and
+        // `ARTICLE` like any other article. Without this the server takes an article,
+        // answers `240`, and then denies all knowledge of it — which is exactly what
+        // somebody testing the posting path is trying to check, and it is not what a
+        // server does.
+        let filed = {
+            let stored = Article {
+                message_id: message_id.clone(),
+                head: article
+                    .lines
+                    .iter()
+                    .take_while(|line| !line.is_empty())
+                    .cloned()
+                    .collect(),
+                body: article
+                    .lines
+                    .iter()
+                    .skip_while(|line| !line.is_empty())
+                    .skip(1)
+                    .cloned()
+                    .collect(),
+            };
+            let groups = newsgroups_of(&article);
+            let mut corpus = self
+                .corpus
+                .write()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            corpus.inject(&groups, &stored)
+        };
+
+        if filed.is_empty() {
+            // Every group it named is one this server does not carry. A real server
+            // refuses rather than accepting an article it has nowhere to put.
+            self.status(output, 441, "no such newsgroup here")?;
+            return Ok(Flow::Continue);
+        }
+
+        if let Some(postbox) = &self.postbox {
+            // A poisoned mutex means another session thread panicked; the article is
+            // dropped rather than panicking this one too, and the test that cares will
+            // fail on the empty postbox with a better message than a panic here.
+            if let Ok(mut posted) = postbox.lock() {
+                posted.push(article);
+            }
+        }
+
+        self.status(output, 240, &format!("article received {message_id}"))?;
+        Ok(Flow::Continue)
     }
 
     fn needs_auth(&self) -> bool {
@@ -314,6 +579,15 @@ impl<'a> Session<'a> {
             CapabilityProfile::Legacy => {}
         }
         lines.push("LIST ACTIVE ACTIVE.TIMES NEWSGROUPS OVERVIEW.FMT".to_owned());
+        // RFC 3977 §5.2.3: a server that will accept articles says so here as well as in
+        // its greeting, and a client is entitled to believe the list. Not advertising it
+        // while answering `340` to POST is a shape of server that does not exist, and a
+        // fake that behaves that way teaches a client the wrong lesson.
+        if self.config.greeting != GreetingMode::NoPosting
+            && self.config.capabilities != CapabilityProfile::Transit
+        {
+            lines.push("POST".to_owned());
+        }
         if self.config.starttls && !self.state.encrypted {
             lines.push("STARTTLS".to_owned());
         }
@@ -401,7 +675,25 @@ impl<'a> Session<'a> {
         let Some(name) = args.first() else {
             return self.status(output, 501, "GROUP needs a newsgroup name");
         };
-        let Some(group) = self.corpus.find(name) else {
+        // Everything wanted from the corpus is taken out here and the lock released before
+        // a byte is written: holding a read guard across the write would stall a POST from
+        // another session for as long as the output takes, which with `--line-delay` is
+        // measured in seconds.
+        let found = {
+            let corpus = self.corpus();
+            corpus.find(name).map(|group| {
+                let (low, high) = group.watermarks();
+                (
+                    low,
+                    high,
+                    group.articles.len(),
+                    group.name.clone(),
+                    group.low(),
+                )
+            })
+        };
+
+        let Some((low, high, count, name, first)) = found else {
             // INN 2.8.0's exact wording, chosen deliberately: it carries no group name.
             // The previous message here began with the group name, which happened to match
             // what the client's parser assumed a 411 looked like -- so the fake server was
@@ -409,11 +701,6 @@ impl<'a> Session<'a> {
             // not be more convenient than the real one.
             return self.status(output, 411, "No such newsgroup");
         };
-
-        let (low, high) = group.watermarks();
-        let count = group.articles.len();
-        let name = group.name.clone();
-        let first = group.low();
 
         self.state.current_group = Some(name.clone());
         self.state.current_article = first;
@@ -429,17 +716,22 @@ impl<'a> Session<'a> {
             },
         };
 
-        let Some(group) = self.corpus.find(&name) else {
-            return self.status(output, 411, "No such newsgroup");
+        let found = {
+            let corpus = self.corpus();
+            corpus.find(&name).map(|group| {
+                let (low, high) = group.watermarks();
+                let numbers: Vec<Vec<u8>> = group
+                    .articles
+                    .keys()
+                    .map(|number| number.to_string().into_bytes())
+                    .collect();
+                (low, high, group.articles.len(), numbers)
+            })
         };
 
-        let (low, high) = group.watermarks();
-        let count = group.articles.len();
-        let numbers: Vec<Vec<u8>> = group
-            .articles
-            .keys()
-            .map(|number| number.to_string().into_bytes())
-            .collect();
+        let Some((low, high, count, numbers)) = found else {
+            return self.status(output, 411, "No such newsgroup");
+        };
 
         self.state.current_group = Some(name.clone());
         self.status(output, 211, &format!("{count} {low} {high} {name}"))?;
@@ -454,7 +746,7 @@ impl<'a> Session<'a> {
         match keyword.as_str() {
             "ACTIVE" => {
                 let lines: Vec<Vec<u8>> = self
-                    .corpus
+                    .corpus()
                     .groups()
                     .iter()
                     .map(|group| {
@@ -468,7 +760,7 @@ impl<'a> Session<'a> {
             }
             "NEWSGROUPS" => {
                 let lines: Vec<Vec<u8>> = self
-                    .corpus
+                    .corpus()
                     .groups()
                     .iter()
                     .map(|group| {
@@ -483,7 +775,7 @@ impl<'a> Session<'a> {
             }
             "ACTIVE.TIMES" => {
                 let lines: Vec<Vec<u8>> = self
-                    .corpus
+                    .corpus()
                     .groups()
                     .iter()
                     .map(|group| {
@@ -512,37 +804,44 @@ impl<'a> Session<'a> {
                     ],
                 )
             }
+            "HEADERS" => {
+                // A colon alone means "any field in the article", which RFC 3977 §8.6
+                // allows and which is the honest answer for a server that stores whole
+                // articles rather than a fixed overview database.
+                self.status(output, 215, "field list follows")?;
+                self.block(output, [b":".as_slice()])
+            }
             other => self.status(output, 501, &format!("LIST {other} is not supported")),
         }
     }
 
     fn fetch(&mut self, output: &mut impl Write, verb: &str, args: &[&str]) -> std::io::Result<()> {
-        let found = match args.first() {
-            Some(arg) if arg.starts_with('<') => self
-                .corpus
-                .find_by_id(arg)
-                .map(|(_, _, article)| (0u64, article.clone())),
-            Some(arg) => {
-                let Ok(number) = arg.parse::<u64>() else {
-                    return self.status(output, 501, "bad article number");
-                };
-                match self.selected_group() {
+        let number = match args.first() {
+            Some(arg) if arg.starts_with('<') => None,
+            Some(arg) => match arg.parse::<u64>() {
+                Ok(number) => Some(number),
+                Err(_) => return self.status(output, 501, "bad article number"),
+            },
+            None => match self.state.current_article {
+                Some(number) => Some(number),
+                None => return self.status(output, 420, "no article selected"),
+            },
+        };
+
+        // One guard for the whole lookup, released before anything is written.
+        let found = {
+            let corpus = self.corpus();
+            match number {
+                None => args
+                    .first()
+                    .and_then(|arg| corpus.find_by_id(arg))
+                    .map(|(_, _, article)| (0u64, article.clone())),
+                Some(number) => match self.selected_group(&corpus) {
                     None => return self.status(output, 412, "no newsgroup selected"),
                     Some(group) => group
                         .article_by_number(number)
                         .map(|article| (number, article.clone())),
-                }
-            }
-            None => {
-                let Some(number) = self.state.current_article else {
-                    return self.status(output, 420, "no article selected");
-                };
-                match self.selected_group() {
-                    None => return self.status(output, 412, "no newsgroup selected"),
-                    Some(group) => group
-                        .article_by_number(number)
-                        .map(|article| (number, article.clone())),
-                }
+                },
             }
         };
 
@@ -593,7 +892,8 @@ impl<'a> Session<'a> {
         if let Some(arg) = args.first()
             && arg.starts_with('<')
         {
-            let Some((group, number, article)) = self.corpus.find_by_id(arg) else {
+            let corpus = self.corpus();
+            let Some((group, number, article)) = corpus.find_by_id(arg) else {
                 return self.status(output, 430, "no such article");
             };
             let line = article.overview_line(number, &group.name);
@@ -601,7 +901,7 @@ impl<'a> Session<'a> {
             return self.block(output, [line.as_slice()]);
         }
 
-        let Some(group) = self.selected_group().cloned() else {
+        let Some(group) = self.selected_group(&self.corpus()).cloned() else {
             return self.status(output, 412, "no newsgroup selected");
         };
 
@@ -638,7 +938,7 @@ impl<'a> Session<'a> {
     }
 
     fn step(&mut self, output: &mut impl Write, verb: &str) -> std::io::Result<()> {
-        let Some(group) = self.selected_group().cloned() else {
+        let Some(group) = self.selected_group(&self.corpus()).cloned() else {
             return self.status(output, 412, "no newsgroup selected");
         };
         let Some(current) = self.state.current_article else {
@@ -662,11 +962,27 @@ impl<'a> Session<'a> {
         }
     }
 
-    fn selected_group(&self) -> Option<&Group> {
+    /// The corpus, for reading.
+    ///
+    /// A poisoned lock means another session thread panicked mid-write. The corpus is a
+    /// fixture, not a database, so the session carries on with what is there rather than
+    /// taking this thread down as well.
+    fn corpus(&self) -> RwLockReadGuard<'a, Corpus> {
+        self.corpus
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// The selected group, looked up in a corpus the caller is already holding open.
+    ///
+    /// Takes the guard rather than locking again: a `&Group` cannot outlive the lock it
+    /// came from, and re-locking in here would hand back a reference into a guard that
+    /// dies at the end of this function.
+    fn selected_group<'c>(&self, corpus: &'c Corpus) -> Option<&'c Group> {
         self.state
             .current_group
             .as_ref()
-            .and_then(|name| self.corpus.find(name))
+            .and_then(|name| corpus.find(name))
     }
 
     // -- output helpers -----------------------------------------------------------------
@@ -733,6 +1049,130 @@ fn parse_range(arg: &str) -> Option<(u64, Option<u64>)> {
     }
 }
 
+/// The success code for a header listing, which differs between the two spellings.
+///
+/// RFC 3977 §8.5.2 gives `HDR` its own code, `225`; RFC 2980 §2.9 had `XHDR` share `221`
+/// with `HEAD`. Servers have been seen to mix them, and the client accepts either from
+/// either — but this server answers what the relevant specification says, because a fake
+/// that blurs the two teaches a client that the distinction does not exist.
+fn headers_follow_code(verb: &str) -> u16 {
+    if verb.starts_with('X') { 221 } else { 225 }
+}
+
+/// One `HDR` line: the article number, a space, and the field's value.
+///
+/// A field the article does not have still gets a line — the article exists, and leaving it
+/// out would make the response look like a shorter range than was asked for.
+fn header_line(number: u64, article: &Article, field: &str) -> Vec<u8> {
+    let mut line = number.to_string().into_bytes();
+    if let Some(value) = article.header_value(field) {
+        line.push(b' ');
+        line.extend_from_slice(&value);
+    }
+    line
+}
+
+/// `yyyymmdd hhmmss [GMT]` as seconds since the epoch.
+///
+/// Two-digit years are accepted because RFC 3977 §7.3.1 still allows them, and a server
+/// that refuses one is refusing a client that is following the specification.
+fn parse_newgroups_date(args: &[&str]) -> Option<u64> {
+    let date = args.first()?;
+    let time = args.get(1)?;
+
+    let (year, rest) = match date.len() {
+        8 => (date.get(..4)?.parse::<i32>().ok()?, date.get(4..)?),
+        6 => {
+            let two = date.get(..2)?.parse::<i32>().ok()?;
+            // RFC 3977 §7.3.1: within the century closest to the present.
+            (
+                if two >= 70 { 1900 + two } else { 2000 + two },
+                date.get(2..)?,
+            )
+        }
+        _ => return None,
+    };
+
+    let month = rest.get(..2)?.parse::<u32>().ok()?;
+    let day = rest.get(2..)?.parse::<u32>().ok()?;
+    let hour = time.get(..2)?.parse::<u32>().ok()?;
+    let minute = time.get(2..4)?.parse::<u32>().ok()?;
+    let second = time.get(4..6)?.parse::<u32>().ok()?;
+
+    if !(1..=12).contains(&month) || !(1..=31).contains(&day) {
+        return None;
+    }
+    if hour > 23 || minute > 59 || second > 60 {
+        return None;
+    }
+
+    let seconds = days_from_civil(year, month, day) * 86_400
+        + i64::from(hour) * 3_600
+        + i64::from(minute) * 60
+        + i64::from(second);
+
+    Some(seconds.max(0).unsigned_abs())
+}
+
+/// Days since 1970-01-01 for a civil date.
+///
+/// Howard Hinnant's `days_from_civil`, which is exact for any proleptic Gregorian date and
+/// is ten lines. A fake server acquiring a date library to compare one timestamp would cost
+/// more than it explains.
+const fn days_from_civil(year: i32, month: u32, day: u32) -> i64 {
+    let year = if month <= 2 { year - 1 } else { year } as i64;
+    let era = if year >= 0 { year } else { year - 399 } / 400;
+    let year_of_era = year - era * 400;
+
+    let month = month as i64;
+    let day_of_year =
+        (153 * (if month > 2 { month - 3 } else { month + 9 }) + 2) / 5 + day as i64 - 1;
+    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
+
+    era * 146_097 + day_of_era - 719_468
+}
+
+/// The groups an article is addressed to.
+fn newsgroups_of(article: &PostedArticle) -> Vec<String> {
+    article
+        .header("Newsgroups")
+        .unwrap_or_default()
+        .split(',')
+        .map(|group| group.trim().to_owned())
+        .filter(|group| !group.is_empty())
+        .collect()
+}
+
+/// Reads a data block a client is sending: lines until a lone `.`, unstuffed.
+///
+/// The mirror of the client's dot-stuffing, and it has to be exact. A server that does not
+/// undo the stuffing turns every line starting with `.` into one starting with `..` for
+/// everybody who reads the article afterwards.
+///
+/// An unterminated block ends at end of input rather than blocking forever: the client has
+/// gone, and a fake server that hangs is worse to debug than one that gives up.
+fn read_article(input: &mut impl BufRead) -> std::io::Result<Vec<Vec<u8>>> {
+    let mut lines = Vec::new();
+    let mut line = Vec::new();
+
+    loop {
+        line.clear();
+        if input.read_until(b'\n', &mut line)? == 0 {
+            return Ok(lines);
+        }
+
+        let content = trim_eol(&line);
+        if content == b"." {
+            return Ok(lines);
+        }
+
+        lines.push(match content.strip_prefix(b".") {
+            Some(rest) => rest.to_vec(),
+            None => content.to_vec(),
+        });
+    }
+}
+
 fn trim_eol(line: &[u8]) -> &[u8] {
     let line = line.strip_suffix(b"\n").unwrap_or(line);
     line.strip_suffix(b"\r").unwrap_or(line)
@@ -745,7 +1185,7 @@ mod tests {
 
     /// Runs a script of commands against a session and returns everything it wrote.
     fn converse(config: &ServerConfig, commands: &str) -> String {
-        let corpus = Corpus::sample();
+        let corpus = RwLock::new(Corpus::sample());
         let mut session = Session::new(&corpus, config);
         let mut input = std::io::Cursor::new(commands.as_bytes().to_vec());
         let mut output = Vec::new();

@@ -5,6 +5,15 @@ use std::path::PathBuf;
 use clap::{Args, Parser, Subcommand, ValueEnum};
 
 /// A terminal news reader for Usenet.
+///
+/// The connection flags are accepted both here and on every subcommand, because the reader
+/// is what runs when no subcommand is given: `nntp-tui --host localhost --no-tls` has to
+/// work, or the default action is the one action that cannot be pointed anywhere.
+///
+/// Clap's `args_conflicts_with_subcommands` would express that in one attribute and is
+/// deliberately not used: it also conflicts the *global* options with every subcommand, so
+/// `nntp-tui --config x doctor` would stop working. [`Cli::check`] refuses the ambiguous
+/// combination instead, which is narrower and says why.
 #[derive(Debug, Parser)]
 #[command(name = "nntp-tui", version, about, long_about = None)]
 pub struct Cli {
@@ -20,12 +29,36 @@ pub struct Cli {
     #[arg(long, global = true, value_name = "PATH")]
     pub log_file: Option<PathBuf>,
 
+    /// Connection details for the reader, when no subcommand is given.
+    #[command(flatten)]
+    pub server: ServerArgs,
+
     /// What to do. With no subcommand, the terminal reader opens.
     #[command(subcommand)]
     pub command: Option<Command>,
 }
 
 impl Cli {
+    /// Refuses a connection flag that cannot mean anything.
+    ///
+    /// `nntp-tui --host a groups --host b` names two servers and the subcommand's own flag
+    /// wins, so the other one would be silently ignored — and a flag somebody typed that
+    /// does nothing is worse than an error.
+    ///
+    /// # Errors
+    ///
+    /// If a subcommand is present and a connection flag was given before it.
+    pub fn check(&self) -> anyhow::Result<()> {
+        if self.command.is_some() && self.server != ServerArgs::default() {
+            anyhow::bail!(
+                "connection flags before a subcommand apply to the reader, which this \
+                 invocation does not open; pass them to the subcommand instead, as in \
+                 `nntp-tui groups --host 127.0.0.1 --no-tls`"
+            );
+        }
+        Ok(())
+    }
+
     /// Whether this invocation will open the terminal reader.
     ///
     /// The reader owns the terminal, so logs have to go to a file rather than to standard
@@ -158,7 +191,7 @@ pub enum ConfigAction {
 /// The flags override the configured server field by field, so
 /// `--server es --host localhost` uses the credentials from `es` against a local server —
 /// which is exactly what one wants when reproducing a problem.
-#[derive(Debug, Args, Clone, Default)]
+#[derive(Debug, Args, Clone, Default, PartialEq, Eq)]
 pub struct ServerArgs {
     /// Use this server from the configuration file
     #[arg(long, short = 's', value_name = "NAME")]
@@ -183,6 +216,13 @@ pub struct ServerArgs {
     /// Connect without encryption
     #[arg(long, conflicts_with_all = ["tls", "starttls"])]
     pub no_tls: bool,
+
+    /// Who to post as, overriding the configuration
+    ///
+    /// Needed when the server is given entirely on the command line, since there is then
+    /// no configured server to take an identity from.
+    #[arg(long, value_name = "ADDRESS")]
+    pub from: Option<String>,
 
     /// Username for AUTHINFO, overriding the configuration
     #[arg(long, short = 'u', value_name = "USER")]
@@ -258,6 +298,61 @@ mod tests {
         let cli = parse(&["nntp-tui"]);
         assert!(cli.command.is_none());
         assert!(cli.opens_the_reader());
+    }
+
+    #[test]
+    fn the_reader_takes_connection_flags_without_naming_a_subcommand() {
+        // Every "try it without a Usenet account" instruction in this project — the
+        // README, the user guide and the real-server runbook — reached for this form,
+        // and it used to be an error: the flags belonged to the `tui` subcommand alone.
+        // Three documents agreeing against the interface is evidence about the interface.
+        let cli = parse(&[
+            "nntp-tui",
+            "--host",
+            "127.0.0.1",
+            "--port",
+            "1119",
+            "--no-tls",
+            "--from",
+            "A Tester <tester@example.org>",
+        ]);
+
+        assert!(cli.command.is_none());
+        assert!(cli.opens_the_reader());
+        assert_eq!(cli.server.host.as_deref(), Some("127.0.0.1"));
+        assert_eq!(cli.server.port, Some(1119));
+        assert!(cli.server.no_tls);
+        assert_eq!(
+            cli.server.from.as_deref(),
+            Some("A Tester <tester@example.org>")
+        );
+    }
+
+    #[test]
+    fn naming_the_subcommand_still_works() {
+        let cli = parse(&["nntp-tui", "tui", "--host", "127.0.0.1", "--no-tls"]);
+        match cli.command {
+            Some(Command::Tui { server }) => {
+                assert_eq!(server.host.as_deref(), Some("127.0.0.1"));
+                assert!(server.no_tls);
+            }
+            other => panic!("expected the tui subcommand, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn connection_flags_cannot_be_split_across_the_two_places() {
+        // `nntp-tui --host a groups --host b` has two answers and no way to pick one, so
+        // it is refused rather than silently ignoring the one the subcommand did not get.
+        let cli = parse(&["nntp-tui", "--host", "a", "groups"]);
+        let error = cli.check().expect_err("should be refused");
+        assert!(error.to_string().contains("subcommand"), "{error}");
+
+        // And the global options are untouched by that rule, which is the trap the
+        // one-attribute version of this fell into.
+        parse(&["nntp-tui", "--config", "x", "groups"])
+            .check()
+            .expect("globals still work before a subcommand");
     }
 
     #[test]

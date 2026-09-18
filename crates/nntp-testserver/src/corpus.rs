@@ -286,6 +286,34 @@ impl Corpus {
         self.groups.iter().find(|group| group.name == name)
     }
 
+    /// Looks up a group by name for modification.
+    pub fn find_mut(&mut self, name: &str) -> Option<&mut Group> {
+        self.groups.iter_mut().find(|group| group.name == name)
+    }
+
+    /// Files an article a client posted, as a server does.
+    ///
+    /// One number per group it is accepted into, assigned after that group's current high
+    /// watermark — the same shape as a crosspost on a real server, where each group
+    /// numbers the article for itself. Groups this server does not carry are skipped and
+    /// reported, since a server cannot file an article somewhere it has no group.
+    ///
+    /// Returns the groups it landed in with the number each gave it.
+    pub fn inject(&mut self, groups: &[String], article: &Article) -> Vec<(String, u64)> {
+        let mut filed = Vec::new();
+
+        for name in groups {
+            let Some(group) = self.find_mut(name) else {
+                continue;
+            };
+            let number = group.high().map_or(1, |high| high + 1);
+            group.articles.insert(number, article.clone());
+            filed.push((name.clone(), number));
+        }
+
+        filed
+    }
+
     /// Looks up an article by message-id across every group.
     pub fn find_by_id(&self, message_id: &str) -> Option<(&Group, u64, &Article)> {
         self.groups.iter().find_map(|group| {

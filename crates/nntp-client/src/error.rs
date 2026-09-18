@@ -120,6 +120,31 @@ pub enum ClientError {
         what: String,
     },
 
+    /// Posting was refused before anything was sent.
+    ///
+    /// The connection is untouched: the greeting said `201`, or `CAPABILITIES` did not
+    /// advertise `POST`, or the group is not one this server accepts articles for. Finding
+    /// out *after* offering an article costs a round trip and, on a server that counts
+    /// them, a strike.
+    #[error("this server will not accept a posting: {reason}")]
+    PostingNotAllowed {
+        /// Why, in a form that can go on a status line.
+        reason: String,
+    },
+
+    /// The article was offered and the server refused it (codes 440, 441).
+    ///
+    /// The text is usually the only explanation there will be — "No colon-space in
+    /// \"From\" header", "Missing Subject", "Article posted in wrong newsgroup" — so it is
+    /// carried verbatim rather than summarised.
+    #[error("the server rejected the article: {code} {text:?}")]
+    PostingRejected {
+        /// The status code, 440 or 441.
+        code: ResponseCode,
+        /// The server's own message.
+        text: String,
+    },
+
     /// The server does not implement the command (codes 500, 501).
     ///
     /// Not necessarily an error: it is the signal to fall back from `OVER` to `XOVER`, or
@@ -222,6 +247,11 @@ impl ClientError {
             | Self::NoSuchArticle { .. }
             | Self::CommandNotSupported { .. }
             | Self::Server { .. }
+            // A refused article leaves the connection exactly where it was: the server
+            // read the whole thing and said no. Dropping it would cost a reconnection for
+            // a mistake the user is about to fix in their editor.
+            | Self::PostingNotAllowed { .. }
+            | Self::PostingRejected { .. }
             | Self::FeatureNotCompiled(_) => false,
         }
     }

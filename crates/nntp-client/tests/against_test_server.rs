@@ -489,3 +489,487 @@ fn a_connection_refused_is_an_error_not_a_hang() {
     let error = connector::connect(&options).unwrap_err();
     assert!(error.is_connection_fatal());
 }
+
+// -- posting ----------------------------------------------------------------------------
+
+/// A draft that is complete enough to be accepted.
+fn draft(body: &str) -> nntp_proto::Draft {
+    nntp_proto::Draft::parse(&format!(
+        "From: A Poster <poster@example.org>\n\
+         Newsgroups: misc.test\n\
+         Subject: A test posting\n\
+         \n\
+         {body}\n"
+    ))
+}
+
+#[test]
+fn posts_an_article_and_the_server_receives_what_was_sent() {
+    let server = TestServer::start().unwrap();
+    let mut client = connect(&server);
+
+    let text = client.post(&draft("Hello from the test suite.")).unwrap();
+    assert!(text.contains("received"), "{text}");
+
+    let posted = server.posted();
+    assert_eq!(posted.len(), 1);
+    assert_eq!(
+        posted[0].header("Subject").as_deref(),
+        Some("A test posting")
+    );
+    assert_eq!(posted[0].header("Newsgroups").as_deref(), Some("misc.test"));
+    assert_eq!(posted[0].body_text(), "Hello from the test suite.");
+}
+
+#[test]
+fn a_body_line_beginning_with_a_dot_arrives_intact() {
+    // The classic NNTP bug: without dot-stuffing the article is truncated at this line and
+    // the sender cannot tell, because the server answers 240 either way.
+    let server = TestServer::start().unwrap();
+    let mut client = connect(&server);
+
+    client
+        .post(&draft(
+            ".signature is not a terminator\nand this line follows it",
+        ))
+        .unwrap();
+
+    let posted = server.posted();
+    assert_eq!(
+        posted[0].body_text(),
+        ".signature is not a terminator\nand this line follows it"
+    );
+}
+
+#[test]
+fn a_refused_article_reports_the_servers_own_words_and_keeps_the_connection() {
+    // 441 is usually the only explanation there will be, and the connection is still
+    // usable: dropping it would cost a reconnection for a mistake about to be fixed.
+    let server = TestServer::with(
+        Corpus::sample(),
+        ServerConfig::new().quirks(Quirks {
+            refuse_post: Some("no colon-space in \"From\" header".to_owned()),
+            ..Quirks::default()
+        }),
+    )
+    .unwrap();
+    let mut client = connect(&server);
+
+    let error = client.post(&draft("Body.")).unwrap_err();
+
+    match &error {
+        ClientError::PostingRejected { code, text } => {
+            assert_eq!(code.as_u16(), 441);
+            assert!(text.contains("colon-space"), "{text}");
+        }
+        other => panic!("expected a rejection, got {other:?}"),
+    }
+    assert!(!error.is_connection_fatal(), "the connection is still fine");
+
+    // And the proof that it is: the next command works.
+    let group = client
+        .select_group(&GroupName::parse("misc.test").unwrap())
+        .unwrap();
+    assert_eq!(group.name.as_str(), "misc.test");
+}
+
+#[test]
+fn a_server_that_greeted_without_posting_is_not_offered_an_article() {
+    // Refused here rather than after a round trip, and without a POST command: a server
+    // that counts refused offers should not be given one for something already known.
+    let server = TestServer::with(
+        Corpus::sample(),
+        ServerConfig::new().greeting(GreetingMode::NoPosting),
+    )
+    .unwrap();
+    let mut client = connect(&server);
+
+    let error = client.post(&draft("Body.")).unwrap_err();
+
+    assert!(
+        matches!(error, ClientError::PostingNotAllowed { .. }),
+        "{error:?}"
+    );
+    assert!(server.posted().is_empty());
+}
+
+#[test]
+fn an_incomplete_draft_never_reaches_the_server() {
+    let server = TestServer::start().unwrap();
+    let mut client = connect(&server);
+
+    let incomplete = nntp_proto::Draft::parse("Subject: no From, no Newsgroups\n\nBody.\n");
+    let error = client.post(&incomplete).unwrap_err();
+
+    assert!(error.to_string().contains("From"), "{error}");
+    assert!(server.posted().is_empty(), "nothing was offered");
+}
+
+#[test]
+fn a_non_ascii_article_arrives_as_encoded_words_and_utf8() {
+    let server = TestServer::start().unwrap();
+    let mut client = connect(&server);
+
+    let draft = nntp_proto::Draft::parse(
+        "From: Åsa <asa@example.se>\n\
+         Newsgroups: misc.test\n\
+         Subject: Uma pergunta sobre ação\n\
+         \n\
+         Está tudo bem?\n",
+    );
+    client.post(&draft).unwrap();
+
+    let posted = server.posted();
+    let subject = posted[0].header("Subject").unwrap();
+    assert!(subject.is_ascii(), "{subject}");
+    assert_eq!(
+        nntp_proto::mime::decode_header_value(subject.as_bytes()),
+        "Uma pergunta sobre ação"
+    );
+    assert_eq!(
+        posted[0].header("Content-Type").as_deref(),
+        Some("text/plain; charset=utf-8"),
+        "an 8-bit body without this is a guess at the other end"
+    );
+    assert_eq!(posted[0].body_text(), "Está tudo bem?");
+}
+
+#[test]
+fn the_connection_is_still_usable_after_a_successful_posting() {
+    // The gap the refusal test left: 441 keeps the connection, but nothing checked that
+    // 240 does. Reported from a real session — the article was accepted and the very next
+    // command died with "connection aborted by the software in your host machine".
+    let server = TestServer::start().unwrap();
+    let mut client = connect(&server);
+
+    client.post(&draft("Body.")).unwrap();
+
+    let group = client
+        .select_group(&GroupName::parse("misc.test").unwrap())
+        .expect("the connection should still work after posting");
+    assert_eq!(group.name.as_str(), "misc.test");
+
+    let records = client.overview(Range::between(1, 3)).expect("overview");
+    assert!(!records.entries.is_empty());
+}
+
+#[test]
+fn an_idle_connection_survives_a_pause_and_is_told_when_it_does_not() {
+    // Reported from a real session against the standalone server: an article was posted,
+    // the reader sat while its user read the screen, and the next command died with
+    // "connection aborted by the software in your host machine". The fake server's socket
+    // timeout is thirty seconds, which is fine for a test and far too short for a person.
+    //
+    // Both halves are asserted here: a pause well inside the limit changes nothing, and a
+    // server that does give up says so first, rather than leaving the client to report
+    // whatever its platform calls a dead socket.
+    let server = TestServer::with(
+        Corpus::sample(),
+        ServerConfig::new().idle_timeout(Duration::from_millis(400)),
+    )
+    .unwrap();
+    let mut client = connect(&server);
+
+    std::thread::sleep(Duration::from_millis(100));
+    client
+        .select_group(&GroupName::parse("misc.test").unwrap())
+        .expect("a short pause is not a disconnection");
+
+    // Now outstay it. The server announces the close instead of vanishing.
+    std::thread::sleep(Duration::from_millis(700));
+    let error = client
+        .select_group(&GroupName::parse("misc.test").unwrap())
+        .unwrap_err();
+
+    match &error {
+        ClientError::Server { code, text, .. } => {
+            assert_eq!(code.as_u16(), 400);
+            assert!(text.contains("idle"), "{text}");
+        }
+        // A connection the operating system has already torn down is the other honest
+        // outcome; what must not happen is a wrong answer.
+        ClientError::ConnectionClosed(_) | ClientError::Io(_) => {}
+        other => panic!("unexpected error: {other:?}"),
+    }
+}
+
+#[test]
+fn a_posted_article_comes_back_from_the_group_it_was_posted_to() {
+    // Asked from a real session: "why doesn't my message appear, even though it was
+    // posted?" Because the server took it and filed it nowhere. A fake server that
+    // accepts an article, answers 240, and then denies all knowledge of it cannot be used
+    // to check the one thing somebody testing the posting path wants to see.
+    let server = TestServer::start().unwrap();
+    let mut client = connect(&server);
+
+    let before = client
+        .select_group(&GroupName::parse("misc.test").unwrap())
+        .unwrap();
+
+    client
+        .post(&draft("This article should come back."))
+        .unwrap();
+
+    // The watermark moved, which is how a reader notices there is something new.
+    let after = client
+        .select_group(&GroupName::parse("misc.test").unwrap())
+        .unwrap();
+    assert_eq!(after.high, before.high + 1);
+    assert_eq!(after.estimated_count, before.estimated_count + 1);
+
+    // And the article itself is there, as posted.
+    let article = client.article(ArticleSpec::Number(after.high)).unwrap();
+    assert_eq!(article.subject(), "A test posting");
+    assert!(
+        article
+            .display_text()
+            .contains("This article should come back."),
+        "{}",
+        article.display_text()
+    );
+
+    // It is in the overview too, or the reader would never list it.
+    let records = client
+        .overview(Range::between(after.high, after.high))
+        .unwrap();
+    assert_eq!(records.entries.len(), 1);
+    assert_eq!(records.entries[0].subject, "A test posting");
+}
+
+#[test]
+fn an_article_for_a_group_this_server_does_not_carry_is_refused() {
+    // A server cannot file an article somewhere it has no group, and pretending to have
+    // accepted it is the failure mode this whole episode was about.
+    let server = TestServer::start().unwrap();
+    let mut client = connect(&server);
+
+    let draft = nntp_proto::Draft::parse(
+        "From: A Poster <poster@example.org>\n\
+         Newsgroups: no.such.group\n\
+         Subject: Nowhere to put this\n\
+         \n\
+         Body.\n",
+    );
+
+    let error = client.post(&draft).unwrap_err();
+    assert!(
+        matches!(error, ClientError::PostingRejected { .. }),
+        "{error:?}"
+    );
+}
+
+// -- the commands that were parsed but never issued (#16) -------------------------------
+
+#[test]
+fn fetches_one_header_across_a_range() {
+    // The point of HDR: one field for many articles, at a fraction of OVER's bytes. This
+    // is what threading a whole group needs, since it only wants References.
+    let server = TestServer::start().unwrap();
+    let mut client = connect(&server);
+    client
+        .select_group(&GroupName::parse("misc.test").unwrap())
+        .unwrap();
+
+    let subjects = client
+        .header_field(
+            &nntp_proto::HeaderName::parse("Subject").unwrap(),
+            Range::between(1, 3).into(),
+        )
+        .unwrap();
+
+    assert_eq!(subjects.entries.len(), 3);
+    assert_eq!(subjects.entries[0].number, 1);
+    assert_eq!(subjects.entries[0].value, "A plain test article");
+    assert!(subjects.skipped.is_empty(), "{:?}", subjects.skipped);
+
+    // And the field that threading actually wants.
+    let references = client
+        .header_field(
+            &nntp_proto::HeaderName::parse("References").unwrap(),
+            Range::between(1, 3).into(),
+        )
+        .unwrap();
+    let reply = references
+        .entries
+        .iter()
+        .find(|entry| entry.number == 2)
+        .expect("article 2");
+    assert_eq!(reply.value, "<root@test.invalid>");
+
+    // An article with no References still gets a line, or the response would look like a
+    // shorter range than was asked for.
+    assert_eq!(references.entries.len(), 3);
+    assert_eq!(
+        references
+            .entries
+            .iter()
+            .find(|entry| entry.number == 1)
+            .map(|entry| entry.value.as_str()),
+        Some("")
+    );
+}
+
+#[test]
+fn falls_back_from_hdr_to_xhdr() {
+    // The same arrangement OVER/XOVER already had: a server old enough to lack one
+    // spelling gets the other, and the answer is remembered.
+    let server = TestServer::with(
+        Corpus::sample(),
+        ServerConfig::new().capabilities(CapabilityProfile::NoOver),
+    )
+    .unwrap();
+    let mut client = connect(&server);
+    client
+        .select_group(&GroupName::parse("misc.test").unwrap())
+        .unwrap();
+
+    let subjects = client
+        .header_field(
+            &nntp_proto::HeaderName::parse("Subject").unwrap(),
+            Range::between(1, 3).into(),
+        )
+        .expect("XHDR should have answered");
+    assert_eq!(subjects.entries.len(), 3);
+}
+
+#[test]
+fn a_header_field_by_message_id_needs_no_selected_group() {
+    let server = TestServer::start().unwrap();
+    let mut client = connect(&server);
+
+    let entries = client
+        .header_field(
+            &nntp_proto::HeaderName::parse("Subject").unwrap(),
+            MessageId::parse("<root@test.invalid>").unwrap().into(),
+        )
+        .unwrap();
+
+    assert_eq!(entries.entries.len(), 1);
+    // RFC 3977 §8.5.2: the server sends 0 rather than a number it may not have.
+    assert_eq!(entries.entries[0].number, 0);
+    assert_eq!(entries.entries[0].value, "A plain test article");
+}
+
+#[test]
+fn a_header_field_range_without_a_group_is_refused_before_it_is_sent() {
+    let server = TestServer::start().unwrap();
+    let mut client = connect(&server);
+
+    let error = client
+        .header_field(
+            &nntp_proto::HeaderName::parse("Subject").unwrap(),
+            Range::between(1, 3).into(),
+        )
+        .unwrap_err();
+
+    assert!(
+        matches!(error, ClientError::NoGroupSelected { .. }),
+        "{error:?}"
+    );
+}
+
+#[test]
+fn lists_the_article_numbers_a_group_actually_holds() {
+    // The watermarks say which numbers a group spans; expiry leaves gaps, and LISTGROUP is
+    // the only way to know which of them exist. comp.lang.rust spans six numbers and
+    // holds two.
+    let server = TestServer::start().unwrap();
+    let mut client = connect(&server);
+
+    let (summary, numbers) = client
+        .article_numbers(Some(&GroupName::parse("comp.lang.rust").unwrap()), None)
+        .unwrap();
+
+    assert_eq!(summary.name.as_str(), "comp.lang.rust");
+    assert_eq!((summary.low, summary.high), (4237, 4242));
+    assert_eq!(numbers, vec![4237, 4242]);
+
+    // It selects the group, which is what the command does.
+    assert_eq!(
+        client.selected_group().map(|group| group.name.as_str()),
+        Some("comp.lang.rust")
+    );
+}
+
+#[test]
+fn walks_a_group_with_next_and_last() {
+    // How a group is read when the server offers no overview at all.
+    let server = TestServer::start().unwrap();
+    let mut client = connect(&server);
+    client
+        .select_group(&GroupName::parse("misc.test").unwrap())
+        .unwrap();
+
+    let second = client.next_article().unwrap();
+    assert_eq!(second.number, Some(2));
+
+    let back = client.previous_article().unwrap();
+    assert_eq!(back.number, Some(1));
+
+    // The start of the group is an error, not a silent stop.
+    let error = client.previous_article().unwrap_err();
+    assert!(!error.is_connection_fatal(), "{error:?}");
+}
+
+#[test]
+fn stepping_without_a_group_is_refused_before_it_is_sent() {
+    let server = TestServer::start().unwrap();
+    let mut client = connect(&server);
+
+    assert!(matches!(
+        client.next_article().unwrap_err(),
+        ClientError::NoGroupSelected { .. }
+    ));
+}
+
+#[test]
+fn reports_when_each_group_was_created() {
+    let server = TestServer::start().unwrap();
+    let mut client = connect(&server);
+
+    let times = client.group_creation_times(None).unwrap();
+
+    assert!(!times.entries.is_empty());
+    assert!(times.skipped.is_empty(), "{:?}", times.skipped);
+    assert!(
+        times
+            .entries
+            .iter()
+            .any(|entry| entry.name.as_str() == "misc.test")
+    );
+}
+
+#[test]
+fn reports_which_header_fields_hdr_accepts() {
+    let server = TestServer::start().unwrap();
+    let mut client = connect(&server);
+
+    let fields = client.available_header_fields().unwrap();
+
+    // A colon alone means "any field in the article" (RFC 3977 §8.6), which is the honest
+    // answer for a server that stores whole articles.
+    assert_eq!(fields, vec![":".to_owned()]);
+}
+
+#[test]
+fn lists_groups_created_since_a_date() {
+    let server = TestServer::start().unwrap();
+    let mut client = connect(&server);
+
+    // The corpus dates its groups to 2001-09-09, so a date before that finds them all and
+    // a date after finds none. The timestamp is the *server's* clock, which is why this is
+    // an absolute date rather than "an hour ago".
+    let long_ago = chrono::DateTime::from_timestamp(1_000_000_000 - 86_400, 0).expect("a date");
+    let recently = chrono::DateTime::from_timestamp(1_000_000_000 + 86_400, 0).expect("a date");
+
+    let all = client.new_groups(long_ago).unwrap();
+    assert!(!all.entries.is_empty());
+    assert!(all.skipped.is_empty(), "{:?}", all.skipped);
+
+    let none = client.new_groups(recently).unwrap();
+    assert!(
+        none.entries.is_empty(),
+        "nothing was created after the corpus's dates: {:?}",
+        none.entries
+    );
+}

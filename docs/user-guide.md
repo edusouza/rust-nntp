@@ -113,11 +113,15 @@ mark_read_on_open = true      # opening an article marks it read
 unread_only = false           # start with the unread filter on
 initial_articles = 300        # how many of a group's newest articles to load
 overview_chunk = 500          # overview records per round trip
+threaded = true               # group the article list into conversations
 date_format = "%Y-%m-%d %H:%M"
 ```
 
-Command-line flags override the configured server field by field, so this uses the
-credentials from `es` against a server on your own machine:
+Command-line flags override the configured server field by field. **Naming the server is
+what carries its credentials somewhere else**: `--host` on its own points the reader at
+another machine and takes no username or password with it, because a password is given for
+one host and typing another host's name is not permission to offer it there. So this uses
+the credentials from `es` against a server on your own machine:
 
 ```sh
 nntp-tui --server es groups --host 127.0.0.1 --port 1119 --no-tls
@@ -197,7 +201,11 @@ while something is outstanding.
 | `g` / `G` | first / last |
 | `Enter` | open the group or article under the cursor |
 | `n` / `p` | next / previous article, opening it |
+| `w` | write a new article in the selected group |
+| `f` | follow up to the article on screen |
 | `u` | show only unread articles, or everything again |
+| `t` | group the list into conversations, or show it flat |
+| `z` | fold the replies under the cursor away, or bring them back |
 | `M` | mark the article under the cursor read, or unread if it was read |
 | `c` | catch up: mark the whole group read |
 | `/` | filter groups by name or description |
@@ -227,9 +235,9 @@ keys.
 - **`•` before a subject** marks an unread article, and its subject is bold. Read articles
   are dimmed and unmarked — the other way round would put a mark on nearly every line of
   a group you follow, which is no mark at all.
-- **`›` before a subject** marks a follow-up. Replies are marked rather than indented:
-  real threads arrive out of order and with missing parents, so an indent would be a lie
-  until threading lands in v0.2.
+- **`›` before an indented subject** marks a follow-up, sitting under the article it
+  answers. `+3` in its place means the replies under that line are folded away — press `z`
+  to bring them back, or `t` for a flat list with no indents at all.
 - **The badge at the bottom left** is green for TLS and yellow for a plaintext connection,
   and red when the connection has dropped. The worker reconnects on the next request, so
   a dropped connection is a nuisance rather than the end of the session.
@@ -278,6 +286,99 @@ Two things worth knowing, because they are visible:
 `Esc` keeps its other meanings when nothing is outstanding, and always belongs to the
 filter while you are typing one.
 
+### Posting
+
+`w` writes a new article in the selected group; `f` follows up to the one on screen. Both
+open your editor on a pre-filled article — headers, a blank line, then the body — and offer
+what you save. Quitting without changing anything abandons the post.
+
+First tell the reader who you are, under the server in the configuration file:
+
+```toml
+[servers.es]
+host = "news.eternal-september.org"
+from = "Your Name <you@example.org>"
+```
+
+There is no default on purpose. A `From` guessed from your login name and your machine's
+host name is how articles end up signed `user@localhost`.
+
+A server given entirely on the command line has no configured identity to take, so `--from`
+supplies one — which is how posting is tested against the fake server:
+
+```sh
+nntp-tui --host 127.0.0.1 --port 1119 --no-tls --from "You <you@example.org>"
+```
+
+The editor is `$VISUAL`, then `$EDITOR`, then `vi` (or `notepad` on Windows). Arguments in
+the variable work — `EDITOR="code --wait"`, `EDITOR="emacsclient -c"` — as long as the path
+itself has no spaces in it.
+
+**What is filled in for a follow-up:** one `Re: ` (never a second), the `References` chain
+so your reply threads properly in everybody else's reader, `Followup-To` in place of
+`Newsgroups` when the author set one, and the parent quoted with its signature dropped. An
+article marked `Followup-To: poster` is *not* composed: the author asked to be answered by
+mail, which this reader cannot send.
+
+**Your draft is never lost.** It is written under
+`~/.local/share/nntp-tui/drafts/` before the editor opens and removed only once the server
+has accepted the article. If the post is refused, the connection drops, or the reader dies,
+the file stays and the message pane (`m`) says where it is.
+
+**What is checked before anything is sent:** `From`, `Newsgroups` and `Subject` present and
+non-empty, a body that is not just whitespace, and no `Path`, `Xref`, `Lines` or `Bytes` —
+those are the server's to set. Everything wrong is reported at once, so one trip back to
+the editor is enough. If the server still refuses, its own message is shown as it arrived;
+that is usually the only explanation there is.
+
+The group you posted to is reloaded straight afterwards, so your article appears in the
+list without asking — against a real server it may take a moment to be accepted and come
+back, and `r` refetches whenever you want.
+
+Accented subjects are sent as RFC 2047 encoded words and a non-ASCII body gets the MIME
+headers that describe it, so what you type is what the other end reads.
+
+### Threads
+
+The article list is grouped into conversations, with replies indented under what they
+answer. `t` switches to a flat, article-number-ordered list and back; `z` folds the replies
+under the cursor away, showing `+3` on the line that is hiding them, and brings them back.
+`threaded = false` under `[ui]` opens the reader flat.
+
+Threading is done from the `References` header, with the tolerances real Usenet traffic
+needs:
+
+- **A thread whose first article has expired still groups.** Its replies gather under a
+  placeholder for the article nobody has.
+- **A thread with no `References` at all is rescued by subject** — `Re:`, `AW:`, `Sv:`,
+  `Re[2]:` and a leading `[list-tag]` are stripped before comparing. This is the last
+  resort and stays narrow on purpose: merging on subject alone is how two unrelated
+  conversations end up looking like one.
+- **The indent is the article's real depth**, whether or not its parent is on screen. A
+  reply that sits under a read article keeps its indent when the unread filter hides that
+  article, so turning `u` on and off does not slide the list sideways.
+- **A fold cannot hide something unread.** If the unread filter hides the article you
+  folded, its unread replies are shown anyway.
+
+Very deep threads stop indenting rather than marching off the right-hand edge; no article
+is ever dropped for being too deep.
+
+### Watching a big group load
+
+Opening a group fetches its newest articles in chunks, and **each chunk appears as it
+arrives** rather than the pane staying empty until the whole range is in. The newest chunk
+is fetched first, so the articles you came for are the ones that show up first; the status
+bar counts them as they land (`comp.lang.c: 1500 articles listed…`) and says how many are
+unread when the fetch finishes.
+
+- `overview_chunk` under `[ui]` sets the chunk size — smaller means more round trips and a
+  list that grows in smaller steps.
+- **Your place is kept.** A cursor on the newest article follows the newest as records
+  arrive; a cursor you have moved stays on the article it is on, even though older records
+  landing in front of it change its position in the list.
+- `Esc` still stops the fetch (above). What has already arrived stays listed — it is real
+  data, and throwing it away would be its own surprise.
+
 ### Read and unread
 
 What you have read is remembered between runs, in the `.newsrc` format every newsreader
@@ -313,6 +414,7 @@ Two instances of the reader against the same server will have the last one to ex
 
 ### What it does not do yet
 
-Posting, threading, MIME multipart and a disk cache are all v0.2 or later; see the
+A disk cache and server-side group filtering are v0.3; see the
 [roadmap](https://github.com/edusouza/rust-nntp/issues/3). There is no subscription list
-yet, so the group list shows everything the server carries.
+yet, so the group list shows everything the server carries, and it is re-fetched on every
+start.

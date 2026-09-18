@@ -85,8 +85,15 @@ worker event arriving while the user is idle is picked up promptly. Events are d
 burst before drawing, so a flurry of them costs one redraw rather than one each.
 
 The worker reconnects on demand: a dropped connection leaves the interface usable and the
-next request re-establishes it. What it cannot yet do is abandon a request already in
-flight — see the cancellation issue.
+next request re-establishes it. A request already in flight can be abandoned: `Esc` raises
+a `Cancel` flag the worker checks between lines of a response, which is shared state rather
+than a `Request` because the channel is first-in-first-out and the worker is *inside* the
+request being cancelled.
+
+Long results are streamed rather than delivered whole. An overview fetch sends one
+`OverviewChunk` per chunk, newest chunk first, and a final `OverviewComplete`; each chunk
+carries the `FetchToken` the interface minted for that fetch, so records from a fetch the
+user has superseded are dropped instead of merged into the current list.
 
 ## Error handling
 
@@ -140,6 +147,7 @@ The suite is entirely offline and runs on Linux, macOS and Windows.
 | `nntp-client` | the conversation driven over scripted in-memory streams, then end to end over a real socket against the fake server, including its deliberate misbehaviour |
 | TLS | a real handshake against a certificate generated at run time, with verification left on; the two failure cases — untrusted CA, wrong name — are asserted to fail |
 | `nntp-tui` read state | unit tests, including 4 000 random operations against an oracle |
+| `nntp-proto` threading | unit tests over hand-built reference graphs, including the malformed ones |
 | `nntp-tui` state machine | unit tests over key events and worker events |
 | `nntp-tui` rendering | `TestBackend` snapshots, including terminals too small to use |
 | `nntp-tui` as a whole | state machine plus worker plus a real socket plus the fake server |

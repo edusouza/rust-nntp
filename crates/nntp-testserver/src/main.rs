@@ -51,6 +51,11 @@ fn main() -> ExitCode {
 
     let mut config = ServerConfig::new()
         .capabilities(args.profile)
+        // A person is at the other end of this one. The library default is thirty seconds
+        // so that an abandoned connection cannot hold a test suite's shutdown, and reading
+        // a single article takes longer than that — against this binary it dropped the
+        // connection between one keystroke and the next.
+        .idle_timeout(std::time::Duration::from_secs(30 * 60))
         .quirks(args.quirks.clone());
     if let Some((username, password)) = &args.credentials {
         config = config.require_auth(username, password);

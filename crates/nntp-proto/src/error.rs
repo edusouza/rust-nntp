@@ -42,6 +42,16 @@ pub enum ProtoError {
         command: &'static str,
     },
 
+    /// A draft was refused before it reached the network.
+    ///
+    /// Everything wrong with it at once, because somebody who has just written an article
+    /// wants one trip back to the editor rather than one per mistake.
+    #[error("the article cannot be posted: {problems}")]
+    UnpostableDraft {
+        /// The problems, already formatted and joined.
+        problems: String,
+    },
+
     /// The encoded command would exceed the 512-octet limit of RFC 3977 §3.1.
     #[error("{command} command line is {len} octets, over the 512-octet limit")]
     CommandTooLong {
@@ -94,6 +104,7 @@ impl ProtoError {
 
             Self::IllegalCommandArgument { .. }
             | Self::CommandTooLong { .. }
+            | Self::UnpostableDraft { .. }
             | Self::InvalidWildmat(_) => false,
         }
     }

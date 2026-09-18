@@ -58,6 +58,10 @@ pub fn run(config: &Config, target: Target) -> anyhow::Result<()> {
         }
     };
 
+    // Who anything written in this session is posted as. Read before the target is moved
+    // into the worker, since the worker has no use for it.
+    let from = target.server.from.clone();
+
     // The flag the interface raises and the worker watches. Created here because both
     // sides need it and it outlives neither on its own.
     let cancel = nntp_client::Cancel::new();
@@ -78,6 +82,7 @@ pub fn run(config: &Config, target: Target) -> anyhow::Result<()> {
 
     let mut app = App::new(&config.ui, read_state);
     app.cancel = cancel;
+    app.from = from;
     for problem in read_problems {
         app.note(problem.to_string());
         tracing::warn!(%problem, "read state");
@@ -135,7 +140,13 @@ fn event_loop(
         // redraw each.
         loop {
             match events.try_recv() {
-                Ok(event) => app.on_event(event),
+                Ok(event) => {
+                    // An event can produce work of its own — a posting lands in the group
+                    // on screen and the list has to be fetched again.
+                    for request in app.on_event(event) {
+                        send(requests, app, request);
+                    }
+                }
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => {
                     app.on_event(Event::Stopped);
@@ -172,7 +183,58 @@ fn event_loop(
         } else {
             app.tick();
         }
+
+        // After the keystroke, not during it: composing takes the terminal away from this
+        // loop, and the state machine is not allowed to know that terminals exist.
+        if let Some(request) = app.take_compose() {
+            compose(terminal, app, requests, &request)?;
+        }
     }
+}
+
+/// Hands the terminal to the user's editor and takes it back afterwards.
+///
+/// The only place in the reader where another program owns the screen. Everything here is
+/// about handing it over cleanly and getting it back whatever happens: an editor that
+/// cannot start, one that exits non-zero, one that leaves the draft untouched.
+fn compose(
+    terminal: &mut ratatui::DefaultTerminal,
+    app: &mut App,
+    requests: &Sender<Request>,
+    request: &crate::tui::app::ComposeRequest,
+) -> anyhow::Result<()> {
+    // Raw mode and the alternate screen both have to go: an editor drawing into them
+    // produces a screen neither program can clean up.
+    ratatui::try_restore().context("releasing the terminal for the editor")?;
+
+    let outcome = crate::compose::compose(&request.template);
+
+    // Back, whatever the editor did. Failing to re-init is fatal — there is no interface
+    // to report it in — but the editor's own failure is not, and is reported below.
+    *terminal = ratatui::try_init().context("taking the terminal back after the editor")?;
+    terminal.clear().context("clearing after the editor")?;
+    app.dirty = true;
+
+    match outcome {
+        Ok(crate::compose::Composed::Edited { text, path }) => {
+            for outgoing in app.on_composed(Some((text, path))) {
+                send(requests, app, outgoing);
+            }
+        }
+        Ok(crate::compose::Composed::Abandoned) => {
+            app.on_composed(None);
+            app.note(format!("{} was abandoned", request.what));
+        }
+        Err(error) => {
+            app.on_composed(None);
+            // `{:#}` so the context chain — which names the editor and the draft's path —
+            // is on one line rather than only in the log.
+            app.note(format!("could not compose: {error:#}"));
+            tracing::warn!(%error, "composing failed");
+        }
+    }
+
+    Ok(())
 }
 
 /// Sends a request, noting in the interface if the worker has gone.

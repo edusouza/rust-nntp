@@ -1,5 +1,6 @@
 //! The listener: accepts connections and runs a [`Session`] on each.
 
+use std::io::Write as _;
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -8,7 +9,7 @@ use std::time::Duration;
 
 use crate::config::ServerConfig;
 use crate::corpus::Corpus;
-use crate::session::{Outcome, Session};
+use crate::session::{Outcome, Postbox, PostedArticle, Session};
 #[cfg(feature = "tls")]
 use crate::tls::SelfSignedIdentity;
 
@@ -23,6 +24,7 @@ const ACCEPT_POLL: Duration = Duration::from_millis(10);
 pub struct TestServer {
     address: SocketAddr,
     stop: Arc<AtomicBool>,
+    postbox: Postbox,
     accept_loop: Option<JoinHandle<()>>,
     #[cfg(feature = "tls")]
     identity: Option<SelfSignedIdentity>,
@@ -151,6 +153,7 @@ impl TestServer {
         listener.set_nonblocking(true)?;
 
         let stop = Arc::new(AtomicBool::new(false));
+        let postbox: Postbox = Arc::new(std::sync::Mutex::new(Vec::new()));
 
         #[cfg(feature = "tls")]
         let (identity, mode, tls_config) = match tls {
@@ -164,8 +167,9 @@ impl TestServer {
         let accept_loop = {
             let stop = Arc::clone(&stop);
             let shared = Arc::new(Shared {
-                corpus,
+                corpus: std::sync::RwLock::new(corpus),
                 config,
+                postbox: Arc::clone(&postbox),
                 #[cfg(feature = "tls")]
                 mode,
                 #[cfg(feature = "tls")]
@@ -180,10 +184,27 @@ impl TestServer {
         Ok(Self {
             address,
             stop,
+            postbox,
             accept_loop: Some(accept_loop),
             #[cfg(feature = "tls")]
             identity,
         })
+    }
+
+    /// Everything clients have posted, oldest first.
+    ///
+    /// As the server received it: a test can therefore check the bytes on the wire rather
+    /// than what the client believes it sent, which is the only way to catch a
+    /// dot-stuffing mistake.
+    ///
+    /// A poisoned mutex — a session thread panicked while holding it — yields an empty
+    /// list rather than a panic here, so the test that called this fails on its own
+    /// assertion instead of on a second panic during teardown.
+    pub fn posted(&self) -> Vec<PostedArticle> {
+        self.postbox
+            .lock()
+            .map(|posted| posted.clone())
+            .unwrap_or_default()
     }
 
     /// The address the server is listening on.
@@ -226,8 +247,9 @@ impl Drop for TestServer {
 
 /// What every session thread needs.
 struct Shared {
-    corpus: Corpus,
+    corpus: std::sync::RwLock<Corpus>,
     config: ServerConfig,
+    postbox: Postbox,
     #[cfg(feature = "tls")]
     mode: TlsMode,
     #[cfg(feature = "tls")]
@@ -279,12 +301,16 @@ fn serve(mut stream: TcpStream, shared: &Arc<Shared>) {
         return;
     }
 
-    // A test that hangs is worse than a test that fails.
-    let _ = stream.set_read_timeout(Some(Duration::from_secs(30)));
-    let _ = stream.set_write_timeout(Some(Duration::from_secs(30)));
+    // A test that hangs is worse than a test that fails — the accept loop joins its
+    // session threads, so an abandoned connection holds shutdown for this long. The
+    // default is short for that reason and generous when a person is at the other end.
+    let idle = shared.config.idle_timeout;
+    let _ = stream.set_read_timeout(Some(idle));
+    let _ = stream.set_write_timeout(Some(idle));
     let _ = stream.set_nodelay(true);
 
     let mut session = Session::new(&shared.corpus, &shared.config);
+    session.set_postbox(Arc::clone(&shared.postbox));
 
     #[cfg(feature = "tls")]
     if shared.mode == TlsMode::Implicit {
@@ -310,10 +336,30 @@ fn serve(mut stream: TcpStream, shared: &Arc<Shared>) {
         Ok(Outcome::Closed) => {}
         Ok(Outcome::UpgradeToTls) => upgrade(stream, &mut session, shared),
         Err(error) => {
+            if is_idle_timeout(&error) {
+                // Say so before going. RFC 3977 §3.1 lets a server announce that it is
+                // closing, and without it the client is left holding a socket that dies
+                // with whatever its platform calls an aborted connection — "Uma conexão
+                // estabelecida foi anulada pelo software no computador host" on Windows,
+                // which tells a reader nothing about what happened.
+                let _ = stream.write_all(b"400 idle too long, closing connection\r\n");
+                let _ = stream.flush();
+            }
             // A client that disconnects abruptly is normal in tests, not a failure.
             tracing::debug!(%error, "test server session ended");
         }
     }
+}
+
+/// Whether a session ended because nothing arrived for as long as the socket allows.
+///
+/// The two kinds are one condition: a read timeout surfaces as `WouldBlock` on Unix and as
+/// `TimedOut` on Windows.
+fn is_idle_timeout(error: &std::io::Error) -> bool {
+    matches!(
+        error.kind(),
+        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+    )
 }
 
 /// Completes a `STARTTLS` upgrade and resumes the session over the encrypted stream.
