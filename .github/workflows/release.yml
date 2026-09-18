@@ -1,0 +1,239 @@
+name: Release
+
+# Publishes a GitHub Release with a binary for each platform when a version tag is
+# pushed. `workflow_dispatch` takes a tag name so that a tag which already exists — v0.1.0
+# was tagged before this workflow was written — can still be given its release.
+on:
+  push:
+    tags: ["v[0-9]+.[0-9]+.[0-9]+*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "An existing tag to build and release, for example v0.1.0"
+        required: true
+        type: string
+
+# The default token is read-only; creating a release and uploading assets needs this and
+# nothing more. Scoped here rather than on the repository so that every other workflow
+# stays read-only.
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ inputs.tag || github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # Everything that can be wrong with a release is cheaper to find before spending twenty
+  # minutes building four binaries for it.
+  verify:
+    name: verify the tag
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.resolve.outputs.tag }}
+      version: ${{ steps.resolve.outputs.version }}
+      prerelease: ${{ steps.resolve.outputs.prerelease }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+          # The changelog extraction below reads the file at the tag, not at main.
+          fetch-depth: 0
+
+      - name: Resolve the tag and check it against Cargo.toml
+        id: resolve
+        run: |
+          set -euo pipefail
+          tag="${{ inputs.tag || github.ref_name }}"
+          version="${tag#v}"
+
+          # A tag that disagrees with the version in the manifest ships a binary whose
+          # `--version` contradicts the release it came from. It has happened to everyone
+          # once, and it is a one-line check.
+          manifest="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)"
+          if [ "$version" != "$manifest" ]; then
+            echo "::error::tag $tag says $version, Cargo.toml says $manifest" >&2
+            exit 1
+          fi
+
+          # `1.2.3-rc.1` is a pre-release; `1.2.3` is not.
+          case "$version" in
+            *-*) prerelease=true ;;
+            *)   prerelease=false ;;
+          esac
+
+          {
+            echo "tag=$tag"
+            echo "version=$version"
+            echo "prerelease=$prerelease"
+          } >> "$GITHUB_OUTPUT"
+          echo "releasing $tag (version $version, prerelease $prerelease)"
+
+      - name: Take the release notes from the changelog
+        run: |
+          set -euo pipefail
+          version="${{ steps.resolve.outputs.version }}"
+
+          # The changelog is written by hand and carefully; the release notes are that
+          # section and nothing generated. A missing section is an error rather than an
+          # empty release page.
+          awk -v want="$version" '
+            $0 ~ "^## \\[" want "\\]" { found = 1; next }
+            found && /^## \[/ { exit }
+            found { print }
+          ' CHANGELOG.md > notes.md
+
+          if [ ! -s notes.md ]; then
+            echo "::error::CHANGELOG.md has no '## [$version]' section" >&2
+            exit 1
+          fi
+
+          {
+            echo "## Install"
+            echo
+            echo 'Download the archive for your platform below, unpack it, and put `nntp-tui` somewhere on your `PATH`.'
+            echo 'Verify it against `SHA256SUMS` first:'
+            echo
+            echo '```sh'
+            echo "sha256sum --check --ignore-missing SHA256SUMS"
+            echo '```'
+            echo
+            echo '```powershell'
+            echo '# PowerShell'
+            echo 'Get-FileHash .\nntp-tui-*.zip -Algorithm SHA256'
+            echo '```'
+            echo
+            echo "Then run \`nntp-tui doctor --host news.example.org\` to see what your server supports."
+            echo
+            echo "---"
+            echo
+            cat notes.md
+          } > release-notes.md
+
+          echo "--- release notes ---"
+          cat release-notes.md
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-notes
+          path: release-notes.md
+          retention-days: 1
+
+  build:
+    name: ${{ matrix.target }}
+    needs: verify
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+          # The macOS runners are arm64; the Intel slice cross-compiles on them, because
+          # Xcode ships both and there is nothing to emulate at build time.
+          - target: aarch64-apple-darwin
+            os: macos-latest
+          - target: x86_64-apple-darwin
+            os: macos-latest
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.verify.outputs.tag }}
+
+      - name: Install the target
+        run: rustup target add ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      # Only the reader. `nntp-testserver` is a testing tool that is not published, and a
+      # release asset is a promise to keep something working for whoever downloads it.
+      - name: Build
+        run: cargo build --release --locked --target ${{ matrix.target }} -p nntp-tui
+
+      - name: Package (unix)
+        if: runner.os != 'Windows'
+        run: |
+          set -euo pipefail
+          name="nntp-tui-${{ needs.verify.outputs.tag }}-${{ matrix.target }}"
+          mkdir "$name"
+          cp "target/${{ matrix.target }}/release/nntp-tui" "$name/"
+          cp README.md CHANGELOG.md LICENSE-MIT LICENSE-APACHE "$name/"
+          cp docs/user-guide.md "$name/"
+          tar -czf "$name.tar.gz" "$name"
+          shasum -a 256 "$name.tar.gz" > "$name.tar.gz.sha256"
+
+      - name: Package (windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $name = "nntp-tui-${{ needs.verify.outputs.tag }}-${{ matrix.target }}"
+          New-Item -ItemType Directory -Path $name | Out-Null
+          Copy-Item "target/${{ matrix.target }}/release/nntp-tui.exe" $name
+          Copy-Item README.md, CHANGELOG.md, LICENSE-MIT, LICENSE-APACHE $name
+          Copy-Item docs/user-guide.md $name
+          Compress-Archive -Path $name -DestinationPath "$name.zip"
+          (Get-FileHash "$name.zip" -Algorithm SHA256).Hash.ToLower() + "  $name.zip" |
+            Out-File -Encoding ascii "$name.zip.sha256"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}
+          path: |
+            nntp-tui-*.tar.gz
+            nntp-tui-*.zip
+            nntp-tui-*.sha256
+          retention-days: 1
+          if-no-files-found: error
+
+  publish:
+    name: publish the release
+    needs: [verify, build]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Collect the assets and one checksum file
+        run: |
+          set -euo pipefail
+          mkdir assets
+          find artifacts -type f \( -name '*.tar.gz' -o -name '*.zip' \) -exec mv {} assets/ \;
+          # One SHA256SUMS beside the archives, in the format `sha256sum --check` reads.
+          find artifacts -type f -name '*.sha256' -exec cat {} + | sed 's|.*/||' | sort -k2 > assets/SHA256SUMS
+          cp artifacts/release-notes/release-notes.md .
+          ls -l assets
+          cat assets/SHA256SUMS
+
+      - name: Create or update the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          tag="${{ needs.verify.outputs.tag }}"
+
+          # `--verify-tag` refuses to invent a tag that does not exist, which is what a
+          # typo in the manual input would otherwise do.
+          if gh release view "$tag" >/dev/null 2>&1; then
+            echo "release $tag exists; updating its notes and assets"
+            gh release edit "$tag" \
+              --notes-file release-notes.md \
+              --prerelease=${{ needs.verify.outputs.prerelease }}
+            gh release upload "$tag" assets/* --clobber
+          else
+            gh release create "$tag" assets/* \
+              --verify-tag \
+              --title "$tag" \
+              --notes-file release-notes.md \
+              --prerelease=${{ needs.verify.outputs.prerelease }}
+          fi
+
+          gh release view "$tag"
