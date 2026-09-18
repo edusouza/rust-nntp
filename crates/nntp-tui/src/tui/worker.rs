@@ -9,10 +9,10 @@ use std::sync::mpsc::{Receiver, Sender};
 use std::thread::JoinHandle;
 
 use nntp_client::{Cancel, Client, ClientError, Transport};
-use nntp_proto::{ActiveEntry, GroupName, Range};
+use nntp_proto::{ActiveEntry, GroupName, Range, Wildmat};
 
 use crate::session::{self, Target};
-use crate::tui::protocol::{Event, FetchToken, GroupRow, Request};
+use crate::tui::protocol::{Event, FetchToken, GroupRow, GroupScope, Request};
 
 /// Starts the worker.
 ///
@@ -85,7 +85,7 @@ impl Worker {
 
     fn dispatch(&mut self, request: Request) {
         let outcome = match &request {
-            Request::LoadGroups => self.load_groups(),
+            Request::LoadGroups { scope } => self.load_groups(scope),
             Request::OpenGroup {
                 group,
                 count,
@@ -167,18 +167,53 @@ impl Worker {
             )))
     }
 
-    fn load_groups(&mut self) -> Result<(), ClientError> {
-        self.send(Event::Progress("fetching the group list…".to_owned()));
+    fn load_groups(&mut self, scope: &GroupScope) -> Result<(), ClientError> {
+        self.send(Event::Progress(format!("fetching {}…", scope.describe())));
 
+        let batches = batch_patterns(&scope.patterns());
         let mut active: Vec<ActiveEntry> = Vec::new();
-        {
-            let client = self.client()?;
-            client.list_groups_streaming(None, |entry| {
-                if let Ok(entry) = entry {
-                    active.push(entry);
+        let mut filtered_locally = false;
+
+        for batch in &batches {
+            let mut entries = Vec::new();
+            let outcome = {
+                let client = self.client()?;
+                client.list_groups_streaming(batch.as_ref(), |entry| {
+                    if let Ok(entry) = entry {
+                        entries.push(entry);
+                    }
+                })
+            };
+
+            match outcome {
+                Ok(()) => active.append(&mut entries),
+                // A server within its rights to refuse the pattern (RFC 3977 §7.6.3
+                // makes it optional for the server too) must not leave the reader with an
+                // empty list. Ask again for everything and do the filtering here — the
+                // saving is lost, which is why the interface is told it happened, but the
+                // groups the user asked for still appear.
+                //
+                // Only for a refusal. Cancellation is fatal to the connection and so is
+                // already excluded, but it is named here too: Esc turning into a fetch of
+                // the whole catalogue — the very thing the user was stopping — is too
+                // unpleasant a bug to leave resting on another predicate's definition.
+                Err(error)
+                    if batch.is_some() && !error.is_connection_fatal() && !error.is_cancelled() =>
+                {
+                    tracing::debug!(%error, "the server refused a LIST pattern; filtering here");
+                    filtered_locally = true;
+                    let patterns = scope.patterns().into_iter().cloned().collect::<Vec<_>>();
+                    active = self.list_all_and_filter(&patterns)?;
+                    break;
                 }
-            })?;
+                Err(error) => return Err(error),
+            }
         }
+
+        // Patterns may overlap — `comp.*` and `comp.lang.*` in one list is a reasonable
+        // thing to write — and a group listed twice would be shown twice.
+        active.sort_by(|a, b| a.name.cmp(&b.name));
+        active.dedup_by(|a, b| a.name == b.name);
 
         // Descriptions come from a second command and are optional: a server that refuses
         // LIST NEWSGROUPS is still perfectly usable, just less informative.
@@ -187,18 +222,28 @@ impl Worker {
         // would leave the worker holding an unusable client and the interface believing
         // it was still connected, so the group list would arrive and every command after
         // it would fail for no visible reason.
-        let descriptions = match self.client()?.list_group_descriptions(None) {
-            Ok(result) => result
-                .entries
-                .into_iter()
-                .map(|entry| (entry.name, entry.description))
-                .collect::<std::collections::BTreeMap<_, _>>(),
-            Err(error) if error.is_connection_fatal() => return Err(error),
-            Err(error) => {
-                tracing::debug!(%error, "no group descriptions available");
-                std::collections::BTreeMap::new()
-            }
+        let mut descriptions = std::collections::BTreeMap::new();
+        // Unfiltered when the server has already shown it will not take a pattern, since
+        // asking again the same way would only earn the same refusal.
+        let description_batches = if filtered_locally {
+            vec![None]
+        } else {
+            batches
         };
+        for batch in &description_batches {
+            match self.client()?.list_group_descriptions(batch.as_ref()) {
+                Ok(result) => descriptions.extend(
+                    result
+                        .entries
+                        .into_iter()
+                        .map(|entry| (entry.name, entry.description)),
+                ),
+                Err(error) if error.is_connection_fatal() => return Err(error),
+                Err(error) => {
+                    tracing::debug!(%error, "no group descriptions available");
+                }
+            }
+        }
 
         let rows = active
             .into_iter()
@@ -211,8 +256,42 @@ impl Worker {
             })
             .collect();
 
-        self.send(Event::Groups(rows));
+        self.send(Event::Groups {
+            rows,
+            scope: scope.clone(),
+            filtered_locally,
+        });
         Ok(())
+    }
+
+    /// Fetches the whole catalogue and applies the patterns here.
+    ///
+    /// The fallback for a server that will not take a wildmat.
+    fn list_all_and_filter(
+        &mut self,
+        patterns: &[Wildmat],
+    ) -> Result<Vec<ActiveEntry>, ClientError> {
+        self.send(Event::Progress(
+            "the server will not narrow the list; fetching all of it…".to_owned(),
+        ));
+
+        let mut all = Vec::new();
+        let client = self.client()?;
+        client.list_groups_streaming(None, |entry| {
+            if let Ok(entry) = entry {
+                all.push(entry);
+            }
+        })?;
+
+        Ok(all
+            .into_iter()
+            .filter(|entry| {
+                patterns.is_empty()
+                    || patterns
+                        .iter()
+                        .any(|pattern| pattern.matches(entry.name.as_str()))
+            })
+            .collect())
     }
 
     fn open_group(
@@ -352,10 +431,55 @@ impl Worker {
     }
 }
 
+/// Groups patterns into as few `LIST` commands as the command line allows.
+///
+/// A wildmat is a comma-separated list, so several patterns usually travel in one command
+/// — but a command line is 512 octets (RFC 3977 §3.1) and a long subscription list does
+/// not fit in one. Splitting it is the honest answer: the alternative is refusing to start
+/// because somebody reads thirty hierarchies.
+///
+/// An empty list yields a single unfiltered command, because "no patterns" means "do not
+/// narrow the response" rather than "match nothing".
+fn batch_patterns(patterns: &[&Wildmat]) -> Vec<Option<Wildmat>> {
+    if patterns.is_empty() {
+        return vec![None];
+    }
+
+    let mut batches = Vec::new();
+    let mut current: Vec<Wildmat> = Vec::new();
+    let mut length = 0usize;
+
+    for pattern in patterns {
+        // The comma that would join it to what is already there.
+        let addition = pattern.as_str().len() + usize::from(!current.is_empty());
+        if !current.is_empty() && length + addition > Wildmat::MAX_LEN {
+            batches.push(Wildmat::join(&current).ok().flatten());
+            current = Vec::new();
+            length = 0;
+        }
+        length += pattern.as_str().len() + usize::from(!current.is_empty());
+        current.push((*pattern).clone());
+    }
+
+    if !current.is_empty() {
+        batches.push(Wildmat::join(&current).ok().flatten());
+    }
+
+    // A pattern too long to be sent even on its own would arrive here as `None`, which
+    // would silently fetch everything. Dropping it is the lesser evil and cannot happen in
+    // practice: `Wildmat::parse` already refuses anything longer than a command line.
+    batches.retain(Option::is_some);
+    if batches.is_empty() {
+        vec![None]
+    } else {
+        batches
+    }
+}
+
 /// Describes a request, for an error message.
 fn describe(request: &Request) -> String {
     match request {
-        Request::LoadGroups => "fetching the group list".to_owned(),
+        Request::LoadGroups { scope } => format!("fetching {}", scope.describe()),
         Request::OpenGroup { group, .. } => format!("opening {group}"),
         Request::LoadOverview { group, range, .. } => {
             format!("listing {group} {}", range.to_argument())
@@ -376,11 +500,66 @@ fn describe(request: &Request) -> String {
 mod tests {
     use super::*;
 
+    fn wildmat(pattern: &str) -> Wildmat {
+        Wildmat::parse(pattern).expect("a valid pattern")
+    }
+
+    #[test]
+    fn no_patterns_is_one_unfiltered_command() {
+        assert_eq!(batch_patterns(&[]), vec![None]);
+    }
+
+    #[test]
+    fn patterns_that_fit_travel_in_one_command() {
+        let patterns = [wildmat("comp.lang.*"), wildmat("misc.test")];
+        assert_eq!(
+            batch_patterns(&patterns.iter().collect::<Vec<_>>()),
+            vec![Wildmat::parse("comp.lang.*,misc.test").ok()]
+        );
+    }
+
+    #[test]
+    fn a_long_subscription_list_is_split_rather_than_refused() {
+        // Thirty hierarchies of a plausible length: more than one command line holds.
+        let patterns: Vec<Wildmat> = (0..30)
+            .map(|index| wildmat(&format!("comp.lang.{}{index}.*", "x".repeat(20))))
+            .collect();
+        let batches = batch_patterns(&patterns.iter().collect::<Vec<_>>());
+
+        assert!(batches.len() > 1, "expected a split, got {batches:?}");
+        for batch in &batches {
+            let batch = batch.as_ref().expect("a pattern");
+            assert!(batch.as_str().len() <= Wildmat::MAX_LEN, "{batch:?}");
+        }
+
+        // Every pattern is sent exactly once: a split that drops one hides groups.
+        let sent: Vec<&str> = batches
+            .iter()
+            .flatten()
+            .flat_map(|batch| batch.as_str().split(','))
+            .collect();
+        assert_eq!(sent.len(), patterns.len());
+        for pattern in &patterns {
+            assert!(sent.contains(&pattern.as_str()), "{pattern:?} was not sent");
+        }
+    }
+
     #[test]
     fn describes_every_request_for_an_error_message() {
         let group = GroupName::parse("misc.test").unwrap();
 
-        assert_eq!(describe(&Request::LoadGroups), "fetching the group list");
+        assert_eq!(
+            describe(&Request::LoadGroups {
+                scope: GroupScope::everything()
+            }),
+            "fetching the group list"
+        );
+        assert_eq!(
+            describe(&Request::LoadGroups {
+                scope: GroupScope::Search(wildmat("*rust*"))
+            }),
+            "fetching groups matching *rust*"
+        );
         assert_eq!(
             describe(&Request::OpenGroup {
                 group: group.clone(),

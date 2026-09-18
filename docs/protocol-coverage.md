@@ -39,13 +39,14 @@ divergence it found is noted under `GROUP`.
 
 | Command | Status | Notes |
 | --- | --- | --- |
+| Wildmat (§4.2) | ✅ | Validated on the way out and, where a list has to be filtered here, matched by `Wildmat::matches`: `*`, `?`, comma-separated alternatives and `!` negation, last match wins. RFC 3977's grammar excludes `[`, `]` and `\`, so there are no character classes and no escapes. |
 | `DATE` | ✅ | |
 | `HELP` | ✅ | |
 | `NEWGROUPS` | ✅ | `new_groups` — the cheap half of keeping a group list fresh. Compared against the *server's* clock, which is why `doctor` reports the skew. Does not report groups that have been removed, so a full refresh is still needed occasionally. |
 | `NEWNEWS` | ⬜ | Optional and frequently disabled by servers. |
-| `LIST ACTIVE` | ✅ | Streaming variant available. Note: `high` precedes `low`, unlike `GROUP`. |
-| `LIST ACTIVE.TIMES` | ✅ | `group_creation_times`. Optional; a server that does not keep it answers `503`, reported as `CommandNotSupported`. |
-| `LIST NEWSGROUPS` | ✅ | Tab- and space-separated descriptions both accepted. |
+| `LIST ACTIVE` | ✅ | Streaming variant available, with an optional wildmat — the reader sends one for the configured `subscriptions`. Note: `high` precedes `low`, unlike `GROUP`. A server may refuse the pattern, which is the one case where the client filters the list itself. |
+| `LIST ACTIVE.TIMES` | ✅ | `group_creation_times`. Optional; a server that does not keep it answers `503`, reported as `CommandNotSupported`. Takes a wildmat. |
+| `LIST NEWSGROUPS` | ✅ | Tab- and space-separated descriptions both accepted. Takes a wildmat, sent alongside the one on `LIST ACTIVE`. |
 | `LIST OVERVIEW.FMT` | ✅ | Fetched once per session and cached; a refusal falls back to the standard layout. |
 | `LIST HEADERS` | ✅ | `available_header_fields`. A server may answer `:` alone, meaning any field in the article; that is returned as it arrived rather than expanded into a list nobody can enumerate. |
 | `LIST DISTRIB.PATS` | 🚫 | Posting-only. |

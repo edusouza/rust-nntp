@@ -15,7 +15,7 @@
 use std::time::Duration;
 
 use nntp_client::{ClientError, ConnectOptions, Limits, connector};
-use nntp_proto::{ArticleSpec, GroupName, MessageId, Range};
+use nntp_proto::{ArticleSpec, GroupName, MessageId, Range, Wildmat};
 use nntp_testserver::{CapabilityProfile, Corpus, GreetingMode, Quirks, ServerConfig, TestServer};
 
 /// Connects to a server, with timeouts short enough that a hang fails the test instead of
@@ -117,6 +117,31 @@ fn a_whole_reading_session() {
     assert_eq!(date.to_rfc3339(), "2026-09-17T08:09:10+00:00");
 
     client.quit().expect("quit");
+}
+
+#[test]
+fn a_wildmat_is_applied_by_the_server_rather_than_here() {
+    // #15. The saving only exists if the *server* does the filtering: a pattern the
+    // server ignores costs the whole catalogue and then discards most of it here.
+    let server = serve(ServerConfig::new());
+    let mut client = connect(&server);
+    client.handshake().expect("handshake");
+
+    let pattern = Wildmat::parse("comp.*").expect("a valid pattern");
+    let groups = client.list_groups(Some(&pattern)).expect("list");
+    let names: Vec<&str> = groups.entries.iter().map(|g| g.name.as_str()).collect();
+
+    assert_eq!(names, ["comp.lang.rust"]);
+
+    let descriptions = client
+        .list_group_descriptions(Some(&pattern))
+        .expect("descriptions");
+    let described: Vec<&str> = descriptions
+        .entries
+        .iter()
+        .map(|entry| entry.name.as_str())
+        .collect();
+    assert_eq!(described, ["comp.lang.rust"]);
 }
 
 #[test]

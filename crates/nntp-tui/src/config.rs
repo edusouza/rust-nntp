@@ -59,6 +59,31 @@ pub struct ServerConfig {
     /// better than one that posts as somebody who does not exist.
     pub from: Option<String>,
 
+    /// Which groups to fetch from this server, as wildmat patterns.
+    ///
+    /// Empty — the default — means the whole group list, which on a full-feed server is
+    /// several megabytes and tens of seconds before anything can be read. Most people read
+    /// a handful of hierarchies, and saying so turns that fetch into a small one:
+    ///
+    /// ```toml
+    /// subscriptions = ["comp.lang.*", "misc.test", "news.software.*"]
+    /// ```
+    ///
+    /// The patterns are sent to the server as the wildmat argument of `LIST ACTIVE`
+    /// (RFC 3977 §7.6.3), so the filtering happens there rather than here. Within a
+    /// pattern `*` matches any run of characters and `?` exactly one; an entry beginning
+    /// with `!` excludes what it matches, and the last pattern that matches a group
+    /// decides — `["comp.*", "!comp.os.*"]` is every `comp` group but those.
+    ///
+    /// Per server, because a subscription is: the same person reads different groups on
+    /// different machines, and an article number only means anything on the server that
+    /// issued it.
+    ///
+    /// This is not a filter for the group list on screen — `/` does that, instantly, on
+    /// what has already been fetched. This decides what is fetched at all, and `S` in the
+    /// reader searches past it when something outside the subscriptions is wanted.
+    pub subscriptions: Vec<String>,
+
     /// Username for `AUTHINFO USER`.
     pub username: Option<String>,
 
@@ -115,6 +140,7 @@ impl Default for ServerConfig {
             port: None,
             security: SecurityConfig::default(),
             from: None,
+            subscriptions: Vec::new(),
             username: None,
             password: None,
             password_command: None,
@@ -321,6 +347,15 @@ impl Config {
                     sources.join(" and ")
                 );
             }
+
+            // A pattern that cannot be sent has to be reported now, by name. Dropping it
+            // silently would hide groups the user asked for and leave nothing to look at
+            // to find out why.
+            for pattern in &server.subscriptions {
+                if let Err(error) = nntp_proto::Wildmat::parse(pattern) {
+                    bail!("server {name:?} has an unusable subscription {pattern:?}: {error}");
+                }
+            }
         }
 
         Ok(())
@@ -417,6 +452,12 @@ allow_plaintext_auth = false
 connect_timeout_secs = 20
 read_timeout_secs = 60
 write_timeout_secs = 30
+# Which groups to fetch. Empty or absent means the server's whole list, which on a
+# full-feed server is several megabytes before you can read anything. These are wildmat
+# patterns, filtered by the server: `*` is any run of characters, `?` is one, a leading
+# `!` excludes, and the last pattern that matches a group wins. Press S in the reader to
+# search past them.
+# subscriptions = ["comp.lang.*", "misc.test", "news.software.readers"]
 
 # A second server, to show that several can coexist.
 # Who your articles are posted as. There is no default: a guess would put somebody
@@ -717,6 +758,35 @@ mod tests {
     fn rejects_a_server_with_no_host() {
         let error = parse("[servers.a]\nhost = \"\"\n").unwrap_err().to_string();
         assert!(error.contains("no host"), "{error}");
+    }
+
+    #[test]
+    fn keeps_subscriptions_in_the_order_they_were_written() {
+        // Order is meaning: the last pattern that matches a group decides, so a list that
+        // came back sorted or deduplicated would quietly change what it selects.
+        let config = parse(
+            "[servers.a]\nhost=\"x\"\nsubscriptions=[\"comp.*\", \"!comp.os.*\", \"misc.test\"]\n",
+        )
+        .expect("a valid file");
+        let server = &config.servers["a"];
+        assert_eq!(server.subscriptions, ["comp.*", "!comp.os.*", "misc.test"]);
+    }
+
+    #[test]
+    fn rejects_a_subscription_that_cannot_be_sent() {
+        // A pattern with a space cannot be a wildmat, so it would be dropped on the way to
+        // the server and the groups it named would silently not appear.
+        let error = parse("[servers.a]\nhost=\"x\"\nsubscriptions=[\"two words\"]\n")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("two words"), "{error}");
+        assert!(error.contains("subscription"), "{error}");
+    }
+
+    #[test]
+    fn no_subscriptions_means_the_whole_group_list() {
+        let config = parse("[servers.a]\nhost=\"x\"\n").expect("a valid file");
+        assert!(config.servers["a"].subscriptions.is_empty());
     }
 
     #[test]

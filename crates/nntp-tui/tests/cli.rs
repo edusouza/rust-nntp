@@ -45,6 +45,15 @@ fn run_against(server: &TestServer, args: &[&str]) -> Output {
     run(&full)
 }
 
+/// Writes a configuration file for one test and returns its path.
+///
+/// Named after the test rather than randomised, so a leftover file says which test left it.
+fn temporary_config(name: &str, contents: &str) -> std::path::PathBuf {
+    let path = std::env::temp_dir().join(format!("nntp-tui-{name}-{}.toml", std::process::id()));
+    std::fs::write(&path, contents).expect("write the configuration");
+    path
+}
+
 /// A path that deliberately does not exist, so the defaults are used.
 fn missing_config() -> &'static str {
     "/nonexistent/nntp-tui-test-config.toml"
@@ -145,9 +154,12 @@ fn groups_filters_by_wildmat_and_limits_the_count() {
 
     let filtered = run_against(&server, &["groups", "--pattern", "comp.*"]);
     assert!(filtered.status.success(), "stderr: {}", stderr(&filtered));
-    // The fake server does not implement wildmat matching, so this checks that the
-    // pattern is accepted and sent, not that it filters.
-    assert!(stdout(&filtered).contains("comp.lang.rust"));
+    let text = stdout(&filtered);
+    assert!(text.contains("comp.lang.rust"), "{text}");
+    // The pattern is applied by the server, so nothing else comes back — `de.comp.test`
+    // is the one a substring match would have let through.
+    assert!(!text.contains("de.comp.test"), "{text}");
+    assert!(!text.contains("misc.test"), "{text}");
 
     let limited = run_against(&server, &["groups", "-n", "2"]);
     assert_eq!(stdout(&limited).lines().count(), 2, "{}", stdout(&limited));
@@ -162,6 +174,51 @@ fn groups_shows_descriptions_including_non_ascii() {
     let text = stdout(&output);
     assert!(text.contains("For testing purposes only"), "{text}");
     assert!(text.contains("äöü"), "{text}");
+}
+
+#[test]
+fn groups_lists_the_subscribed_ones_when_no_pattern_is_given() {
+    // #15. The saving belongs to the command line too: on a full feed `groups` is the
+    // same several megabytes the reader was waiting for.
+    let server = serve();
+    let config = temporary_config(
+        "subscriptions_apply",
+        &format!(
+            "[servers.local]\nhost = \"127.0.0.1\"\nport = {}\nsecurity = \"plain\"\n\
+             subscriptions = [\"comp.*\"]\n",
+            server.port()
+        ),
+    );
+
+    let output = run(&[
+        "--config",
+        config.to_str().expect("a printable path"),
+        "groups",
+    ]);
+
+    assert!(output.status.success(), "stderr: {}", stderr(&output));
+    let text = stdout(&output);
+    assert!(text.contains("comp.lang.rust"), "{text}");
+    assert!(!text.contains("misc.test"), "{text}");
+    // Said on stderr, so a pipe still sees group names and only group names, and somebody
+    // hunting for a group they are not subscribed to learns why it is missing.
+    assert!(stderr(&output).contains("--pattern"), "{}", stderr(&output));
+
+    // And an explicit pattern still wins over the configuration.
+    let everything = run(&[
+        "--config",
+        config.to_str().expect("a printable path"),
+        "groups",
+        "--pattern",
+        "*",
+    ]);
+    assert!(
+        stdout(&everything).contains("misc.test"),
+        "{}",
+        stdout(&everything)
+    );
+
+    let _ = std::fs::remove_file(&config);
 }
 
 #[test]

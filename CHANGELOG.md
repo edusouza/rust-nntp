@@ -9,6 +9,55 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Subscriptions: the reader fetches the groups you read, not all of them** ([#15]). A
+  `subscriptions` key under a server takes wildmat patterns, sent as the argument of
+  `LIST ACTIVE` and `LIST NEWSGROUPS` so the *server* does the filtering:
+
+  ```toml
+  [servers.eternal-september]
+  subscriptions = ["comp.lang.*", "misc.test", "!comp.lang.c"]
+  ```
+
+  On a full-feed server that is the difference between several megabytes before anything
+  can be read and a fetch that finishes while you are still looking at the greeting.
+
+  The patterns follow RFC 3977 §4.2 rather than being substrings: `*` is any run of
+  characters, `?` is one, an entry beginning with `!` excludes, and the last pattern that
+  matches a group decides. A pattern is anchored at both ends, so `comp.*` does not match
+  `de.comp.test` — which a substring filter would have let through.
+
+  **Not a cage.** `S` asks the server for groups matching whatever is in the filter box,
+  and with the box empty, for the whole catalogue. It is a key of its own rather than
+  something the `/` filter does when it finds nothing, because it costs a round trip and
+  the megabytes the subscriptions were configured to avoid. The group pane says which of
+  the three lists is on screen: a bare count, `n subscribed`, or `n found`.
+
+  **Not the `/` filter.** That still narrows what has already been fetched, instantly and
+  without the network. Two ways of narrowing a list that look the same and cost wildly
+  different things should not be the same gesture.
+
+  The group list is now sorted by name. Patterns may overlap, and a long subscription list
+  travels as several `LIST` commands, so without it the order would have been "whatever the
+  patterns were written in" — and a group listed by two patterns would have appeared twice.
+
+  A server may refuse the pattern — RFC 3977 §7.6.3 leaves it optional for the server too
+  — and one that does no longer leaves the reader with an empty list: the whole catalogue
+  is fetched and filtered here, and the message pane says so, because the groups still
+  appear but the saving does not.
+
+  `Wildmat::matches` implements the matching rule, iteratively rather than recursively:
+  `*a*a*a*a*b` against a long name is where a naive matcher becomes exponential, and a
+  pattern out of a configuration file is not something to hand a stack overflow.
+
+  The command line follows the same rule: `nntp-tui groups` with no `--pattern` lists the
+  subscribed groups and says so on stderr, so a pipe still sees group names and only group
+  names. `--pattern '*'` is the whole catalogue whatever the configuration says.
+
+  `nntp-testserver` now honours the wildmat on `LIST ACTIVE`, `LIST NEWSGROUPS` and
+  `LIST ACTIVE.TIMES`, and grows a `--no-list-wildmat` quirk for the servers that refuse
+  one. It ignored the pattern entirely before, which would have let a client ship a filter
+  that narrowed nothing and only find out against a real group list.
+
 - **Releases carry binaries.** A `v*.*.*` tag now builds `nntp-tui` for Linux, both macOS
   architectures and Windows, and publishes a GitHub Release with the archives and a
   `SHA256SUMS` beside them. The release notes are the changelog section for that version —
@@ -553,5 +602,6 @@ records what was checked, against which server, on what date ([#4]).
 [#10]: https://github.com/edusouza/rust-nntp/issues/10
 [#11]: https://github.com/edusouza/rust-nntp/issues/11
 [#12]: https://github.com/edusouza/rust-nntp/issues/12
+[#15]: https://github.com/edusouza/rust-nntp/issues/15
 [#16]: https://github.com/edusouza/rust-nntp/issues/16
 [#17]: https://github.com/edusouza/rust-nntp/issues/17

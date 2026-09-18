@@ -23,15 +23,21 @@ pub const MAX_COMMAND_LEN: usize = 512;
 pub struct Wildmat(String);
 
 impl Wildmat {
+    /// The longest pattern that may be sent.
+    ///
+    /// Well inside the 512-octet command line of RFC 3977 §3.1, which also has to carry
+    /// the command itself.
+    pub const MAX_LEN: usize = 400;
+
     /// Validates and wraps a pattern.
     ///
     /// # Errors
     ///
-    /// Returns [`ProtoError::InvalidWildmat`] if the pattern is empty, longer than 400
-    /// octets, or contains a byte outside printable US-ASCII.
+    /// Returns [`ProtoError::InvalidWildmat`] if the pattern is empty, longer than
+    /// [`Self::MAX_LEN`], or contains a byte outside printable US-ASCII.
     pub fn parse(pattern: &str) -> Result<Self> {
         if pattern.is_empty()
-            || pattern.len() > 400
+            || pattern.len() > Self::MAX_LEN
             || !pattern.bytes().all(|b| b.is_ascii_graphic())
         {
             return Err(ProtoError::InvalidWildmat(pattern.to_owned()));
@@ -48,10 +54,127 @@ impl Wildmat {
         Self::parse(&format!("{prefix}.*"))
     }
 
+    /// Builds a pattern matching any name containing `text`: `rust` becomes `*rust*`.
+    ///
+    /// This is the wildmat spelling of the substring search a reader's filter box does
+    /// locally, so that the same typing can be handed to the server instead.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProtoError::InvalidWildmat`] if the resulting pattern is not valid —
+    /// which is what a space or a non-ASCII character in `text` produces, since neither
+    /// can be sent in a wildmat.
+    pub fn containing(text: &str) -> Result<Self> {
+        Self::parse(&format!("*{text}*"))
+    }
+
+    /// Joins patterns into one, in the comma-separated form RFC 3977 §4.2 defines.
+    ///
+    /// Returns `None` for an empty list, because a wildmat that matches nothing cannot be
+    /// spelled and "no patterns" means "do not narrow the response" everywhere it is used.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProtoError::InvalidWildmat`] if the joined pattern exceeds the length a
+    /// wildmat may have. Callers with a long list should send several commands rather than
+    /// one — see [`Self::MAX_LEN`].
+    pub fn join(patterns: &[Self]) -> Result<Option<Self>> {
+        if patterns.is_empty() {
+            return Ok(None);
+        }
+        let joined = patterns
+            .iter()
+            .map(Self::as_str)
+            .collect::<Vec<_>>()
+            .join(",");
+        Self::parse(&joined).map(Some)
+    }
+
     /// The pattern as a string slice.
     pub fn as_str(&self) -> &str {
         &self.0
     }
+
+    /// Whether `name` matches this pattern, by the rules of RFC 3977 §4.2.
+    ///
+    /// The pattern is a comma-separated list of sub-patterns, each optionally preceded by
+    /// `!` to negate it, and **the last sub-pattern that matches decides**: `comp.*` keeps
+    /// every `comp` group, `comp.*,!comp.os.*` keeps all but the `comp.os` ones, and
+    /// `comp.*,!comp.os.*,comp.os.linux.*` puts that one hierarchy back. A name that no
+    /// sub-pattern matches does not match.
+    ///
+    /// Within a sub-pattern, `*` matches any run of characters including none, `?` matches
+    /// exactly one, and everything else matches itself. RFC 3977's grammar deliberately
+    /// excludes `[`, `]` and `\` from a wildmat, so — unlike the original wildmat, and
+    /// unlike some servers — this implements no character classes and no escaping, and
+    /// treats those three characters as ordinary text.
+    ///
+    /// Matching is case-sensitive, as newsgroup names are.
+    ///
+    /// This is here for the two callers that must filter a group list themselves: a server
+    /// that refuses a pattern on `LIST` and has to be filtered after the fact, and a fake
+    /// server that would otherwise teach a client that patterns are ignored.
+    pub fn matches(&self, name: &str) -> bool {
+        let name: Vec<char> = name.chars().collect();
+        let mut matched = false;
+
+        for item in self.0.split(',') {
+            let (negated, pattern) = match item.strip_prefix('!') {
+                Some(rest) => (true, rest),
+                None => (false, item),
+            };
+            if matches_one(&pattern.chars().collect::<Vec<_>>(), &name) {
+                matched = !negated;
+            }
+        }
+
+        matched
+    }
+}
+
+/// Matches one `*`/`?` sub-pattern against a name.
+///
+/// Iterative with one backtracking point rather than recursive: `*` against a long name is
+/// where a recursive matcher becomes exponential, and a pattern arriving from a
+/// configuration file is not something to hand a stack overflow.
+fn matches_one(pattern: &[char], name: &[char]) -> bool {
+    let (mut p, mut n) = (0usize, 0usize);
+    // Where to resume from if the current `*` turns out to have consumed too little.
+    let mut star: Option<usize> = None;
+    let mut resume = 0usize;
+
+    while n < name.len() {
+        match pattern.get(p) {
+            Some('*') => {
+                star = Some(p);
+                resume = n;
+                p += 1;
+            }
+            Some('?') => {
+                p += 1;
+                n += 1;
+            }
+            Some(character) if Some(character) == name.get(n) => {
+                p += 1;
+                n += 1;
+            }
+            // No match here: give the last `*` one more character and try again.
+            _ => match star {
+                Some(index) => {
+                    p = index + 1;
+                    resume += 1;
+                    n = resume;
+                }
+                None => return false,
+            },
+        }
+    }
+
+    // Trailing stars may match nothing at all; anything else left over does not match.
+    while matches!(pattern.get(p), Some('*')) {
+        p += 1;
+    }
+    p == pattern.len()
 }
 
 /// Which `LIST` variant to send.
@@ -599,5 +722,105 @@ mod tests {
         }
         assert!(Wildmat::parse("comp.lang.*").is_ok());
         assert!(Wildmat::parse("comp.*,!comp.os.*").is_ok());
+    }
+
+    fn wildmat(pattern: &str) -> Wildmat {
+        Wildmat::parse(pattern).expect("a valid pattern")
+    }
+
+    #[test]
+    fn a_pattern_without_wildcards_matches_only_itself() {
+        let pattern = wildmat("misc.test");
+        assert!(pattern.matches("misc.test"));
+        assert!(!pattern.matches("misc.test.moderated"));
+        assert!(!pattern.matches("alt.misc.test"));
+        // Group names are case-sensitive, and so is matching them.
+        assert!(!pattern.matches("Misc.Test"));
+    }
+
+    #[test]
+    fn a_star_matches_any_run_of_characters_including_none() {
+        assert!(wildmat("comp.*").matches("comp."));
+        assert!(wildmat("comp.*").matches("comp.lang.rust"));
+        assert!(!wildmat("comp.*").matches("alt.comp.lang"));
+
+        assert!(wildmat("*rust*").matches("comp.lang.rust"));
+        assert!(wildmat("*rust*").matches("rust"));
+        assert!(!wildmat("*rust*").matches("comp.lang.ada"));
+
+        assert!(wildmat("*").matches("anything.at.all"));
+        assert!(wildmat("*").matches(""));
+    }
+
+    #[test]
+    fn a_question_mark_matches_exactly_one_character() {
+        assert!(wildmat("misc.tes?").matches("misc.test"));
+        assert!(!wildmat("misc.tes?").matches("misc.tes"));
+        assert!(!wildmat("misc.tes?").matches("misc.tested"));
+    }
+
+    #[test]
+    fn the_last_matching_sub_pattern_decides() {
+        // RFC 3977 §4.2. The rule that makes a subscription list expressive: everything
+        // under a hierarchy except one branch, and then one twig of that branch back.
+        let pattern = wildmat("comp.*,!comp.os.*,comp.os.linux.*");
+        assert!(pattern.matches("comp.lang.rust"));
+        assert!(!pattern.matches("comp.os.plan9"));
+        assert!(pattern.matches("comp.os.linux.misc"));
+        assert!(!pattern.matches("alt.folklore.computers"));
+    }
+
+    #[test]
+    fn a_negation_alone_matches_nothing() {
+        // Nothing has matched by the time the negation is applied, so there is nothing to
+        // take away. A list of exclusions with no inclusion is a mistake worth behaving
+        // predictably about rather than treating as "everything but".
+        assert!(!wildmat("!comp.*").matches("comp.lang.rust"));
+        assert!(!wildmat("!comp.*").matches("alt.test"));
+    }
+
+    #[test]
+    fn stars_do_not_run_away_on_a_long_name() {
+        // The pathological case for a naive recursive matcher: many stars, a long name,
+        // and no match at the end. This finishes immediately or it does not finish at all.
+        let pattern = wildmat("*a*a*a*a*a*a*a*a*a*a*b");
+        assert!(!pattern.matches(&"a".repeat(2000)));
+        assert!(pattern.matches(&format!("{}b", "a".repeat(2000))));
+    }
+
+    #[test]
+    fn brackets_and_backslashes_are_ordinary_characters() {
+        // RFC 3977 §4.2 excludes them from the grammar, so there are no character classes
+        // and no escapes here. Documented rather than silently different.
+        assert!(wildmat("comp.[ab]").matches("comp.[ab]"));
+        assert!(!wildmat("comp.[ab]").matches("comp.a"));
+    }
+
+    #[test]
+    fn builds_a_substring_pattern_from_typed_text() {
+        assert_eq!(Wildmat::containing("rust").unwrap().as_str(), "*rust*");
+        assert!(
+            Wildmat::containing("rust")
+                .unwrap()
+                .matches("comp.lang.rust")
+        );
+        // What a reader's filter box can hold and a wildmat cannot.
+        assert!(Wildmat::containing("two words").is_err());
+    }
+
+    #[test]
+    fn joins_patterns_with_commas() {
+        assert_eq!(Wildmat::join(&[]).unwrap(), None);
+        assert_eq!(
+            Wildmat::join(&[wildmat("comp.lang.*"), wildmat("misc.test")])
+                .unwrap()
+                .map(|joined| joined.as_str().to_owned()),
+            Some("comp.lang.*,misc.test".to_owned())
+        );
+
+        // Too long to send is an error rather than a truncation: a silently shortened
+        // subscription list would drop groups without saying so.
+        let long = vec![wildmat(&"x".repeat(200)); 3];
+        assert!(Wildmat::join(&long).is_err());
     }
 }

@@ -268,10 +268,40 @@ pub fn groups(
     let mut client = session::connect(&target)?;
     let out = &mut std::io::stdout().lock();
 
-    let wildmat = pattern
-        .map(Wildmat::parse)
-        .transpose()
-        .context("the pattern is not a valid wildmat")?;
+    // An explicit pattern wins; without one, the server's configured subscriptions apply,
+    // for the same reason they apply in the reader — on a full feed this is the difference
+    // between a command that answers and one you wait out. It is said on stderr rather
+    // than stdout so that a pipe still sees only group names, and so that somebody looking
+    // for a group they are not subscribed to is told why it is missing.
+    let wildmat = match pattern {
+        Some(pattern) => {
+            Some(Wildmat::parse(pattern).context("the pattern is not a valid wildmat")?)
+        }
+        None => {
+            let subscriptions = target
+                .server
+                .subscriptions
+                .iter()
+                .map(String::as_str)
+                .map(Wildmat::parse)
+                .collect::<Result<Vec<_>, _>>()
+                .context("a configured subscription is not a valid wildmat")?;
+
+            match Wildmat::join(&subscriptions)
+                .context("the configured subscriptions are too long to send as one pattern")?
+            {
+                Some(joined) => {
+                    eprintln!(
+                        "listing the {} subscribed pattern(s) for {}; --pattern '*' shows everything",
+                        subscriptions.len(),
+                        target.label
+                    );
+                    Some(joined)
+                }
+                None => None,
+            }
+        }
+    };
 
     let mut shown = 0usize;
     let mut skipped = 0usize;

@@ -45,7 +45,21 @@ impl Harness {
     }
 
     fn with_read_state(server: TestServer, read: ReadStore) -> Self {
-        Self::build(server, read, 500)
+        Self::build(server, read, 500, Vec::new())
+    }
+
+    /// A harness whose reader is subscribed to `patterns` and nothing else.
+    fn with_subscriptions(server: TestServer, patterns: &[&str]) -> Self {
+        let patterns = patterns
+            .iter()
+            .map(|pattern| nntp_proto::Wildmat::parse(pattern).expect("a valid pattern"))
+            .collect();
+        Self::build(
+            server,
+            ReadStore::empty(PathBuf::from("unused")),
+            500,
+            patterns,
+        )
     }
 
     /// A harness whose worker splits overview fetches into `chunk`-sized pieces.
@@ -54,15 +68,28 @@ impl Harness {
     /// is to make the pieces small. The chunk size is a configuration key precisely
     /// because what is sensible depends on the server.
     fn with_chunk(server: TestServer, chunk: u64) -> Self {
-        Self::build(server, ReadStore::empty(PathBuf::from("unused")), chunk)
+        Self::build(
+            server,
+            ReadStore::empty(PathBuf::from("unused")),
+            chunk,
+            Vec::new(),
+        )
     }
 
-    fn build(server: TestServer, read: ReadStore, chunk: u64) -> Self {
+    fn build(
+        server: TestServer,
+        read: ReadStore,
+        chunk: u64,
+        subscriptions: Vec<nntp_proto::Wildmat>,
+    ) -> Self {
         let target = target_for(&server);
         let (request_tx, request_rx) = mpsc::channel();
         let (event_tx, event_rx) = mpsc::channel();
 
         let mut app = App::new(&Config::default().ui, read);
+        // Set before the first request, exactly as the run loop does: the subscriptions
+        // decide what that request asks for.
+        app.subscriptions = subscriptions;
 
         // The harness shares the app's cancel flag with the worker, exactly as the run
         // loop does, so a test can cancel the way a keystroke would.
@@ -168,6 +195,93 @@ fn loads_the_group_list_on_start_up() {
     );
     // Sparse numbering: the watermarks span six numbers for two articles.
     assert_eq!(rust.article_bound(), 6);
+}
+
+#[test]
+fn subscriptions_narrow_the_group_list_at_the_server() {
+    // #15. The corpus carries four groups; a reader subscribed to two hierarchies should
+    // see two of them, and — the part that matters on a full-feed server — the other two
+    // should never have crossed the network.
+    let mut harness =
+        Harness::with_subscriptions(serve(ServerConfig::new()), &["comp.*", "misc.*"]);
+    harness.settle("the group list", |app| !app.groups.is_empty());
+
+    let names: Vec<&str> = harness
+        .app
+        .groups
+        .iter()
+        .map(|group| group.name.as_str())
+        .collect();
+    assert_eq!(names, ["comp.lang.rust", "misc.test"]);
+
+    // `de.comp.test` is the one a substring filter would have let through and a wildmat
+    // does not: `comp.*` is anchored at the start of the name.
+    assert!(!names.contains(&"de.comp.test"), "{names:?}");
+    assert!(
+        harness.app.status.contains("subscribed"),
+        "{}",
+        harness.app.status
+    );
+}
+
+#[test]
+fn a_server_that_refuses_a_pattern_still_shows_the_subscribed_groups() {
+    // RFC 3977 §7.6.3 leaves the pattern optional for the server too, and servers that
+    // refuse one exist. The saving is lost, which is worth saying; an empty group list
+    // would not be.
+    let mut harness = Harness::with_subscriptions(
+        serve(ServerConfig::new().quirks(Quirks {
+            no_list_wildmat: true,
+            ..Quirks::default()
+        })),
+        &["comp.*"],
+    );
+    harness.settle("the group list", |app| !app.groups.is_empty());
+
+    let names: Vec<&str> = harness
+        .app
+        .groups
+        .iter()
+        .map(|group| group.name.as_str())
+        .collect();
+    assert_eq!(names, ["comp.lang.rust"]);
+    assert!(
+        harness
+            .app
+            .messages
+            .iter()
+            .any(|message| message.contains("filtered here")),
+        "{:?}",
+        harness.app.messages
+    );
+}
+
+#[test]
+fn a_search_reaches_a_group_outside_the_subscriptions() {
+    // The escape hatch: without it, a subscription list is a trap that needs a text editor
+    // and a restart to get out of.
+    let mut harness = Harness::with_subscriptions(serve(ServerConfig::new()), &["comp.lang.*"]);
+    harness.settle("the group list", |app| !app.groups.is_empty());
+    assert_eq!(harness.app.groups.len(), 1);
+
+    harness.press(KeyCode::Char('/'));
+    harness.type_text("misc");
+    harness.press(KeyCode::Enter);
+    harness.press(KeyCode::Char('S'));
+
+    harness.settle("the search", |app| {
+        app.groups
+            .iter()
+            .any(|group| group.name.as_str() == "misc.test")
+    });
+
+    // And the group can then be opened like any other, which is the point of finding it.
+    harness.press(KeyCode::Enter);
+    harness.settle("the articles", |app| !app.articles.is_empty());
+    assert_eq!(
+        harness.app.group.as_ref().map(|group| group.name.as_str()),
+        Some("misc.test")
+    );
 }
 
 #[test]

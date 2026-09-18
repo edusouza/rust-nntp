@@ -10,6 +10,7 @@ use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, BorderType, Clear, List, ListItem, ListState, Paragraph, Wrap};
 
 use crate::tui::app::{App, Overlay, Pane};
+use crate::tui::protocol::GroupScope;
 
 /// The colour of a focused border, and of the selected row.
 const ACCENT: Color = Color::Cyan;
@@ -95,13 +96,23 @@ fn selection_style(focused: bool) -> Style {
 fn draw_groups(frame: &mut Frame<'_>, app: &App, area: Rect) {
     let visible = app.visible_groups();
 
+    // What the count means depends on what was asked for, and this pane is two dozen
+    // columns wide, so it is one word: a list narrowed by subscriptions or by a search is
+    // not the server's whole catalogue, and a reader looking for a missing group needs to
+    // know which of the two they are looking at.
+    let scope = match &app.group_scope {
+        GroupScope::Subscribed(patterns) if patterns.is_empty() => "",
+        GroupScope::Subscribed(_) => " subscribed",
+        GroupScope::Search(_) => " found",
+    };
+
     let subtitle = if app.editing_filter {
         Some(format!("/{}", app.filter))
     } else if app.filter.is_empty() {
-        (!app.groups.is_empty()).then(|| format!("{}", app.groups.len()))
+        (!app.groups.is_empty()).then(|| format!("{}{scope}", app.groups.len()))
     } else {
         Some(format!(
-            "/{} — {} of {}",
+            "/{} — {} of {}{scope}",
             app.filter,
             visible.len(),
             app.groups.len()
@@ -485,7 +496,7 @@ fn draw_overlay(
 }
 
 fn help_text() -> Text<'static> {
-    const ROWS: [(&str, &str); 22] = [
+    const ROWS: [(&str, &str); 23] = [
         ("Tab / Shift-Tab", "next / previous pane"),
         ("h l  ← →", "move focus left / right"),
         ("j k  ↓ ↑", "move down / up"),
@@ -504,8 +515,9 @@ fn help_text() -> Text<'static> {
         ("f", "follow up to the article on screen"),
         ("M", "mark the article under the cursor read / unread"),
         ("c", "catch up: mark the whole group read"),
-        ("/", "filter groups by name or description"),
+        ("/", "filter the groups already fetched, by name or text"),
         ("↑ ↓ while filtering", "move through what the filter left"),
+        ("S", "ask the server for groups matching the filter"),
         (
             "Esc",
             "stop a request in progress; else clear the filter or close an overlay",
@@ -563,6 +575,15 @@ mod tests {
     use super::*;
     use crate::config::UiConfig;
     use crate::tui::protocol::{Event, GroupRow};
+
+    /// A group list as the worker delivers one: everything the server carries.
+    fn groups_arrived(rows: Vec<GroupRow>) -> Event {
+        Event::Groups {
+            rows,
+            scope: GroupScope::everything(),
+            filtered_locally: false,
+        }
+    }
 
     /// Renders into an in-memory terminal and returns the screen as text.
     ///
@@ -679,7 +700,7 @@ mod tests {
     #[test]
     fn lists_groups_with_a_bounded_unread_count() {
         let mut app = app();
-        app.on_event(Event::Groups(vec![
+        app.on_event(groups_arrived(vec![
             group_row("comp.lang.rust", 1, 10),
             group_row("empty.group", 1, 0),
         ]));
@@ -696,7 +717,7 @@ mod tests {
     fn a_group_with_nothing_left_says_read_rather_than_zero() {
         let mut app = app();
         app.read.mark_range_read("comp.lang.rust", 1, 10);
-        app.on_event(Event::Groups(vec![group_row("comp.lang.rust", 1, 10)]));
+        app.on_event(groups_arrived(vec![group_row("comp.lang.rust", 1, 10)]));
 
         let screen = render(&mut app, 100, 20);
         assert!(screen.contains("read"), "{screen}");
@@ -805,7 +826,7 @@ mod tests {
     #[test]
     fn shows_the_filter_and_how_much_it_hides() {
         let mut app = app();
-        app.on_event(Event::Groups(vec![
+        app.on_event(groups_arrived(vec![
             group_row("comp.lang.rust", 1, 10),
             group_row("misc.test", 1, 3),
         ]));
@@ -814,6 +835,38 @@ mod tests {
         let screen = render(&mut app, 100, 20);
         assert!(screen.contains("/misc"), "{screen}");
         assert!(screen.contains("1 of 2"), "{screen}");
+    }
+
+    #[test]
+    fn says_when_the_list_is_narrower_than_the_server() {
+        // A reader hunting for a group that is not on screen has to be able to tell
+        // "this server does not carry it" from "you did not ask for it".
+        let mut app = app();
+        app.on_event(Event::Groups {
+            rows: vec![group_row("comp.lang.rust", 1, 10)],
+            scope: GroupScope::Subscribed(vec![
+                nntp_proto::Wildmat::parse("comp.lang.*").expect("a valid pattern"),
+            ]),
+            filtered_locally: false,
+        });
+
+        let screen = render(&mut app, 100, 20);
+        assert!(screen.contains("1 subscribed"), "{screen}");
+    }
+
+    #[test]
+    fn says_when_the_list_came_from_a_search() {
+        let mut app = app();
+        app.on_event(Event::Groups {
+            rows: vec![group_row("comp.lang.rust", 1, 10)],
+            scope: GroupScope::Search(
+                nntp_proto::Wildmat::parse("*rust*").expect("a valid pattern"),
+            ),
+            filtered_locally: false,
+        });
+
+        let screen = render(&mut app, 100, 20);
+        assert!(screen.contains("1 found"), "{screen}");
     }
 
     #[test]
@@ -913,7 +966,9 @@ mod tests {
         let mut app = app();
         app.overlay = Overlay::Help;
 
-        let screen = render(&mut app, 100, 40);
+        // Tall enough for every key: the help is past thirty lines now, and the point
+        // here is what the overlay does when it *does* fit, not how tall it happens to be.
+        let screen = render(&mut app, 100, 46);
         assert!(!screen.contains("to scroll"), "{screen}");
         assert!(screen.contains("Ctrl-C"), "{screen}");
     }
@@ -958,7 +1013,7 @@ mod tests {
         // Not useful at this size, but it must not panic: a user will resize a terminal
         // to something absurd sooner or later.
         let mut app = app();
-        app.on_event(Event::Groups(vec![group_row("misc.test", 1, 3)]));
+        app.on_event(groups_arrived(vec![group_row("misc.test", 1, 3)]));
         app.overlay = Overlay::Help;
 
         for (width, height) in [(1, 1), (2, 3), (10, 4), (20, 2), (5, 20)] {

@@ -74,7 +74,19 @@ nntp-tui overview comp.lang.rust -n 20
 nntp-tui article '<abc123@example.org>'
 ```
 
-The [user guide](docs/user-guide.md) covers configuration, key bindings and logging.
+On a full-feed server the group list is megabytes, so say which groups you actually read
+and the server sends only those:
+
+```toml
+[servers.eternal-september]
+host = "news.eternal-september.org"
+subscriptions = ["comp.lang.*", "misc.test"]
+```
+
+`S` in the reader searches past them when you want something else.
+
+The [user guide](docs/user-guide.md) covers configuration, subscriptions, key bindings and
+logging.
 
 ## Workspace layout
 
