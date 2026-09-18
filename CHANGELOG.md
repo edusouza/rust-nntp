@@ -59,6 +59,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`nntp-testserver` no longer drops a connection a person is using.** Its sockets had a
+  thirty-second timeout, which keeps an abandoned connection from holding the test suite's
+  shutdown and is far too short for somebody reading an article: against the standalone
+  binary the connection died between one keystroke and the next, and the reader reported
+  whatever the platform calls an aborted socket — on Windows, a sentence about software on
+  the host computer aborting an established connection.
+
+  The timeout is now configurable, still thirty seconds for tests, and half an hour in the
+  standalone binary, where a person is at the other end. A server that does give up now
+  sends `400` before closing, so the client can say what happened instead of relaying an
+  operating-system message.
+
 - **`--host` no longer carries another server's credentials.** With an account configured,
   `nntp-tui --host 127.0.0.1 --no-tls` used that account's username and password against
   `127.0.0.1` — the configured server was picked up implicitly and only the host was

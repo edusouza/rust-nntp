@@ -633,3 +633,62 @@ fn a_non_ascii_article_arrives_as_encoded_words_and_utf8() {
     );
     assert_eq!(posted[0].body_text(), "Está tudo bem?");
 }
+
+#[test]
+fn the_connection_is_still_usable_after_a_successful_posting() {
+    // The gap the refusal test left: 441 keeps the connection, but nothing checked that
+    // 240 does. Reported from a real session — the article was accepted and the very next
+    // command died with "connection aborted by the software in your host machine".
+    let server = TestServer::start().unwrap();
+    let mut client = connect(&server);
+
+    client.post(&draft("Body.")).unwrap();
+
+    let group = client
+        .select_group(&GroupName::parse("misc.test").unwrap())
+        .expect("the connection should still work after posting");
+    assert_eq!(group.name.as_str(), "misc.test");
+
+    let records = client.overview(Range::between(1, 3)).expect("overview");
+    assert!(!records.entries.is_empty());
+}
+
+#[test]
+fn an_idle_connection_survives_a_pause_and_is_told_when_it_does_not() {
+    // Reported from a real session against the standalone server: an article was posted,
+    // the reader sat while its user read the screen, and the next command died with
+    // "connection aborted by the software in your host machine". The fake server's socket
+    // timeout is thirty seconds, which is fine for a test and far too short for a person.
+    //
+    // Both halves are asserted here: a pause well inside the limit changes nothing, and a
+    // server that does give up says so first, rather than leaving the client to report
+    // whatever its platform calls a dead socket.
+    let server = TestServer::with(
+        Corpus::sample(),
+        ServerConfig::new().idle_timeout(Duration::from_millis(400)),
+    )
+    .unwrap();
+    let mut client = connect(&server);
+
+    std::thread::sleep(Duration::from_millis(100));
+    client
+        .select_group(&GroupName::parse("misc.test").unwrap())
+        .expect("a short pause is not a disconnection");
+
+    // Now outstay it. The server announces the close instead of vanishing.
+    std::thread::sleep(Duration::from_millis(700));
+    let error = client
+        .select_group(&GroupName::parse("misc.test").unwrap())
+        .unwrap_err();
+
+    match &error {
+        ClientError::Server { code, text, .. } => {
+            assert_eq!(code.as_u16(), 400);
+            assert!(text.contains("idle"), "{text}");
+        }
+        // A connection the operating system has already torn down is the other honest
+        // outcome; what must not happen is a wrong answer.
+        ClientError::ConnectionClosed(_) | ClientError::Io(_) => {}
+        other => panic!("unexpected error: {other:?}"),
+    }
+}

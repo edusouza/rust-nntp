@@ -1,5 +1,6 @@
 //! The listener: accepts connections and runs a [`Session`] on each.
 
+use std::io::Write as _;
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -300,9 +301,12 @@ fn serve(mut stream: TcpStream, shared: &Arc<Shared>) {
         return;
     }
 
-    // A test that hangs is worse than a test that fails.
-    let _ = stream.set_read_timeout(Some(Duration::from_secs(30)));
-    let _ = stream.set_write_timeout(Some(Duration::from_secs(30)));
+    // A test that hangs is worse than a test that fails — the accept loop joins its
+    // session threads, so an abandoned connection holds shutdown for this long. The
+    // default is short for that reason and generous when a person is at the other end.
+    let idle = shared.config.idle_timeout;
+    let _ = stream.set_read_timeout(Some(idle));
+    let _ = stream.set_write_timeout(Some(idle));
     let _ = stream.set_nodelay(true);
 
     let mut session = Session::new(&shared.corpus, &shared.config);
@@ -332,10 +336,30 @@ fn serve(mut stream: TcpStream, shared: &Arc<Shared>) {
         Ok(Outcome::Closed) => {}
         Ok(Outcome::UpgradeToTls) => upgrade(stream, &mut session, shared),
         Err(error) => {
+            if is_idle_timeout(&error) {
+                // Say so before going. RFC 3977 §3.1 lets a server announce that it is
+                // closing, and without it the client is left holding a socket that dies
+                // with whatever its platform calls an aborted connection — "Uma conexão
+                // estabelecida foi anulada pelo software no computador host" on Windows,
+                // which tells a reader nothing about what happened.
+                let _ = stream.write_all(b"400 idle too long, closing connection\r\n");
+                let _ = stream.flush();
+            }
             // A client that disconnects abruptly is normal in tests, not a failure.
             tracing::debug!(%error, "test server session ended");
         }
     }
+}
+
+/// Whether a session ended because nothing arrived for as long as the socket allows.
+///
+/// The two kinds are one condition: a read timeout surfaces as `WouldBlock` on Unix and as
+/// `TimedOut` on Windows.
+fn is_idle_timeout(error: &std::io::Error) -> bool {
+    matches!(
+        error.kind(),
+        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+    )
 }
 
 /// Completes a `STARTTLS` upgrade and resumes the session over the encrypted stream.
