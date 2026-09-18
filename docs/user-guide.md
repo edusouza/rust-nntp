@@ -278,6 +278,22 @@ Two things worth knowing, because they are visible:
 `Esc` keeps its other meanings when nothing is outstanding, and always belongs to the
 filter while you are typing one.
 
+### Watching a big group load
+
+Opening a group fetches its newest articles in chunks, and **each chunk appears as it
+arrives** rather than the pane staying empty until the whole range is in. The newest chunk
+is fetched first, so the articles you came for are the ones that show up first; the status
+bar counts them as they land (`comp.lang.c: 1500 articles listed…`) and says how many are
+unread when the fetch finishes.
+
+- `overview_chunk` under `[ui]` sets the chunk size — smaller means more round trips and a
+  list that grows in smaller steps.
+- **Your place is kept.** A cursor on the newest article follows the newest as records
+  arrive; a cursor you have moved stays on the article it is on, even though older records
+  landing in front of it change its position in the list.
+- `Esc` still stops the fetch (above). What has already arrived stays listed — it is real
+  data, and throwing it away would be its own surprise.
+
 ### Read and unread
 
 What you have read is remembered between runs, in the `.newsrc` format every newsreader
@@ -313,6 +329,7 @@ Two instances of the reader against the same server will have the last one to ex
 
 ### What it does not do yet
 
-Posting, threading, MIME multipart and a disk cache are all v0.2 or later; see the
+Posting, threading and a disk cache are all v0.2 or later; see the
 [roadmap](https://github.com/edusouza/rust-nntp/issues/3). There is no subscription list
-yet, so the group list shows everything the server carries.
+yet, so the group list shows everything the server carries, and it is re-fetched on every
+start.

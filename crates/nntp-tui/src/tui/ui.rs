@@ -534,6 +534,28 @@ mod tests {
             .unwrap()
     }
 
+    /// Delivers a whole overview fetch the way the worker does: one chunk, then the
+    /// completion.
+    ///
+    /// Most tests care that the records end up listed, not about how many pieces they
+    /// arrived in; the tests that care about the pieces build the events themselves.
+    fn deliver_overview(
+        app: &mut App,
+        group: &str,
+        records: Vec<nntp_proto::OverviewRecord>,
+        skipped: usize,
+    ) {
+        let group = nntp_proto::GroupName::parse(group).unwrap();
+        let token = app.begin_overview_fetch();
+        app.on_event(Event::OverviewChunk {
+            group: group.clone(),
+            token,
+            records,
+            skipped,
+        });
+        app.on_event(Event::OverviewComplete { group, token });
+    }
+
     fn group_row(name: &str, low: u64, high: u64) -> GroupRow {
         GroupRow {
             name: nntp_proto::GroupName::parse(name).unwrap(),
@@ -622,15 +644,16 @@ mod tests {
             3,
         ))));
         app.read.mark_read("misc.test", 2);
-        app.on_event(Event::Overview {
-            group: nntp_proto::GroupName::parse("misc.test").unwrap(),
-            records: vec![
+        deliver_overview(
+            &mut app,
+            "misc.test",
+            vec![
                 overview_record(1, "unread one"),
                 overview_record(2, "already read"),
                 overview_record(3, "unread two"),
             ],
-            skipped: 0,
-        });
+            0,
+        );
 
         let screen = render(&mut app, 100, 20);
         assert!(screen.contains("•  unread one"), "{screen}");
@@ -648,11 +671,12 @@ mod tests {
             1,
             2,
         ))));
-        app.on_event(Event::Overview {
-            group: nntp_proto::GroupName::parse("misc.test").unwrap(),
-            records: vec![overview_record(1, "one"), overview_record(2, "two")],
-            skipped: 0,
-        });
+        deliver_overview(
+            &mut app,
+            "misc.test",
+            vec![overview_record(1, "one"), overview_record(2, "two")],
+            0,
+        );
         app.read.mark_range_read("misc.test", 1, 2);
         app.unread_only = true;
 

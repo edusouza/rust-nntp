@@ -9,6 +9,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Overview records appear as they arrive** ([#8]). Opening a group used to fetch the
+  whole range before showing anything: the status bar moved, the article pane stayed
+  empty, and on a group with a hundred thousand articles it stayed empty for a long time.
+  The interface was never blocked, but to a reader "not blocked" and "nothing on screen"
+  look the same.
+
+  Each chunk is now sent as it is read and merged into the list on display, **newest chunk
+  first** — fetching forwards would fill the pane with the oldest end of the range and
+  leave what the reader came for until last.
+
+  The cursor is the delicate part of arriving records. A cursor sitting on the newest
+  article follows the newest; a cursor the user has moved stays on the article it is on,
+  even though records landing in front of it change its index. Anything else moves
+  somebody's place while they are reading.
+
+  Telling one fetch from another needs more than the group name, because refreshing a
+  group while its previous fetch is still arriving produces two fetches of the same name.
+  Each one now carries a `FetchToken` minted by the interface and echoed by the worker,
+  and records from a superseded fetch are dropped rather than merged into the current
+  list — the same guarantee as the existing "late reply for another group" rule, extended
+  to the case the group name cannot see.
+
 - **MIME multipart bodies and `format=flowed`** ([#12]). The reader used to show the raw
   body: boundary lines, part headers, base64 and the HTML copy of a message that had also
   arrived as plain text. Now the body is a part tree, and the reader shows the part a
@@ -346,7 +368,7 @@ records what was checked, against which server, on what date ([#4]).
 [#3]: https://github.com/edusouza/rust-nntp/issues/3
 [#4]: https://github.com/edusouza/rust-nntp/issues/4
 [#7]: https://github.com/edusouza/rust-nntp/issues/7
-[#9]: https://github.com/edusouza/rust-nntp/issues/9
+[#8]: https://github.com/edusouza/rust-nntp/issues/8
 [#9]: https://github.com/edusouza/rust-nntp/issues/9
 [#12]: https://github.com/edusouza/rust-nntp/issues/12
 [#17]: https://github.com/edusouza/rust-nntp/issues/17

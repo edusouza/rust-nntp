@@ -14,7 +14,7 @@ use nntp_client::Cancel;
 
 use crate::config::UiConfig;
 use crate::readstate::ReadStore;
-use crate::tui::protocol::{Event, GroupRow, Request};
+use crate::tui::protocol::{Event, FetchToken, GroupRow, Request};
 
 /// How many messages to keep for the message pane.
 const LOG_CAPACITY: usize = 200;
@@ -186,6 +186,22 @@ pub struct App {
     /// Whether the article list hides articles that have been read.
     pub unread_only: bool,
 
+    /// The overview fetch whose records the article list is showing.
+    ///
+    /// Records arrive in chunks, so the list is assembled over time and something has to
+    /// say which fetch is being assembled. `None` means no fetch is outstanding and any
+    /// chunk that turns up belongs to one that has been superseded.
+    overview_token: Option<FetchToken>,
+    /// Mints the next token. Monotonic, never reused within a run.
+    next_token: u64,
+    /// Chunks accepted for [`Self::overview_token`] so far.
+    overview_chunks: usize,
+    /// Unparsable overview lines seen so far for [`Self::overview_token`].
+    ///
+    /// Accumulated rather than reported per chunk: a malformed group would otherwise
+    /// produce one message per chunk, and the interesting number is the total.
+    overview_skipped: usize,
+
     /// Which articles have been read, per group.
     ///
     /// The state machine owns it and mutates it; loading and saving belong to the run
@@ -256,6 +272,10 @@ impl App {
             articles: Vec::new(),
             article_cursor: 0,
             unread_only: config.unread_only,
+            overview_token: None,
+            next_token: 0,
+            overview_chunks: 0,
+            overview_skipped: 0,
             read,
             article: None,
             body_scroll: 0,
@@ -438,31 +458,52 @@ impl App {
                 self.group = Some(*summary);
             }
 
-            Event::Overview {
+            Event::OverviewChunk {
                 group,
+                token,
                 records,
                 skipped,
             } => {
+                // A chunk of a superseded fetch is dropped without a word: the fetch that
+                // replaced it says so once, when its own completion arrives, and one note
+                // per chunk would bury everything else in the message pane.
+                if !self.accepts_overview(&group, token) {
+                    return;
+                }
+
+                self.overview_skipped += skipped;
+                self.absorb_overview(records);
+
+                // Only when the first records land, so that a user who has gone back to
+                // the group list mid-fetch is not dragged into the article pane by each
+                // chunk that arrives.
+                if self.overview_chunks == 0 {
+                    self.focus = Pane::Articles;
+                }
+                self.overview_chunks += 1;
+
+                self.status = format!("{group}: {} articles listed…", self.articles.len());
+            }
+
+            Event::OverviewComplete { group, token } => {
+                // The request was counted when it was issued, so its completion brings the
+                // count down whether or not anything is still interested in the records.
                 self.inflight = self.inflight.saturating_sub(1);
 
-                // A reply for a group the user has navigated away from must not be shown
-                // under the current group's heading.
-                let current = self.group.as_ref().map(|summary| &summary.name);
-                if current != Some(&group) {
+                if !self.accepts_overview(&group, token) {
                     self.note(format!("discarded a late overview reply for {group}"));
                     return;
                 }
 
-                if skipped > 0 {
+                if self.overview_skipped > 0 {
                     self.note(format!(
-                        "{group}: {skipped} overview line(s) could not be parsed"
+                        "{group}: {} overview line(s) could not be parsed",
+                        self.overview_skipped
                     ));
                 }
 
-                self.articles = records;
-                // Newest last, and the newest is what a reader wants to see first.
-                self.article_cursor = self.visible_articles().len().saturating_sub(1);
                 self.focus = Pane::Articles;
+                self.overview_token = None;
 
                 let unread = self
                     .articles
@@ -735,10 +776,12 @@ impl App {
                 self.article_cursor = 0;
                 self.status = format!("opening {}…", group.name);
                 self.inflight += 1;
+                let token = self.begin_overview_fetch();
 
                 vec![Request::OpenGroup {
                     group: group.name,
                     count: self.initial_articles,
+                    token,
                 }]
             }
 
@@ -826,6 +869,95 @@ impl App {
         self.clamp_article_cursor();
     }
 
+    /// Starts a new overview fetch and returns the token that identifies it.
+    ///
+    /// Everything the previous fetch was accumulating is dropped here rather than when
+    /// its last chunk arrives, because the user has already moved on and its remaining
+    /// chunks are on their way.
+    ///
+    /// Public because anything that builds a [`Request::OpenGroup`] or
+    /// [`Request::LoadOverview`] has to take the token from here. Records carrying a token
+    /// this has not issued are treated as belonging to a superseded fetch and dropped,
+    /// which is the whole point — but it does mean a request minted without one goes
+    /// nowhere visible.
+    pub fn begin_overview_fetch(&mut self) -> FetchToken {
+        self.next_token += 1;
+        let token = FetchToken::new(self.next_token);
+        self.overview_token = Some(token);
+        self.overview_chunks = 0;
+        self.overview_skipped = 0;
+        token
+    }
+
+    /// Whether records from this fetch are still wanted.
+    ///
+    /// Two conditions, and both matter. The token catches a superseded fetch of the group
+    /// that is still on screen — a refresh while the previous one is arriving — which the
+    /// group name cannot see. The group name catches records for a group the user has
+    /// left, which is the older guarantee and stays true even if a token were ever reused.
+    fn accepts_overview(&self, group: &nntp_proto::GroupName, token: FetchToken) -> bool {
+        self.overview_token == Some(token)
+            && self.group.as_ref().map(|summary| &summary.name) == Some(group)
+    }
+
+    /// Merges a chunk of overview records into the list on display.
+    ///
+    /// The cursor is the delicate part. A cursor sitting on the newest article follows the
+    /// newest, because that is where a reader who has not moved expects to stay; a cursor
+    /// the user has moved stays on the article it is on, even though arriving records
+    /// change its index. Anything else would move somebody's place while they are reading.
+    fn absorb_overview(&mut self, mut records: Vec<OverviewRecord>) {
+        if records.is_empty() {
+            return;
+        }
+
+        let visible = self.visible_articles();
+        // An empty list counts as pinned: the first chunk should land on its newest
+        // article rather than on its oldest.
+        let pinned_to_newest = self.article_cursor + 1 >= visible.len();
+        let anchor = self.selected_article().map(|record| record.number);
+
+        match (self.articles.first(), records.last()) {
+            (None, _) => self.articles = records,
+
+            // The common case. Chunks arrive newest first, so each one is entirely older
+            // than everything already held and goes straight on the front — no sort, no
+            // comparison per record.
+            (Some(oldest_held), Some(newest_arriving))
+                if newest_arriving.number < oldest_held.number =>
+            {
+                records.append(&mut self.articles);
+                self.articles = records;
+            }
+
+            // Overlapping or out of order: a refresh across a range already on screen.
+            // The arriving copy wins, since it is the more recent view of the same
+            // article — `sort_by_key` is stable and the arriving records are placed
+            // first, so `dedup_by_key`, which keeps the first of each run, keeps them.
+            _ => {
+                records.append(&mut self.articles);
+                records.sort_by_key(|record| record.number);
+                records.dedup_by_key(|record| record.number);
+                self.articles = records;
+            }
+        }
+
+        let visible = self.visible_articles();
+        self.article_cursor = if pinned_to_newest {
+            visible.len().saturating_sub(1)
+        } else {
+            anchor
+                .and_then(|number| {
+                    visible.iter().position(|index| {
+                        self.articles
+                            .get(*index)
+                            .is_some_and(|record| record.number == number)
+                    })
+                })
+                .unwrap_or_else(|| self.article_cursor.min(visible.len().saturating_sub(1)))
+        };
+    }
+
     /// Brings the article cursor back inside the visible list.
     fn clamp_article_cursor(&mut self) {
         let count = self.visible_articles().len();
@@ -889,12 +1021,15 @@ impl App {
                 let first = high
                     .saturating_sub(self.initial_articles.saturating_sub(1))
                     .max(low);
-                self.status = format!("reloading {}…", summary.name);
+                let group = summary.name.clone();
+                self.status = format!("reloading {group}…");
                 self.inflight += 1;
+                let token = self.begin_overview_fetch();
 
                 vec![Request::LoadOverview {
-                    group: summary.name.clone(),
+                    group,
                     range: Range::between(first, high),
+                    token,
                 }]
             }
         }
@@ -960,6 +1095,8 @@ fn shift(current: usize, delta: isize, count: usize) -> usize {
 mod tests {
     use nntp_proto::{GroupName, OverviewFmt, PostingStatus, StatusLine};
 
+    use crate::tui::protocol::FetchToken;
+
     use super::*;
 
     /// A read-state store that is never saved: these tests exercise the state machine,
@@ -1010,20 +1147,38 @@ mod tests {
         OverviewRecord::parse(line.as_bytes(), &OverviewFmt::standard()).unwrap()
     }
 
+    /// Delivers a whole overview fetch the way the worker does: one chunk, then the
+    /// completion.
+    ///
+    /// Most tests care that the records end up listed, not about how many pieces they
+    /// arrived in; the tests that care about the pieces build the events themselves.
+    fn deliver_overview(app: &mut App, group: &str, records: Vec<OverviewRecord>, skipped: usize) {
+        let group = nntp_proto::GroupName::parse(group).unwrap();
+        let token = app.begin_overview_fetch();
+        app.on_event(Event::OverviewChunk {
+            group: group.clone(),
+            token,
+            records,
+            skipped,
+        });
+        app.on_event(Event::OverviewComplete { group, token });
+    }
+
     /// Drives an app through to a group with articles listed.
     fn app_with_articles() -> App {
         let mut app = app();
         app.on_event(Event::Groups(some_groups()));
         app.on_event(Event::GroupOpened(Box::new(summary("misc.test", 1, 3, 3))));
-        app.on_event(Event::Overview {
-            group: GroupName::parse("misc.test").unwrap(),
-            records: vec![
+        deliver_overview(
+            &mut app,
+            "misc.test",
+            vec![
                 record(1, "oldest"),
                 record(2, "middle"),
                 record(3, "newest"),
             ],
-            skipped: 0,
-        });
+            0,
+        );
         app
     }
 
@@ -1163,11 +1318,12 @@ mod tests {
             1_000,
             101,
         ))));
-        app.on_event(Event::Overview {
-            group: GroupName::parse("misc.test").unwrap(),
-            records: vec![record(999, "one"), record(1_000, "two")],
-            skipped: 0,
-        });
+        deliver_overview(
+            &mut app,
+            "misc.test",
+            vec![record(999, "one"), record(1_000, "two")],
+            0,
+        );
 
         app.on_key(key(KeyCode::Char('c')));
 
@@ -1508,11 +1664,12 @@ mod tests {
         app.on_key(key(KeyCode::Char('/')));
 
         app.on_event(Event::GroupOpened(Box::new(summary("misc.test", 1, 3, 3))));
-        app.on_event(Event::Overview {
-            group: GroupName::parse("misc.test").unwrap(),
-            records: vec![record(1, "one"), record(2, "two")],
-            skipped: 0,
-        });
+        deliver_overview(
+            &mut app,
+            "misc.test",
+            vec![record(1, "one"), record(2, "two")],
+            0,
+        );
         assert_eq!(app.focus, Pane::Articles, "the reply moved the focus");
 
         app.on_key(key(KeyCode::Down));
@@ -1594,6 +1751,8 @@ mod tests {
             vec![Request::OpenGroup {
                 group: GroupName::parse("comp.lang.rust").unwrap(),
                 count: UiConfig::default().initial_articles,
+                // The first fetch of the run.
+                token: FetchToken::new(1),
             }]
         );
         assert_eq!(app.inflight, 1);
@@ -1629,11 +1788,12 @@ mod tests {
     fn a_late_overview_reply_for_another_group_is_discarded() {
         // Otherwise the article list shows one group's articles under another's heading.
         let mut app = app_with_articles();
-        app.on_event(Event::Overview {
-            group: GroupName::parse("comp.lang.rust").unwrap(),
-            records: vec![record(99, "from the wrong group")],
-            skipped: 0,
-        });
+        deliver_overview(
+            &mut app,
+            "comp.lang.rust",
+            vec![record(99, "from the wrong group")],
+            0,
+        );
 
         assert_eq!(app.articles.len(), 3);
         assert!(
@@ -1644,14 +1804,227 @@ mod tests {
     }
 
     #[test]
+    fn records_are_listed_as_each_chunk_arrives() {
+        // The point of #8: the pane fills while the rest is still on the wire, rather
+        // than staying empty until the whole range has been fetched.
+        let mut app = app();
+        app.on_event(Event::GroupOpened(Box::new(summary("misc.test", 1, 4, 4))));
+        let group = GroupName::parse("misc.test").unwrap();
+        let token = app.begin_overview_fetch();
+
+        app.on_event(Event::OverviewChunk {
+            group: group.clone(),
+            token,
+            records: vec![record(3, "newest"), record(4, "newer still")],
+            skipped: 0,
+        });
+
+        assert_eq!(app.articles.len(), 2, "listed before the fetch finished");
+        assert_eq!(app.focus, Pane::Articles);
+        assert_eq!(app.inflight, 0, "the completion is what ends the request");
+
+        app.on_event(Event::OverviewChunk {
+            group: group.clone(),
+            token,
+            records: vec![record(1, "oldest"), record(2, "older")],
+            skipped: 0,
+        });
+        app.on_event(Event::OverviewComplete { group, token });
+
+        // Chunks arrive newest first and are merged back into article-number order.
+        assert_eq!(
+            app.articles.iter().map(|r| r.number).collect::<Vec<_>>(),
+            vec![1, 2, 3, 4]
+        );
+    }
+
+    #[test]
+    fn a_cursor_on_the_newest_article_follows_the_newest() {
+        let mut app = app();
+        app.on_event(Event::GroupOpened(Box::new(summary("misc.test", 1, 4, 4))));
+        let group = GroupName::parse("misc.test").unwrap();
+        let token = app.begin_overview_fetch();
+
+        app.on_event(Event::OverviewChunk {
+            group: group.clone(),
+            token,
+            records: vec![record(3, "newest"), record(4, "newer still")],
+            skipped: 0,
+        });
+        assert_eq!(app.selected_article().map(|r| r.number), Some(4));
+
+        // Older records land in front of it. The cursor's index changes; the article it
+        // is on must not.
+        app.on_event(Event::OverviewChunk {
+            group,
+            token,
+            records: vec![record(1, "oldest"), record(2, "older")],
+            skipped: 0,
+        });
+
+        assert_eq!(app.article_cursor, 3);
+        assert_eq!(app.selected_article().map(|r| r.number), Some(4));
+    }
+
+    #[test]
+    fn a_cursor_the_user_moved_stays_on_its_article() {
+        // Records arriving underneath a reader must not move their place.
+        let mut app = app();
+        app.on_event(Event::GroupOpened(Box::new(summary("misc.test", 1, 4, 4))));
+        let group = GroupName::parse("misc.test").unwrap();
+        let token = app.begin_overview_fetch();
+
+        app.on_event(Event::OverviewChunk {
+            group: group.clone(),
+            token,
+            records: vec![record(3, "newest"), record(4, "newer still")],
+            skipped: 0,
+        });
+
+        app.focus = Pane::Articles;
+        app.on_key(key(KeyCode::Up));
+        assert_eq!(app.selected_article().map(|r| r.number), Some(3));
+
+        app.on_event(Event::OverviewChunk {
+            group,
+            token,
+            records: vec![record(1, "oldest"), record(2, "older")],
+            skipped: 0,
+        });
+
+        assert_eq!(
+            app.selected_article().map(|r| r.number),
+            Some(3),
+            "the cursor stayed on article 3 at its new index"
+        );
+        assert_eq!(app.article_cursor, 2);
+    }
+
+    #[test]
+    fn a_chunk_of_a_superseded_fetch_of_the_same_group_is_dropped() {
+        // The group name cannot catch this one: both fetches are for the group on screen.
+        // Without the token, a refresh started mid-fetch would have the abandoned fetch's
+        // records merged into the new one's list.
+        let mut app = app();
+        app.on_event(Event::GroupOpened(Box::new(summary("misc.test", 1, 4, 4))));
+        let group = GroupName::parse("misc.test").unwrap();
+
+        let abandoned = app.begin_overview_fetch();
+        let current = app.begin_overview_fetch();
+        assert_ne!(abandoned, current);
+
+        app.on_event(Event::OverviewChunk {
+            group: group.clone(),
+            token: abandoned,
+            records: vec![record(1, "from the abandoned fetch")],
+            skipped: 0,
+        });
+        assert!(app.articles.is_empty(), "{:?}", app.status);
+
+        app.on_event(Event::OverviewChunk {
+            group,
+            token: current,
+            records: vec![record(2, "from the current fetch")],
+            skipped: 0,
+        });
+        assert_eq!(
+            app.articles.iter().map(|r| r.number).collect::<Vec<_>>(),
+            vec![2]
+        );
+    }
+
+    #[test]
+    fn a_record_that_arrives_twice_is_listed_once() {
+        // A refresh re-fetches a range already on screen. Two copies of one article in
+        // the list would be a visible bug, and the newer copy is the truer one.
+        let mut app = app_with_articles();
+        let group = GroupName::parse("misc.test").unwrap();
+        let token = app.begin_overview_fetch();
+
+        app.on_event(Event::OverviewChunk {
+            group: group.clone(),
+            token,
+            records: vec![record(2, "edited subject"), record(4, "brand new")],
+            skipped: 0,
+        });
+        app.on_event(Event::OverviewComplete { group, token });
+
+        assert_eq!(
+            app.articles.iter().map(|r| r.number).collect::<Vec<_>>(),
+            vec![1, 2, 3, 4]
+        );
+        assert_eq!(
+            app.articles
+                .iter()
+                .find(|r| r.number == 2)
+                .map(|r| r.subject.as_str()),
+            Some("edited subject"),
+            "the copy that just arrived wins"
+        );
+    }
+
+    #[test]
+    fn an_empty_group_finishes_with_an_empty_list() {
+        // "Nothing here" and "not arrived yet" have to look different, so the completion
+        // is sent even when no chunk carried anything.
+        let mut app = app_with_articles();
+        app.on_event(Event::GroupOpened(Box::new(summary(
+            "comp.lang.rust",
+            1,
+            0,
+            0,
+        ))));
+        let group = GroupName::parse("comp.lang.rust").unwrap();
+        let token = app.begin_overview_fetch();
+        app.articles.clear();
+
+        app.on_event(Event::OverviewComplete { group, token });
+
+        assert!(app.articles.is_empty());
+        assert!(app.status.contains("0 articles listed"), "{}", app.status);
+    }
+
+    #[test]
+    fn unparseable_lines_are_counted_across_chunks_and_reported_once() {
+        // One message per chunk would bury everything else in the message pane on a
+        // group the server serves badly.
+        let mut app = app();
+        app.on_event(Event::GroupOpened(Box::new(summary("misc.test", 1, 4, 4))));
+        let group = GroupName::parse("misc.test").unwrap();
+        let token = app.begin_overview_fetch();
+
+        for number in [3, 1] {
+            app.on_event(Event::OverviewChunk {
+                group: group.clone(),
+                token,
+                records: vec![record(number, "fine")],
+                skipped: 2,
+            });
+        }
+        assert!(
+            !app.messages
+                .iter()
+                .any(|m| m.contains("could not be parsed")),
+            "not reported per chunk: {:?}",
+            app.messages
+        );
+
+        app.on_event(Event::OverviewComplete { group, token });
+
+        let reported = app
+            .messages
+            .iter()
+            .filter(|m| m.contains("could not be parsed"))
+            .collect::<Vec<_>>();
+        assert_eq!(reported.len(), 1, "{:?}", app.messages);
+        assert!(reported[0].contains('4'), "{:?}", reported);
+    }
+
+    #[test]
     fn unparseable_overview_lines_are_reported_not_hidden() {
         let mut app = app();
         app.on_event(Event::GroupOpened(Box::new(summary("misc.test", 1, 3, 3))));
-        app.on_event(Event::Overview {
-            group: GroupName::parse("misc.test").unwrap(),
-            records: vec![record(1, "fine")],
-            skipped: 2,
-        });
+        deliver_overview(&mut app, "misc.test", vec![record(1, "fine")], 2);
 
         assert!(
             app.messages
@@ -1799,6 +2172,8 @@ mod tests {
             vec![Request::LoadOverview {
                 group: GroupName::parse("misc.test").unwrap(),
                 range: Range::between(1, 3),
+                // `app_with_articles` already delivered one fetch, so this is the second.
+                token: FetchToken::new(2),
             }]
         );
     }

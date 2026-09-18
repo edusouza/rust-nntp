@@ -45,6 +45,19 @@ impl Harness {
     }
 
     fn with_read_state(server: TestServer, read: ReadStore) -> Self {
+        Self::build(server, read, 500)
+    }
+
+    /// A harness whose worker splits overview fetches into `chunk`-sized pieces.
+    ///
+    /// The corpus is small, so the only way to see a fetch arrive in more than one piece
+    /// is to make the pieces small. The chunk size is a configuration key precisely
+    /// because what is sensible depends on the server.
+    fn with_chunk(server: TestServer, chunk: u64) -> Self {
+        Self::build(server, ReadStore::empty(PathBuf::from("unused")), chunk)
+    }
+
+    fn build(server: TestServer, read: ReadStore, chunk: u64) -> Self {
         let target = target_for(&server);
         let (request_tx, request_rx) = mpsc::channel();
         let (event_tx, event_rx) = mpsc::channel();
@@ -53,7 +66,7 @@ impl Harness {
 
         // The harness shares the app's cancel flag with the worker, exactly as the run
         // loop does, so a test can cancel the way a keystroke would.
-        worker::spawn(target, 500, request_rx, event_tx, app.cancel.clone())
+        worker::spawn(target, chunk, request_rx, event_tx, app.cancel.clone())
             .expect("spawn the worker");
 
         let initial = app.initial_requests();
@@ -151,6 +164,73 @@ fn loads_the_group_list_on_start_up() {
     );
     // Sparse numbering: the watermarks span six numbers for two articles.
     assert_eq!(rust.article_bound(), 6);
+}
+
+#[test]
+fn overview_records_arrive_in_pieces_newest_first() {
+    // #8. Two claims, and both are what a user actually sees: the article list fills
+    // while the fetch is still running, and the first thing to fill it is the newest end
+    // of the range — the part a reader came for.
+    let mut harness = Harness::with_chunk(serve(ServerConfig::new()), 1);
+    harness.settle("the group list", |app| !app.groups.is_empty());
+
+    harness.press(KeyCode::Char('/'));
+    harness.type_text("misc.test");
+    harness.press(KeyCode::Enter);
+    harness.press(KeyCode::Enter);
+
+    let mut chunks = 0usize;
+    let mut first_chunk = Vec::new();
+    let mut listed_before_the_end = 0usize;
+    let deadline = Instant::now() + TIMEOUT;
+
+    loop {
+        assert!(
+            Instant::now() < deadline,
+            "timed out after {chunks} chunk(s): {}",
+            harness.app.status
+        );
+
+        match harness.events.recv_timeout(Duration::from_millis(100)) {
+            Ok(event) => {
+                let finished = matches!(event, Event::OverviewComplete { .. });
+                if let Event::OverviewChunk { ref records, .. } = event {
+                    chunks += 1;
+                    if chunks == 1 {
+                        first_chunk = records.iter().map(|record| record.number).collect();
+                    }
+                }
+
+                harness.app.on_event(event);
+
+                if finished {
+                    break;
+                }
+                listed_before_the_end = listed_before_the_end.max(harness.app.articles.len());
+            }
+            Err(RecvTimeoutError::Timeout) => harness.app.tick(),
+            Err(RecvTimeoutError::Disconnected) => panic!("the worker stopped"),
+        }
+    }
+
+    assert!(chunks >= 2, "the fetch was not split: {chunks} chunk(s)");
+    assert_eq!(first_chunk, vec![3], "the newest chunk arrives first");
+    assert!(
+        listed_before_the_end > 0,
+        "nothing was listed until the fetch finished, which is the bug #8 is about"
+    );
+    assert_eq!(
+        harness
+            .app
+            .articles
+            .iter()
+            .map(|record| record.number)
+            .collect::<Vec<_>>(),
+        vec![1, 2, 3],
+        "and the assembled list is in article-number order"
+    );
+    assert_eq!(harness.app.selected_article().map(|r| r.number), Some(3));
+    assert_eq!(harness.app.inflight, 0);
 }
 
 #[test]

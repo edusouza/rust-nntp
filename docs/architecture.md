@@ -85,8 +85,15 @@ worker event arriving while the user is idle is picked up promptly. Events are d
 burst before drawing, so a flurry of them costs one redraw rather than one each.
 
 The worker reconnects on demand: a dropped connection leaves the interface usable and the
-next request re-establishes it. What it cannot yet do is abandon a request already in
-flight — see the cancellation issue.
+next request re-establishes it. A request already in flight can be abandoned: `Esc` raises
+a `Cancel` flag the worker checks between lines of a response, which is shared state rather
+than a `Request` because the channel is first-in-first-out and the worker is *inside* the
+request being cancelled.
+
+Long results are streamed rather than delivered whole. An overview fetch sends one
+`OverviewChunk` per chunk, newest chunk first, and a final `OverviewComplete`; each chunk
+carries the `FetchToken` the interface minted for that fetch, so records from a fetch the
+user has superseded are dropped instead of merged into the current list.
 
 ## Error handling
 

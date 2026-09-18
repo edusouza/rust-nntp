@@ -12,7 +12,7 @@ use nntp_client::{Cancel, Client, ClientError, Transport};
 use nntp_proto::{ActiveEntry, GroupName, Range};
 
 use crate::session::{self, Target};
-use crate::tui::protocol::{Event, GroupRow, Request};
+use crate::tui::protocol::{Event, FetchToken, GroupRow, Request};
 
 /// Starts the worker.
 ///
@@ -86,8 +86,16 @@ impl Worker {
     fn dispatch(&mut self, request: Request) {
         let outcome = match &request {
             Request::LoadGroups => self.load_groups(),
-            Request::OpenGroup { group, count } => self.open_group(group, *count),
-            Request::LoadOverview { group, range } => self.load_overview(group, *range),
+            Request::OpenGroup {
+                group,
+                count,
+                token,
+            } => self.open_group(group, *count, *token),
+            Request::LoadOverview {
+                group,
+                range,
+                token,
+            } => self.load_overview(group, *range, *token),
             Request::LoadArticle { group, spec } => self.load_article(group.as_ref(), spec.clone()),
             Request::Shutdown => Ok(()),
         };
@@ -206,27 +214,38 @@ impl Worker {
         Ok(())
     }
 
-    fn open_group(&mut self, group: &GroupName, count: u64) -> Result<(), ClientError> {
+    fn open_group(
+        &mut self,
+        group: &GroupName,
+        count: u64,
+        token: FetchToken,
+    ) -> Result<(), ClientError> {
         self.send(Event::Progress(format!("selecting {group}…")));
 
         let summary = self.client()?.select_group(group)?;
         self.send(Event::GroupOpened(Box::new(summary.clone())));
 
         let Some((low, high)) = summary.range() else {
-            // An empty group is not an error; it just has nothing to list.
-            self.send(Event::Overview {
+            // An empty group is not an error; it just has nothing to list. The completion
+            // is still sent, because the reader has to be able to tell an empty group from
+            // one whose records have not arrived yet.
+            self.send(Event::OverviewComplete {
                 group: group.clone(),
-                records: Vec::new(),
-                skipped: 0,
+                token,
             });
             return Ok(());
         };
 
         let first = high.saturating_sub(count.saturating_sub(1)).max(low);
-        self.fetch_overview(group, Range::between(first, high))
+        self.fetch_overview(group, Range::between(first, high), token)
     }
 
-    fn load_overview(&mut self, group: &GroupName, range: Range) -> Result<(), ClientError> {
+    fn load_overview(
+        &mut self,
+        group: &GroupName,
+        range: Range,
+        token: FetchToken,
+    ) -> Result<(), ClientError> {
         // The client tracks which group is selected, but the worker may have reconnected
         // since, so select it again rather than assuming.
         let selected = self
@@ -237,23 +256,32 @@ impl Worker {
             self.client()?.select_group(group)?;
         }
 
-        self.fetch_overview(group, range)
+        self.fetch_overview(group, range, token)
     }
 
-    /// Fetches a range in chunks, reporting progress, and sends one event at the end.
+    /// Fetches a range in chunks, sending each one as it arrives.
     ///
-    /// Chunking keeps any single response bounded and lets the status bar move, which
-    /// matters on a group with a hundred thousand articles. The records are sent as one
-    /// event because the interface replaces its list rather than appending to it.
-    fn fetch_overview(&mut self, group: &GroupName, range: Range) -> Result<(), ClientError> {
+    /// Chunking keeps any single response bounded; sending each chunk is what puts
+    /// articles on screen while the rest is still on the wire. On a group with a hundred
+    /// thousand articles the difference is a pane that fills in a second rather than one
+    /// that stays empty for a minute.
+    ///
+    /// **Newest chunk first.** The chunks are walked backwards because a reader wants the
+    /// newest articles, so those are the ones worth showing first; fetching forwards would
+    /// fill the pane with the oldest end of the range and leave what the user came for
+    /// until last. The interface merges each chunk into the list it already holds, which
+    /// is why arriving out of ascending order is not its problem.
+    fn fetch_overview(
+        &mut self,
+        group: &GroupName,
+        range: Range,
+        token: FetchToken,
+    ) -> Result<(), ClientError> {
         let chunks = range.chunks(self.overview_chunk);
         let total = chunks.len();
         let fmt = self.client()?.overview_format()?;
 
-        let mut records = Vec::new();
-        let mut skipped = 0usize;
-
-        for (index, chunk) in chunks.iter().enumerate() {
+        for (index, chunk) in chunks.iter().rev().enumerate() {
             if total > 1 {
                 self.send(Event::Progress(format!(
                     "{group}: fetching {} of {total}…",
@@ -262,19 +290,25 @@ impl Worker {
             }
 
             let client = self.client()?;
-            let mut chunk_skipped = 0usize;
+            let mut records = Vec::new();
+            let mut skipped = 0usize;
             client.overview_streaming(*chunk, &fmt, |record| match record {
                 Ok(record) => records.push(record),
-                Err(_) => chunk_skipped += 1,
+                Err(_) => skipped += 1,
             })?;
-            skipped += chunk_skipped;
+
+            records.sort_by_key(|record| record.number);
+            self.send(Event::OverviewChunk {
+                group: group.clone(),
+                token,
+                records,
+                skipped,
+            });
         }
 
-        records.sort_by_key(|record| record.number);
-        self.send(Event::Overview {
+        self.send(Event::OverviewComplete {
             group: group.clone(),
-            records,
-            skipped,
+            token,
         });
         Ok(())
     }
@@ -315,7 +349,7 @@ fn describe(request: &Request) -> String {
     match request {
         Request::LoadGroups => "fetching the group list".to_owned(),
         Request::OpenGroup { group, .. } => format!("opening {group}"),
-        Request::LoadOverview { group, range } => {
+        Request::LoadOverview { group, range, .. } => {
             format!("listing {group} {}", range.to_argument())
         }
         Request::LoadArticle { spec, .. } => match spec {
@@ -339,14 +373,16 @@ mod tests {
         assert_eq!(
             describe(&Request::OpenGroup {
                 group: group.clone(),
-                count: 10
+                count: 10,
+                token: FetchToken::new(1)
             }),
             "opening misc.test"
         );
         assert_eq!(
             describe(&Request::LoadOverview {
                 group: group.clone(),
-                range: Range::between(1, 5)
+                range: Range::between(1, 5),
+                token: FetchToken::new(2)
             }),
             "listing misc.test 1-5"
         );
