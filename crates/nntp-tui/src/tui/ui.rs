@@ -156,21 +156,35 @@ fn draw_articles(frame: &mut Frame<'_>, app: &App, area: Rect) {
         }
     });
 
-    let visible = app.visible_articles();
+    let rows = app.article_rows();
+    let visible: Vec<usize> = rows.iter().map(|row| row.index).collect();
 
-    let items: Vec<ListItem<'_>> = visible
+    let items: Vec<ListItem<'_>> = rows
         .iter()
-        .filter_map(|index| app.articles.get(*index))
-        .map(|record| {
+        .filter_map(|row| app.articles.get(row.index).map(|record| (row, record)))
+        .map(|(row, record)| {
             let subject = if record.subject.is_empty() {
                 "(no subject)".to_owned()
             } else {
                 record.subject.clone()
             };
-            // A reply is marked rather than indented: real threads arrive out of order
-            // and with missing parents, so an indent would be a lie until v0.2 builds
-            // the tree properly.
-            let reply = if record.is_reply() { "› " } else { "  " };
+
+            // The indent is the thread. It is capped well below the algorithm's own
+            // depth limit because this pane is a third of the screen: past a few levels
+            // the subject would be pushed off the right-hand edge, and an unreadable
+            // subject costs more than a lost level of nesting.
+            const MAX_INDENT: usize = 6;
+            let indent = "  ".repeat(row.depth.min(MAX_INDENT));
+
+            // A folded thread says how much it is hiding. Without the number a fold is
+            // indistinguishable from a thread that simply has no replies.
+            let marker = if row.collapsed {
+                format!("+{} ", row.hidden)
+            } else if row.depth > 0 {
+                "\u{203a} ".to_owned()
+            } else {
+                "  ".to_owned()
+            };
 
             // Unread is marked, read is not. The other way round would put a mark on
             // almost every line in a group you follow, which is no mark at all.
@@ -184,7 +198,8 @@ fn draw_articles(frame: &mut Frame<'_>, app: &App, area: Rect) {
 
             ListItem::new(Line::from(vec![
                 Span::from(mark).fg(ACCENT),
-                Span::from(reply).dim(),
+                Span::from(indent).dim(),
+                Span::from(marker).dim(),
                 subject,
             ]))
         })
@@ -423,7 +438,7 @@ fn draw_overlay(frame: &mut Frame<'_>, title: &str, text: Text<'static>, area: R
 }
 
 fn help_text() -> Text<'static> {
-    const ROWS: [(&str, &str); 18] = [
+    const ROWS: [(&str, &str); 20] = [
         ("Tab / Shift-Tab", "next / previous pane"),
         ("h l  ← →", "move focus left / right"),
         ("j k  ↓ ↑", "move down / up"),
@@ -433,6 +448,11 @@ fn help_text() -> Text<'static> {
         ("Enter", "open the group or article under the cursor"),
         ("n / p", "next / previous article, opening it"),
         ("u", "show only unread articles, or everything"),
+        ("t", "group the list into conversations, or show it flat"),
+        (
+            "z",
+            "fold the replies under the cursor away, or bring them back",
+        ),
         ("M", "mark the article under the cursor read / unread"),
         ("c", "catch up: mark the whole group read"),
         ("/", "filter groups by name or description"),
@@ -661,6 +681,52 @@ mod tests {
         // The read one is on screen, without a mark.
         assert!(screen.contains("already read"), "{screen}");
         assert!(!screen.contains("•  already read"), "{screen}");
+    }
+
+    #[test]
+    fn a_thread_is_drawn_indented_and_a_fold_says_what_it_hides() {
+        let mut app = app();
+        app.on_event(Event::GroupOpened(Box::new(group_summary(
+            "misc.test",
+            1,
+            3,
+        ))));
+
+        let group = nntp_proto::GroupName::parse("misc.test").unwrap();
+        let token = app.begin_overview_fetch();
+        let reply = |number: u64, subject: &str, references: &str| {
+            let line = format!("{number}\t{subject}\ta@x\t\t<{number}@x>\t{references}\t10\t1");
+            nntp_proto::OverviewRecord::parse(line.as_bytes(), &nntp_proto::OverviewFmt::standard())
+                .unwrap()
+        };
+        app.on_event(Event::OverviewChunk {
+            group: group.clone(),
+            token,
+            records: vec![
+                reply(1, "the question", ""),
+                reply(2, "Re: the question", "<1@x>"),
+            ],
+            skipped: 0,
+        });
+        app.on_event(Event::OverviewComplete { group, token });
+
+        let screen = render(&mut app, 100, 20);
+        assert!(
+            screen.contains("\u{2022}  \u{203a} Re: the question"),
+            "the reply should be indented under its parent\n{screen}"
+        );
+
+        // Folded, the reply is gone and the count is on the parent's line.
+        app.focus = Pane::Articles;
+        app.article_cursor = 0;
+        app.on_key(ratatui::crossterm::event::KeyEvent::new(
+            ratatui::crossterm::event::KeyCode::Char('z'),
+            ratatui::crossterm::event::KeyModifiers::NONE,
+        ));
+
+        let screen = render(&mut app, 100, 20);
+        assert!(screen.contains("+1 the question"), "{screen}");
+        assert!(!screen.contains("Re: the question"), "{screen}");
     }
 
     #[test]

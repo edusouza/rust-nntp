@@ -5,9 +5,9 @@
 //! nothing here blocks. That is what makes the behaviour testable — the tests at the
 //! bottom of this file drive the whole reader without a terminal or a socket.
 
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 
-use nntp_proto::{ArticleSpec, GroupSummary, OverviewRecord, Range};
+use nntp_proto::{ArticleSpec, GroupSummary, OverviewRecord, Range, ThreadNode};
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use nntp_client::Cancel;
@@ -159,6 +159,24 @@ impl ArticleView {
     }
 }
 
+/// One line of the article pane.
+///
+/// Flat and threaded views produce the same kind of row; only `depth` and the fold fields
+/// differ, so the renderer has one code path and the state machine has one cursor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ArticleRow {
+    /// Index into `App::articles`.
+    pub index: usize,
+    /// How far to indent: 0 for a thread root, and always 0 in the flat view.
+    pub depth: usize,
+    /// Replies folded away under this row, or 0 if none are.
+    pub hidden: usize,
+    /// Whether this article has replies at all, folded or not.
+    pub has_replies: bool,
+    /// Whether this article's replies are folded away.
+    pub collapsed: bool,
+}
+
 /// The whole interface state.
 #[derive(Debug)]
 pub struct App {
@@ -185,6 +203,17 @@ pub struct App {
     pub article_cursor: usize,
     /// Whether the article list hides articles that have been read.
     pub unread_only: bool,
+    /// Whether the article list is grouped into conversations.
+    pub threaded: bool,
+    /// The threads [`Self::articles`] falls into, rebuilt whenever the records change.
+    ///
+    /// Cached rather than computed per draw: threading is the one derived value in here
+    /// that is not linear in the number of records, and the article pane is redrawn on
+    /// every keystroke.
+    threads: Vec<ThreadNode>,
+    /// Article numbers whose replies are folded away, by number rather than by index
+    /// because a refetch changes indices and a reader's folds should survive one.
+    collapsed: HashSet<u64>,
 
     /// The overview fetch whose records the article list is showing.
     ///
@@ -272,6 +301,9 @@ impl App {
             articles: Vec::new(),
             article_cursor: 0,
             unread_only: config.unread_only,
+            threaded: config.threaded,
+            threads: Vec::new(),
+            collapsed: HashSet::new(),
             overview_token: None,
             next_token: 0,
             overview_chunks: 0,
@@ -335,20 +367,101 @@ impl App {
 
     /// Indices into [`Self::articles`] that the article list shows, in order.
     ///
-    /// Everything unless [`Self::unread_only`] is on, in which case only the unread. The
-    /// same shape as [`Self::visible_groups`], deliberately: one filtering pattern in the
-    /// interface rather than two.
+    /// Everything unless [`Self::unread_only`] is on, in which case only the unread, and
+    /// in thread order when [`Self::threaded`] is on. The same shape as
+    /// [`Self::visible_groups`], deliberately: one filtering pattern in the interface
+    /// rather than two, and one thing the cursor is an index into.
     pub fn visible_articles(&self) -> Vec<usize> {
-        if !self.unread_only {
-            return (0..self.articles.len()).collect();
+        self.article_rows()
+            .into_iter()
+            .map(|row| row.index)
+            .collect()
+    }
+
+    /// The article list as rows to draw, in order.
+    ///
+    /// The threaded and flat views differ only here; everything else — the cursor, the
+    /// unread filter, marking read — works off the same list of indices either way.
+    pub fn article_rows(&self) -> Vec<ArticleRow> {
+        if !self.threaded {
+            return self
+                .articles
+                .iter()
+                .enumerate()
+                .filter(|(_, record)| !self.unread_only || self.is_unread(record.number))
+                .map(|(index, _)| ArticleRow {
+                    index,
+                    depth: 0,
+                    hidden: 0,
+                    has_replies: false,
+                    collapsed: false,
+                })
+                .collect();
         }
 
-        self.articles
-            .iter()
-            .enumerate()
-            .filter(|(_, record)| self.is_unread(record.number))
-            .map(|(index, _)| index)
-            .collect()
+        let mut rows = Vec::new();
+        for root in &self.threads {
+            self.push_rows(root, 0, &mut rows);
+        }
+        rows
+    }
+
+    /// Flattens one thread into rows, depth first.
+    ///
+    /// Two rules worth stating, because both are visible:
+    ///
+    /// - **Depth is the node's real depth in the thread**, whether or not its ancestors
+    ///   are drawn. A reply to a read article under the unread filter therefore keeps its
+    ///   indent, and turning the filter on and off does not slide the list sideways.
+    /// - **A fold only applies to a row that is drawn.** If the unread filter hides the
+    ///   article you collapsed, its unread replies are shown anyway: the filter's job is
+    ///   to show you what you have not read, and a fold must not be able to hide it.
+    fn push_rows(&self, node: &ThreadNode, depth: usize, rows: &mut Vec<ArticleRow>) {
+        let drawn = node
+            .article
+            .and_then(|index| {
+                self.articles
+                    .get(index)
+                    .map(|record| (index, record.number))
+            })
+            .filter(|(_, number)| !self.unread_only || self.is_unread(*number));
+
+        if let Some((index, number)) = drawn {
+            let collapsed = self.collapsed.contains(&number);
+            let hidden = if collapsed {
+                node.children.iter().map(ThreadNode::len).sum()
+            } else {
+                0
+            };
+
+            rows.push(ArticleRow {
+                index,
+                depth,
+                hidden,
+                has_replies: !node.children.is_empty(),
+                collapsed,
+            });
+
+            if collapsed {
+                return;
+            }
+        }
+
+        for child in &node.children {
+            self.push_rows(child, depth + 1, rows);
+        }
+    }
+
+    /// Rebuilds the thread tree from the records on display.
+    ///
+    /// Called whenever [`Self::articles`] changes, which is the only thing the tree
+    /// depends on — collapse state is applied at draw time, so folds survive a refetch.
+    fn rebuild_threads(&mut self) {
+        self.threads = if self.threaded {
+            nntp_proto::thread(&self.articles)
+        } else {
+            Vec::new()
+        };
     }
 
     /// The overview record under the cursor.
@@ -644,6 +757,8 @@ impl App {
             KeyCode::Char('u') => self.toggle_unread_only(),
             KeyCode::Char('M') => self.toggle_read_under_cursor(),
             KeyCode::Char('c') => self.catch_up(),
+            KeyCode::Char('t') => self.toggle_threading(),
+            KeyCode::Char('z') => self.toggle_fold_under_cursor(),
 
             _ => self.dirty = false,
         }
@@ -767,11 +882,17 @@ impl App {
                 if group.is_empty() {
                     self.status = format!("{} is empty", group.name);
                     self.articles.clear();
+                    self.threads.clear();
+                    self.collapsed.clear();
                     self.article = None;
                     return Vec::new();
                 }
 
                 self.articles.clear();
+                self.threads.clear();
+                // Folds belong to the group they were made in: article numbers mean
+                // something else in the next one.
+                self.collapsed.clear();
                 self.article = None;
                 self.article_cursor = 0;
                 self.status = format!("opening {}…", group.name);
@@ -824,6 +945,79 @@ impl App {
         } else {
             format!("showing all {} articles", self.articles.len())
         };
+    }
+
+    /// `t`: group the article list into conversations, or show it flat again.
+    ///
+    /// The article under the cursor stays under the cursor, because the two views order
+    /// the same articles differently and landing somewhere else on a key press meant to
+    /// change the *shape* of the list would be disorienting.
+    fn toggle_threading(&mut self) {
+        let anchor = self.selected_article().map(|record| record.number);
+        self.threaded = !self.threaded;
+        self.rebuild_threads();
+
+        self.article_cursor = anchor
+            .and_then(|number| self.row_of(number))
+            .unwrap_or_else(|| self.visible_articles().len().saturating_sub(1));
+
+        self.status = if self.threaded {
+            format!("{} threads", self.threads.len())
+        } else {
+            format!("showing {} articles flat", self.articles.len())
+        };
+    }
+
+    /// `z`: fold the replies under the cursor away, or bring them back.
+    fn toggle_fold_under_cursor(&mut self) {
+        if !self.threaded {
+            self.status = "threading is off (t)".to_owned();
+            return;
+        }
+
+        let Some(row) = self.article_rows().into_iter().nth(self.article_cursor) else {
+            return;
+        };
+        let Some(number) = self.articles.get(row.index).map(|record| record.number) else {
+            return;
+        };
+
+        if !row.has_replies {
+            self.status = format!("article {number} has no replies");
+            return;
+        }
+
+        if self.collapsed.remove(&number) {
+            self.status = format!("article {number}: replies shown");
+        } else {
+            self.collapsed.insert(number);
+            // Counted after folding, not before: the row only reports what it is hiding
+            // once it is hiding it, and guessing from the rows below would get a nested
+            // fold wrong.
+            let hidden = self
+                .article_rows()
+                .into_iter()
+                .find(|candidate| candidate.index == row.index)
+                .map_or(0, |candidate| candidate.hidden);
+            self.status = format!(
+                "article {number}: {} folded",
+                plural(hidden, "reply", "replies")
+            );
+        }
+
+        // Folding removes rows below the cursor, so the cursor itself cannot move — but
+        // unfolding can put the list somewhere the cursor is no longer inside.
+        self.article_cursor = self.row_of(number).unwrap_or(self.article_cursor);
+        self.clamp_article_cursor();
+    }
+
+    /// Which row an article number is on, if it is on one.
+    fn row_of(&self, number: u64) -> Option<usize> {
+        self.article_rows().into_iter().position(|row| {
+            self.articles
+                .get(row.index)
+                .is_some_and(|record| record.number == number)
+        })
     }
 
     /// `M`: mark the article under the cursor read, or unread if it already was read.
@@ -941,6 +1135,8 @@ impl App {
                 self.articles = records;
             }
         }
+
+        self.rebuild_threads();
 
         let visible = self.visible_articles();
         self.article_cursor = if pinned_to_newest {
@@ -1078,6 +1274,13 @@ impl App {
     }
 }
 
+/// `n` with the right noun after it.
+///
+/// "1 replies folded" is the kind of detail that makes an interface feel unfinished.
+fn plural(count: usize, one: &str, many: &str) -> String {
+    format!("{count} {}", if count == 1 { one } else { many })
+}
+
 /// Moves a cursor by `delta` within `0..count`, clamping at both ends.
 ///
 /// Clamping rather than wrapping: a list that jumps from the end back to the beginning
@@ -1144,6 +1347,17 @@ mod tests {
 
     fn record(number: u64, subject: &str) -> OverviewRecord {
         let line = format!("{number}\t{subject}\ta@x\t\t<{number}@x>\t\t10\t1");
+        OverviewRecord::parse(line.as_bytes(), &OverviewFmt::standard()).unwrap()
+    }
+
+    /// A record that replies to the given article numbers.
+    fn reply(number: u64, subject: &str, references: &[u64]) -> OverviewRecord {
+        let refs = references
+            .iter()
+            .map(|n| format!("<{n}@x>"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let line = format!("{number}\t{subject}\ta@x\t\t<{number}@x>\t{refs}\t10\t1");
         OverviewRecord::parse(line.as_bytes(), &OverviewFmt::standard()).unwrap()
     }
 
@@ -2018,6 +2232,214 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(reported.len(), 1, "{:?}", app.messages);
         assert!(reported[0].contains('4'), "{:?}", reported);
+    }
+
+    /// An app showing one thread: a root, two replies, and one unrelated article.
+    fn app_with_a_thread() -> App {
+        let mut app = app();
+        app.on_event(Event::GroupOpened(Box::new(summary("misc.test", 1, 4, 4))));
+        deliver_overview(
+            &mut app,
+            "misc.test",
+            vec![
+                reply(1, "the question", &[]),
+                reply(2, "Re: the question", &[1]),
+                reply(3, "Re: the question", &[1, 2]),
+                reply(4, "something else", &[]),
+            ],
+            0,
+        );
+        app
+    }
+
+    #[test]
+    fn replies_are_indented_under_what_they_answer() {
+        let app = app_with_a_thread();
+        assert!(app.threaded, "threading is the default");
+
+        let rows = app.article_rows();
+        let shape: Vec<(u64, usize)> = rows
+            .iter()
+            .filter_map(|row| app.articles.get(row.index).map(|r| (r.number, row.depth)))
+            .collect();
+
+        assert_eq!(shape, vec![(1, 0), (2, 1), (3, 2), (4, 0)]);
+    }
+
+    #[test]
+    fn threading_reorders_the_list_but_not_the_cursor() {
+        // `t` changes the shape of the list, so landing on a different article would be a
+        // surprise. The article under the cursor stays under it.
+        let mut app = app_with_a_thread();
+        app.focus = Pane::Articles;
+        app.article_cursor = 1;
+        assert_eq!(app.selected_article().map(|r| r.number), Some(2));
+
+        app.on_key(key(KeyCode::Char('t')));
+        assert!(!app.threaded);
+        assert_eq!(app.selected_article().map(|r| r.number), Some(2));
+
+        app.on_key(key(KeyCode::Char('t')));
+        assert!(app.threaded);
+        assert_eq!(app.selected_article().map(|r| r.number), Some(2));
+    }
+
+    #[test]
+    fn the_flat_view_is_article_number_order() {
+        let mut app = app_with_a_thread();
+        app.on_key(key(KeyCode::Char('t')));
+
+        let numbers: Vec<u64> = app
+            .article_rows()
+            .iter()
+            .filter_map(|row| app.articles.get(row.index).map(|r| r.number))
+            .collect();
+
+        assert_eq!(numbers, vec![1, 2, 3, 4]);
+        assert!(app.article_rows().iter().all(|row| row.depth == 0));
+    }
+
+    #[test]
+    fn folding_hides_the_replies_and_says_how_many() {
+        let mut app = app_with_a_thread();
+        app.focus = Pane::Articles;
+        app.article_cursor = 0;
+
+        app.on_key(key(KeyCode::Char('z')));
+
+        let rows = app.article_rows();
+        let numbers: Vec<u64> = rows
+            .iter()
+            .filter_map(|row| app.articles.get(row.index).map(|r| r.number))
+            .collect();
+        assert_eq!(numbers, vec![1, 4], "the two replies are folded away");
+        assert_eq!(rows.first().map(|row| row.hidden), Some(2));
+        assert!(app.status.contains('2'), "{}", app.status);
+
+        // And back again.
+        app.on_key(key(KeyCode::Char('z')));
+        assert_eq!(app.article_rows().len(), 4);
+    }
+
+    #[test]
+    fn folding_leaves_the_cursor_on_the_article_it_folded() {
+        let mut app = app_with_a_thread();
+        app.focus = Pane::Articles;
+        app.article_cursor = 0;
+
+        app.on_key(key(KeyCode::Char('z')));
+        assert_eq!(app.selected_article().map(|r| r.number), Some(1));
+
+        app.on_key(key(KeyCode::Char('z')));
+        assert_eq!(app.selected_article().map(|r| r.number), Some(1));
+    }
+
+    #[test]
+    fn folding_an_article_with_no_replies_says_so_rather_than_doing_nothing() {
+        let mut app = app_with_a_thread();
+        app.focus = Pane::Articles;
+        app.article_cursor = 3;
+        assert_eq!(app.selected_article().map(|r| r.number), Some(4));
+
+        app.on_key(key(KeyCode::Char('z')));
+
+        assert_eq!(app.article_rows().len(), 4);
+        assert!(app.status.contains("no replies"), "{}", app.status);
+    }
+
+    #[test]
+    fn a_fold_cannot_hide_an_unread_reply_from_the_unread_filter() {
+        // The filter's job is to show what has not been read. A fold on an article the
+        // filter itself hides must not take its unread replies with it.
+        let mut app = app_with_a_thread();
+        app.focus = Pane::Articles;
+        app.article_cursor = 0;
+        app.on_key(key(KeyCode::Char('z')));
+
+        app.read.mark_read("misc.test", 1);
+        app.unread_only = true;
+
+        let numbers: Vec<u64> = app
+            .article_rows()
+            .iter()
+            .filter_map(|row| app.articles.get(row.index).map(|r| r.number))
+            .collect();
+
+        assert_eq!(numbers, vec![2, 3, 4]);
+    }
+
+    #[test]
+    fn folds_do_not_survive_moving_to_another_group() {
+        // Article numbers mean something else in the next group, so a fold carried over
+        // would land on an unrelated article.
+        let mut app = app_with_a_thread();
+        app.focus = Pane::Articles;
+        app.article_cursor = 0;
+        app.on_key(key(KeyCode::Char('z')));
+        assert_eq!(app.article_rows().len(), 2);
+
+        app.on_event(Event::Groups(some_groups()));
+        app.focus = Pane::Groups;
+        app.on_key(key(KeyCode::Enter));
+        app.on_event(Event::GroupOpened(Box::new(summary("misc.test", 1, 4, 4))));
+        deliver_overview(
+            &mut app,
+            "misc.test",
+            vec![
+                reply(1, "the question", &[]),
+                reply(2, "Re: the question", &[1]),
+            ],
+            0,
+        );
+
+        assert_eq!(app.article_rows().len(), 2, "nothing is folded");
+        assert_eq!(app.article_rows().get(1).map(|row| row.depth), Some(1));
+    }
+
+    #[test]
+    fn folding_with_threading_off_says_what_to_press() {
+        let mut app = app_with_a_thread();
+        app.on_key(key(KeyCode::Char('t')));
+        app.focus = Pane::Articles;
+
+        app.on_key(key(KeyCode::Char('z')));
+
+        assert!(app.status.contains('t'), "{}", app.status);
+        assert_eq!(app.article_rows().len(), 4);
+    }
+
+    #[test]
+    fn a_thread_assembled_from_two_chunks_is_still_a_thread() {
+        // The reply can arrive before the article it answers, since chunks come newest
+        // first. Threading is rebuilt as records land, so the order they arrive in must
+        // not change the result.
+        let mut app = app();
+        app.on_event(Event::GroupOpened(Box::new(summary("misc.test", 1, 2, 2))));
+        let group = GroupName::parse("misc.test").unwrap();
+        let token = app.begin_overview_fetch();
+
+        app.on_event(Event::OverviewChunk {
+            group: group.clone(),
+            token,
+            records: vec![reply(2, "Re: the question", &[1])],
+            skipped: 0,
+        });
+        assert_eq!(app.article_rows().first().map(|row| row.depth), Some(0));
+
+        app.on_event(Event::OverviewChunk {
+            group: group.clone(),
+            token,
+            records: vec![reply(1, "the question", &[])],
+            skipped: 0,
+        });
+        app.on_event(Event::OverviewComplete { group, token });
+
+        let shape: Vec<(u64, usize)> = app
+            .article_rows()
+            .iter()
+            .filter_map(|row| app.articles.get(row.index).map(|r| (r.number, row.depth)))
+            .collect();
+        assert_eq!(shape, vec![(1, 0), (2, 1)]);
     }
 
     #[test]

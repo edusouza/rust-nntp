@@ -234,6 +234,38 @@ fn overview_records_arrive_in_pieces_newest_first() {
 }
 
 #[test]
+fn a_reply_is_threaded_under_the_article_it_answers() {
+    // #10, end to end: the References header comes off a real OVER response rather than
+    // out of a fixture built by hand, which is the part the unit tests cannot say.
+    let mut harness = Harness::new(serve(ServerConfig::new()));
+    harness.settle("the group list", |app| !app.groups.is_empty());
+
+    harness.press(KeyCode::Char('/'));
+    harness.type_text("misc.test");
+    harness.press(KeyCode::Enter);
+    harness.press(KeyCode::Enter);
+    harness.settle("the article list", |app| app.articles.len() == 3);
+
+    let shape = |app: &App| -> Vec<(u64, usize)> {
+        app.article_rows()
+            .iter()
+            .filter_map(|row| app.articles.get(row.index).map(|r| (r.number, row.depth)))
+            .collect()
+    };
+
+    // Article 2 replies to article 1; article 3 refers to nothing.
+    assert_eq!(shape(&harness.app), vec![(1, 0), (2, 1), (3, 0)]);
+
+    // `z` folds the reply away and `t` drops back to a flat list.
+    harness.app.article_cursor = 0;
+    harness.press(KeyCode::Char('z'));
+    assert_eq!(shape(&harness.app), vec![(1, 0), (3, 0)]);
+
+    harness.press(KeyCode::Char('t'));
+    assert_eq!(shape(&harness.app), vec![(1, 0), (2, 0), (3, 0)]);
+}
+
+#[test]
 fn opens_a_group_and_then_an_article() {
     let mut harness = Harness::new(serve(ServerConfig::new()));
     harness.settle("the group list", |app| !app.groups.is_empty());

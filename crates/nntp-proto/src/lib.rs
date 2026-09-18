@@ -72,6 +72,7 @@ pub mod mime;
 pub mod overview;
 pub mod response;
 pub mod spec;
+pub mod thread;
 
 pub use article::{Article, ContentType, TransferEncoding};
 pub use block::DataBlock;
@@ -86,3 +87,4 @@ pub use message_id::MessageId;
 pub use overview::{OverviewFmt, OverviewRecord};
 pub use response::{ResponseCode, ResponseKind, StatusLine};
 pub use spec::{ArticleSpec, Range, RangeOrId};
+pub use thread::{ThreadNode, thread};

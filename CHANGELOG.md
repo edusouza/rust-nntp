@@ -9,6 +9,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Threaded article list** ([#10]). Replies used to be marked with a chevron and left
+  where the server's numbering put them, so a conversation was scattered through the list
+  in arrival order. The list is now grouped into conversations, with replies indented under
+  what they answer. `t` switches between threaded and flat; `z` folds the replies under the
+  cursor away and brings them back; `threaded = false` under `[ui]` opens the reader flat.
+
+  The marker rather than an indent *was* the right call for v0.1, and this is why: real
+  `References` chains are broken. Parents expire, are cancelled, or were never carried by
+  this server; senders trim or reverse the chain; gateways rewrite it. So the grouping is
+  [Jamie Zawinski's algorithm](https://www.jwz.org/doc/threading.html), which exists for
+  exactly that traffic:
+
+  - a reply whose parent is missing still groups with its siblings, under a placeholder
+    for the article nobody has — kept only when it holds more than one reply, since with
+    one it would say nothing;
+  - a thread with no `References` anywhere is rescued by subject, after stripping `Re:` in
+    the languages a reader actually meets, the `Re[2]:` counter form and a leading
+    `[list-tag]`. Deliberately narrow, because merging on subject alone is how unrelated
+    articles end up in one another's conversations;
+  - a `References` cycle is broken rather than followed, and every article in it is still
+    shown;
+  - nesting is capped, and the cap is applied iteratively *before* the tree is built —
+    otherwise a group carrying one very long reply chain would overflow the stack instead
+    of drawing a deep thread. The articles are kept either way.
+
+  Two rules in the reader are worth knowing because they are visible. Indentation is the
+  article's real depth in its thread whether or not its ancestors are drawn, so turning
+  the unread filter on and off does not slide the list sideways. And a fold only applies
+  to a row that is drawn: if the unread filter hides the article you folded, its unread
+  replies are shown anyway, because the filter's job is to show what you have not read.
+
 - **Overview records appear as they arrive** ([#8]). Opening a group used to fetch the
   whole range before showing anything: the status bar moved, the article pane stayed
   empty, and on a group with a hundred thousand articles it stayed empty for a long time.
@@ -370,5 +401,6 @@ records what was checked, against which server, on what date ([#4]).
 [#7]: https://github.com/edusouza/rust-nntp/issues/7
 [#8]: https://github.com/edusouza/rust-nntp/issues/8
 [#9]: https://github.com/edusouza/rust-nntp/issues/9
+[#10]: https://github.com/edusouza/rust-nntp/issues/10
 [#12]: https://github.com/edusouza/rust-nntp/issues/12
 [#17]: https://github.com/edusouza/rust-nntp/issues/17

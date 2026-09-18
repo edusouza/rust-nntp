@@ -113,6 +113,7 @@ mark_read_on_open = true      # opening an article marks it read
 unread_only = false           # start with the unread filter on
 initial_articles = 300        # how many of a group's newest articles to load
 overview_chunk = 500          # overview records per round trip
+threaded = true               # group the article list into conversations
 date_format = "%Y-%m-%d %H:%M"
 ```
 
@@ -198,6 +199,8 @@ while something is outstanding.
 | `Enter` | open the group or article under the cursor |
 | `n` / `p` | next / previous article, opening it |
 | `u` | show only unread articles, or everything again |
+| `t` | group the list into conversations, or show it flat |
+| `z` | fold the replies under the cursor away, or bring them back |
 | `M` | mark the article under the cursor read, or unread if it was read |
 | `c` | catch up: mark the whole group read |
 | `/` | filter groups by name or description |
@@ -227,9 +230,9 @@ keys.
 - **`•` before a subject** marks an unread article, and its subject is bold. Read articles
   are dimmed and unmarked — the other way round would put a mark on nearly every line of
   a group you follow, which is no mark at all.
-- **`›` before a subject** marks a follow-up. Replies are marked rather than indented:
-  real threads arrive out of order and with missing parents, so an indent would be a lie
-  until threading lands in v0.2.
+- **`›` before an indented subject** marks a follow-up, sitting under the article it
+  answers. `+3` in its place means the replies under that line are folded away — press `z`
+  to bring them back, or `t` for a flat list with no indents at all.
 - **The badge at the bottom left** is green for TLS and yellow for a plaintext connection,
   and red when the connection has dropped. The worker reconnects on the next request, so
   a dropped connection is a nuisance rather than the end of the session.
@@ -277,6 +280,31 @@ Two things worth knowing, because they are visible:
 
 `Esc` keeps its other meanings when nothing is outstanding, and always belongs to the
 filter while you are typing one.
+
+### Threads
+
+The article list is grouped into conversations, with replies indented under what they
+answer. `t` switches to a flat, article-number-ordered list and back; `z` folds the replies
+under the cursor away, showing `+3` on the line that is hiding them, and brings them back.
+`threaded = false` under `[ui]` opens the reader flat.
+
+Threading is done from the `References` header, with the tolerances real Usenet traffic
+needs:
+
+- **A thread whose first article has expired still groups.** Its replies gather under a
+  placeholder for the article nobody has.
+- **A thread with no `References` at all is rescued by subject** — `Re:`, `AW:`, `Sv:`,
+  `Re[2]:` and a leading `[list-tag]` are stripped before comparing. This is the last
+  resort and stays narrow on purpose: merging on subject alone is how two unrelated
+  conversations end up looking like one.
+- **The indent is the article's real depth**, whether or not its parent is on screen. A
+  reply that sits under a read article keeps its indent when the unread filter hides that
+  article, so turning `u` on and off does not slide the list sideways.
+- **A fold cannot hide something unread.** If the unread filter hides the article you
+  folded, its unread replies are shown anyway.
+
+Very deep threads stop indenting rather than marching off the right-hand edge; no article
+is ever dropped for being too deep.
 
 ### Watching a big group load
 
@@ -329,7 +357,7 @@ Two instances of the reader against the same server will have the last one to ex
 
 ### What it does not do yet
 
-Posting, threading and a disk cache are all v0.2 or later; see the
+Posting and a disk cache are v0.2 or later; see the
 [roadmap](https://github.com/edusouza/rust-nntp/issues/3). There is no subscription list
 yet, so the group list shows everything the server carries, and it is re-fetched on every
 start.

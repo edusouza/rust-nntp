@@ -209,6 +209,13 @@ pub struct UiConfig {
     ///
     /// The `u` key toggles it either way; this is only the state the reader opens in.
     pub unread_only: bool,
+
+    /// Whether the article list starts grouped into conversations.
+    ///
+    /// On by default: a newsreader that shows replies next to what they reply to is what
+    /// `slrn`, `tin` and the rest have done for thirty years, and a flat list of a busy
+    /// group is a list of fragments. The `t` key switches either way.
+    pub threaded: bool,
 }
 
 impl Default for UiConfig {
@@ -219,6 +226,7 @@ impl Default for UiConfig {
             date_format: "%Y-%m-%d %H:%M".to_owned(),
             mark_read_on_open: true,
             unread_only: false,
+            threaded: true,
         }
     }
 }
@@ -423,6 +431,8 @@ date_format = "{date_format}"
 mark_read_on_open = {mark_read_on_open}
 # Whether the article list starts showing only unread articles. `u` toggles it.
 unread_only = {unread_only}
+# Whether the article list starts grouped into conversations. `t` toggles it.
+threaded = {threaded}
 "#,
             max_line_bytes = LimitsConfig::default().max_line_bytes,
             max_block_bytes = LimitsConfig::default().max_block_bytes,
@@ -432,6 +442,7 @@ unread_only = {unread_only}
             date_format = UiConfig::default().date_format,
             mark_read_on_open = UiConfig::default().mark_read_on_open,
             unread_only = UiConfig::default().unread_only,
+            threaded = UiConfig::default().threaded,
         )
     }
 }

@@ -147,6 +147,7 @@ The suite is entirely offline and runs on Linux, macOS and Windows.
 | `nntp-client` | the conversation driven over scripted in-memory streams, then end to end over a real socket against the fake server, including its deliberate misbehaviour |
 | TLS | a real handshake against a certificate generated at run time, with verification left on; the two failure cases — untrusted CA, wrong name — are asserted to fail |
 | `nntp-tui` read state | unit tests, including 4 000 random operations against an oracle |
+| `nntp-proto` threading | unit tests over hand-built reference graphs, including the malformed ones |
 | `nntp-tui` state machine | unit tests over key events and worker events |
 | `nntp-tui` rendering | `TestBackend` snapshots, including terminals too small to use |
 | `nntp-tui` as a whole | state machine plus worker plus a real socket plus the fake server |
