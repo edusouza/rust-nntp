@@ -696,7 +696,18 @@ impl App {
                 self.inflight = self.inflight.saturating_sub(1);
 
                 if !self.accepts_overview(&group, token) {
-                    self.note(format!("discarded a late overview reply for {group}"));
+                    // Two different situations, and saying "discarded" for both reads as
+                    // data loss for the one where nothing was lost. A superseded fetch is
+                    // routine now that posting reloads the group: post twice and the first
+                    // reload is overtaken by the second.
+                    let showing = self.group.as_ref().map(|summary| &summary.name);
+                    if showing == Some(&group) {
+                        self.note(format!("{group}: a reload was overtaken by a newer one"));
+                    } else {
+                        self.note(format!(
+                            "{group}: an overview reply arrived after you had moved on"
+                        ));
+                    }
                     return Vec::new();
                 }
 
@@ -2377,7 +2388,7 @@ mod tests {
 
         assert_eq!(app.articles.len(), 3);
         assert!(
-            app.messages.iter().any(|m| m.contains("discarded")),
+            app.messages.iter().any(|m| m.contains("moved on")),
             "{:?}",
             app.messages
         );
@@ -3011,6 +3022,31 @@ mod tests {
         let mut app = app_that_can_post();
         assert!(app.on_composed(None).is_empty());
         assert_eq!(app.inflight, 0);
+    }
+
+    #[test]
+    fn a_superseded_reload_does_not_read_as_data_loss() {
+        // Routine now that posting reloads the group: post twice and the first reload is
+        // overtaken by the second. "Discarded" for that would send somebody looking for
+        // the articles it lost, and it lost none.
+        let mut app = app_with_a_thread();
+        let group = GroupName::parse("misc.test").unwrap();
+
+        let overtaken = app.begin_overview_fetch();
+        let _current = app.begin_overview_fetch();
+
+        app.on_event(Event::OverviewComplete {
+            group,
+            token: overtaken,
+        });
+
+        let note = app
+            .messages
+            .front()
+            .cloned()
+            .unwrap_or_else(|| "no message".to_owned());
+        assert!(note.contains("overtaken"), "{note}");
+        assert!(!note.contains("discarded"), "{note}");
     }
 
     #[test]
