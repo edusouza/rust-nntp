@@ -59,6 +59,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **The reader takes connection flags without naming a subcommand.** `nntp-tui --host
+  127.0.0.1 --port 1119 --no-tls` answered `error: unexpected argument '--host' found`:
+  the flags belonged to the `tui` subcommand alone, even though the reader is what runs
+  when no subcommand is given. The README, the user guide and the real-server runbook all
+  documented the form that did not work, which is three documents agreeing against the
+  interface. Both forms work now, and giving the flags before a *different* subcommand is
+  refused with a message rather than silently ignored.
+
 - **`nntp-testserver` now advertises `POST`** when it will accept articles. It answered
   `340` to `POST` while leaving the capability out of `CAPABILITIES`, which is a shape of
   server that does not exist — and a fake that behaves that way teaches a client the wrong
