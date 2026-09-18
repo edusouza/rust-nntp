@@ -38,10 +38,20 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App) {
     draw_article(frame, app, article);
     draw_status(frame, app, status);
 
+    // The overlay clamps its own scroll, because how many lines a text occupies depends on
+    // wrapping and so on the width — which only the renderer knows. Reported back so that
+    // `End` leaves the position somewhere the next key press can move from.
     match app.overlay {
         Overlay::None => {}
-        Overlay::Help => draw_overlay(frame, "Keys", help_text(), body),
-        Overlay::Messages => draw_overlay(frame, "Messages", messages_text(app), body),
+        Overlay::Help => {
+            let scroll = draw_overlay(frame, app, "Keys", help_text(), body);
+            app.set_overlay_scroll(scroll);
+        }
+        Overlay::Messages => {
+            let text = messages_text(app);
+            let scroll = draw_overlay(frame, app, "Messages", text, body);
+            app.set_overlay_scroll(scroll);
+        }
     }
 }
 
@@ -396,7 +406,13 @@ fn draw_status(frame: &mut Frame<'_>, app: &App, area: Rect) {
 }
 
 /// Draws a centred overlay over the panes.
-fn draw_overlay(frame: &mut Frame<'_>, title: &str, text: Text<'static>, area: Rect) {
+fn draw_overlay(
+    frame: &mut Frame<'_>,
+    app: &App,
+    title: &str,
+    text: Text<'static>,
+    area: Rect,
+) -> usize {
     // The overlay takes three quarters of the area, bounded to a readable size and then
     // bounded again by the terminal itself, so a window too small for the preferred
     // minimum still renders something instead of panicking.
@@ -422,6 +438,34 @@ fn draw_overlay(frame: &mut Frame<'_>, title: &str, text: Text<'static>, area: R
         height,
     };
 
+    // How much of it fits, so that a text taller than the overlay can be scrolled rather
+    // than silently cut off at the bottom. The lines are counted after wrapping, which is
+    // why this is here and not in the state machine.
+    let inner_width = centred.width.saturating_sub(2).max(1);
+    let inner_height = centred.height.saturating_sub(2) as usize;
+    let wrapped: usize = text
+        .lines
+        .iter()
+        .map(|line| {
+            let width = line.width().max(1);
+            width.div_ceil(inner_width as usize)
+        })
+        .sum();
+    let max_scroll = wrapped.saturating_sub(inner_height);
+    let scroll = app.overlay_scroll.min(max_scroll);
+
+    // A cut-off list that does not say it is cut off is the actual problem; the title is
+    // where a reader is already looking.
+    let title = if max_scroll > 0 {
+        format!(
+            " {title} — {}/{} lines, \u{2191}\u{2193} to scroll, Esc to close ",
+            (scroll + inner_height).min(wrapped),
+            wrapped
+        )
+    } else {
+        format!(" {title} — Esc to close ")
+    };
+
     // Clear first, or the panes show through the overlay.
     frame.render_widget(Clear, centred);
     frame.render_widget(
@@ -430,15 +474,18 @@ fn draw_overlay(frame: &mut Frame<'_>, title: &str, text: Text<'static>, area: R
                 Block::bordered()
                     .border_type(BorderType::Double)
                     .border_style(Style::new().fg(ACCENT))
-                    .title(format!(" {title} — Esc to close ")),
+                    .title(title),
             )
-            .wrap(Wrap { trim: false }),
+            .wrap(Wrap { trim: false })
+            .scroll((u16::try_from(scroll).unwrap_or(u16::MAX), 0)),
         centred,
     );
+
+    scroll
 }
 
 fn help_text() -> Text<'static> {
-    const ROWS: [(&str, &str); 20] = [
+    const ROWS: [(&str, &str); 22] = [
         ("Tab / Shift-Tab", "next / previous pane"),
         ("h l  ← →", "move focus left / right"),
         ("j k  ↓ ↑", "move down / up"),
@@ -453,6 +500,8 @@ fn help_text() -> Text<'static> {
             "z",
             "fold the replies under the cursor away, or bring them back",
         ),
+        ("w", "write a new article in the selected group"),
+        ("f", "follow up to the article on screen"),
         ("M", "mark the article under the cursor read / unread"),
         ("c", "catch up: mark the whole group read"),
         ("/", "filter groups by name or description"),
@@ -829,7 +878,44 @@ mod tests {
         let screen = render(&mut app, 100, 24);
         assert!(screen.contains("Keys"), "{screen}");
         assert!(screen.contains("Esc to close"), "{screen}");
-        assert!(screen.contains("filter groups"), "{screen}");
+        assert!(screen.contains("next / previous pane"), "{screen}");
+    }
+
+    #[test]
+    fn a_help_list_taller_than_the_terminal_can_be_scrolled_and_says_so() {
+        // The key list outgrew a 24-line terminal, which plenty of people still use. An
+        // overlay that cuts off its bottom third without a word is worse than no help.
+        let mut app = app();
+        app.overlay = Overlay::Help;
+
+        let screen = render(&mut app, 100, 24);
+        assert!(screen.contains("to scroll"), "{screen}");
+        // The last row of the list. Not "quit": the status bar says that too.
+        let last_row = "Ctrl-C";
+        assert!(
+            !screen.contains(last_row),
+            "the end should be off-screen: {screen}"
+        );
+
+        app.on_key(ratatui::crossterm::event::KeyEvent::new(
+            ratatui::crossterm::event::KeyCode::End,
+            ratatui::crossterm::event::KeyModifiers::NONE,
+        ));
+        let screen = render(&mut app, 100, 24);
+        assert!(
+            screen.contains(last_row),
+            "scrolling to the end shows it: {screen}"
+        );
+    }
+
+    #[test]
+    fn a_help_list_that_fits_says_nothing_about_scrolling() {
+        let mut app = app();
+        app.overlay = Overlay::Help;
+
+        let screen = render(&mut app, 100, 40);
+        assert!(!screen.contains("to scroll"), "{screen}");
+        assert!(screen.contains("Ctrl-C"), "{screen}");
     }
 
     #[test]

@@ -18,7 +18,59 @@ pub enum Flow {
     /// The client sent `STARTTLS` and has been told to proceed; the caller must now
     /// perform the handshake and start a fresh command phase over the encrypted stream.
     UpgradeToTls,
+    /// The client sent `POST` and has been told `340`; the caller must now read the
+    /// article as a data block and hand it to [`Session::accept_article`].
+    ///
+    /// The command dispatcher only writes, so reading the block belongs to whichever loop
+    /// owns the input — and both of them, plaintext and TLS, get it the same way.
+    ReadArticle,
 }
+
+/// An article a client posted, as the server received it.
+///
+/// Kept so that a test can assert on what actually arrived rather than on what the client
+/// believes it sent — which is the only way to catch a dot-stuffing bug, since the sender
+/// cannot see its own truncation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PostedArticle {
+    /// The lines as received, unstuffed and without terminators.
+    pub lines: Vec<Vec<u8>>,
+}
+
+impl PostedArticle {
+    /// A header value, ignoring case.
+    pub fn header(&self, name: &str) -> Option<String> {
+        let prefix = format!("{}:", name.to_ascii_lowercase());
+        self.lines
+            .iter()
+            .take_while(|line| !line.is_empty())
+            .find(|line| {
+                String::from_utf8_lossy(line)
+                    .to_ascii_lowercase()
+                    .starts_with(&prefix)
+            })
+            .map(|line| {
+                String::from_utf8_lossy(line)
+                    .split_once(':')
+                    .map_or_else(String::new, |(_, value)| value.trim().to_owned())
+            })
+    }
+
+    /// The body, as text.
+    pub fn body_text(&self) -> String {
+        let body: Vec<String> = self
+            .lines
+            .iter()
+            .skip_while(|line| !line.is_empty())
+            .skip(1)
+            .map(|line| String::from_utf8_lossy(line).into_owned())
+            .collect();
+        body.join("\n")
+    }
+}
+
+/// Where a server keeps what clients have posted to it.
+pub type Postbox = std::sync::Arc<std::sync::Mutex<Vec<PostedArticle>>>;
 
 /// Why a session stopped.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -51,6 +103,7 @@ pub struct Session<'a> {
     corpus: &'a Corpus,
     config: &'a ServerConfig,
     state: State,
+    postbox: Option<Postbox>,
 }
 
 impl<'a> Session<'a> {
@@ -59,6 +112,7 @@ impl<'a> Session<'a> {
         Self {
             corpus,
             config,
+            postbox: None,
             state: State {
                 truncate_next_block: config.quirks.truncate_next_block,
                 // A server that advertises READER is already in reader mode.
@@ -66,6 +120,11 @@ impl<'a> Session<'a> {
                 ..State::default()
             },
         }
+    }
+
+    /// Keeps posted articles where the caller can inspect them.
+    pub fn set_postbox(&mut self, postbox: Postbox) {
+        self.postbox = Some(postbox);
     }
 
     /// Whether this session is running over an encrypted transport.
@@ -107,6 +166,13 @@ impl<'a> Session<'a> {
                 Flow::Continue => {}
                 Flow::Close => return Ok(Outcome::Closed),
                 Flow::UpgradeToTls => return Ok(Outcome::UpgradeToTls),
+                Flow::ReadArticle => {
+                    let article = read_article(input)?;
+                    match self.accept_article(article, output)? {
+                        Flow::Close => return Ok(Outcome::Closed),
+                        _ => continue,
+                    }
+                }
             }
         }
     }
@@ -167,6 +233,12 @@ impl<'a> Session<'a> {
                         ));
                     }
                     return Ok(Outcome::UpgradeToTls);
+                }
+                Flow::ReadArticle => {
+                    let article = read_article(reader)?;
+                    if self.accept_article(article, reader.get_mut())? == Flow::Close {
+                        return Ok(Outcome::Closed);
+                    }
                 }
             }
         }
@@ -251,6 +323,7 @@ impl<'a> Session<'a> {
                 self.fetch(output, &verb, &args).map(|()| Flow::Continue)
             }
             "OVER" | "XOVER" => self.over(output, &verb, &args).map(|()| Flow::Continue),
+            "POST" => self.post(output),
             "NEXT" | "LAST" => self.step(output, &verb).map(|()| Flow::Continue),
             other => self
                 .status(output, 500, &format!("command {other} not recognised"))
@@ -280,6 +353,64 @@ impl<'a> Session<'a> {
 
         self.status(output, 382, "continue with TLS negotiation")?;
         Ok(Flow::UpgradeToTls)
+    }
+
+    /// `POST`: the first half of the exchange. The article arrives next.
+    fn post(&mut self, output: &mut impl Write) -> std::io::Result<Flow> {
+        if self.config.greeting == GreetingMode::NoPosting {
+            self.status(output, 440, "posting not permitted")?;
+            return Ok(Flow::Continue);
+        }
+
+        self.status(output, 340, "send the article; end with a lone .")?;
+        Ok(Flow::ReadArticle)
+    }
+
+    /// The second half: what the client sent, and whether it is taken.
+    ///
+    /// # Errors
+    ///
+    /// Propagates IO errors from the transport.
+    pub fn accept_article(
+        &mut self,
+        lines: Vec<Vec<u8>>,
+        output: &mut impl Write,
+    ) -> std::io::Result<Flow> {
+        let article = PostedArticle { lines };
+
+        if let Some(reason) = &self.config.quirks.refuse_post {
+            // Refused *after* reading it, which is what a real server does: it cannot know
+            // the article is unacceptable until it has one.
+            let reason = reason.clone();
+            self.status(output, 441, &reason)?;
+            return Ok(Flow::Continue);
+        }
+
+        for required in ["From", "Newsgroups", "Subject"] {
+            if article
+                .header(required)
+                .is_none_or(|value| value.trim().is_empty())
+            {
+                self.status(output, 441, &format!("missing {required} header"))?;
+                return Ok(Flow::Continue);
+            }
+        }
+
+        let message_id = article
+            .header("Message-ID")
+            .unwrap_or_else(|| format!("<{}@test.invalid>", self.state.commands_served));
+
+        if let Some(postbox) = &self.postbox {
+            // A poisoned mutex means another session thread panicked; the article is
+            // dropped rather than panicking this one too, and the test that cares will
+            // fail on the empty postbox with a better message than a panic here.
+            if let Ok(mut posted) = postbox.lock() {
+                posted.push(article);
+            }
+        }
+
+        self.status(output, 240, &format!("article received {message_id}"))?;
+        Ok(Flow::Continue)
     }
 
     fn needs_auth(&self) -> bool {
@@ -314,6 +445,15 @@ impl<'a> Session<'a> {
             CapabilityProfile::Legacy => {}
         }
         lines.push("LIST ACTIVE ACTIVE.TIMES NEWSGROUPS OVERVIEW.FMT".to_owned());
+        // RFC 3977 §5.2.3: a server that will accept articles says so here as well as in
+        // its greeting, and a client is entitled to believe the list. Not advertising it
+        // while answering `340` to POST is a shape of server that does not exist, and a
+        // fake that behaves that way teaches a client the wrong lesson.
+        if self.config.greeting != GreetingMode::NoPosting
+            && self.config.capabilities != CapabilityProfile::Transit
+        {
+            lines.push("POST".to_owned());
+        }
         if self.config.starttls && !self.state.encrypted {
             lines.push("STARTTLS".to_owned());
         }
@@ -730,6 +870,36 @@ fn parse_range(arg: &str) -> Option<(u64, Option<u64>)> {
         None => arg.parse().ok().map(|n| (n, Some(n))),
         Some((low, "")) => low.parse().ok().map(|low| (low, None)),
         Some((low, high)) => Some((low.parse().ok()?, Some(high.parse().ok()?))),
+    }
+}
+
+/// Reads a data block a client is sending: lines until a lone `.`, unstuffed.
+///
+/// The mirror of the client's dot-stuffing, and it has to be exact. A server that does not
+/// undo the stuffing turns every line starting with `.` into one starting with `..` for
+/// everybody who reads the article afterwards.
+///
+/// An unterminated block ends at end of input rather than blocking forever: the client has
+/// gone, and a fake server that hangs is worse to debug than one that gives up.
+fn read_article(input: &mut impl BufRead) -> std::io::Result<Vec<Vec<u8>>> {
+    let mut lines = Vec::new();
+    let mut line = Vec::new();
+
+    loop {
+        line.clear();
+        if input.read_until(b'\n', &mut line)? == 0 {
+            return Ok(lines);
+        }
+
+        let content = trim_eol(&line);
+        if content == b"." {
+            return Ok(lines);
+        }
+
+        lines.push(match content.strip_prefix(b".") {
+            Some(rest) => rest.to_vec(),
+            None => content.to_vec(),
+        });
     }
 }
 

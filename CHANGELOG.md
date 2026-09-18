@@ -9,6 +9,59 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Posting, in the editor you already use** ([#11]). `w` writes a new article in the
+  selected group and `f` follows up to the one on screen; both open `$VISUAL` or `$EDITOR`
+  on a pre-filled article and offer what comes back. A reader that could not answer was
+  half a reader.
+
+  Set `from = "Your Name <you@example.org>"` under the server in the configuration file.
+  There is deliberately no default: a `From` assembled from the login name and the
+  machine's host name is how articles end up signed `user@localhost`, and a reader that
+  refuses to post until it is told who you are is better than one that posts as somebody
+  who does not exist.
+
+  **What the reader fills in for you.** One `Re: ` and only one — `Re: Re: Re:` is what
+  happens when every client adds its own. The `References` chain, so the reply threads
+  under its parent in *everybody else's* reader. `Followup-To` in place of `Newsgroups`
+  when the parent set one, which is the whole point of that header and is usually a
+  crosspost asking to be answered in one group. The parent quoted, with its signature
+  dropped — quoting somebody's `.signature` back at them is the most reliable way to be
+  told off on Usenet. And `Followup-To: poster` is refused rather than quietly posted to
+  the group: the author asked for mail, and this reader cannot send mail.
+
+  **The draft is never lost.** It is written into the reader's own data directory before
+  the editor opens and deleted only once the server has accepted the article. A rejection,
+  a dropped connection, a crash, a power cut mid-edit — all of them leave the file where it
+  is, and the reader says where. "Never lose a draft" cannot be bolted on after a failure;
+  it has to be where the file is written.
+
+  **Checked here, not by the server.** A missing `Newsgroups`, an empty `Subject`, a body
+  that is only whitespace, a `Path` or `Xref` header the server owns — all reported at once,
+  in front of you, before anything is sent. A `441` arrives after the article has been
+  offered and usually says one terse thing. When the server does refuse, its own words are
+  shown verbatim, because they are the only explanation there will be.
+
+  Non-ASCII is handled in both directions now: a subject with an accent in it goes out as
+  RFC 2047 encoded words, and a body that is not ASCII gets the MIME headers that say what
+  it is. This project spent a lot of effort on not *showing* people mojibake; sending it
+  would have been a poor joke.
+
+  Body lines beginning with `.` are dot-stuffed, so a `.signature` line does not truncate
+  the article — invisibly to the sender, since the server answers `240` either way.
+
+### Changed
+
+- **The key-list overlay scrolls** (`↑` `↓`, `PageUp`/`PageDown`, `g`/`G`), and says how
+  much of it is on screen. With posting and threading it outgrew a 24-line terminal, and an
+  overlay that silently cuts off its bottom third is worse than no help at all.
+
+### Fixed
+
+- **`nntp-testserver` now advertises `POST`** when it will accept articles. It answered
+  `340` to `POST` while leaving the capability out of `CAPABILITIES`, which is a shape of
+  server that does not exist — and a fake that behaves that way teaches a client the wrong
+  lesson. Found by the first client that checked the capability before offering an article.
+
 - **Threaded article list** ([#10]). Replies used to be marked with a chevron and left
   where the server's numbering put them, so a conversation was scattered through the list
   in arrival order. The list is now grouped into conversations, with replies indented under
@@ -402,5 +455,6 @@ records what was checked, against which server, on what date ([#4]).
 [#8]: https://github.com/edusouza/rust-nntp/issues/8
 [#9]: https://github.com/edusouza/rust-nntp/issues/9
 [#10]: https://github.com/edusouza/rust-nntp/issues/10
+[#11]: https://github.com/edusouza/rust-nntp/issues/11
 [#12]: https://github.com/edusouza/rust-nntp/issues/12
 [#17]: https://github.com/edusouza/rust-nntp/issues/17

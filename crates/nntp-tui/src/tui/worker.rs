@@ -97,6 +97,7 @@ impl Worker {
                 token,
             } => self.load_overview(group, *range, *token),
             Request::LoadArticle { group, spec } => self.load_article(group.as_ref(), spec.clone()),
+            Request::Post { draft } => self.post(draft),
             Request::Shutdown => Ok(()),
         };
 
@@ -334,6 +335,13 @@ impl Worker {
         Ok(())
     }
 
+    fn post(&mut self, draft: &nntp_proto::Draft) -> Result<(), ClientError> {
+        self.send(Event::Progress("offering the article…".to_owned()));
+        let text = self.client()?.post(draft)?;
+        self.send(Event::Posted { text });
+        Ok(())
+    }
+
     /// Sends an event, ignoring a closed channel.
     ///
     /// A closed channel means the interface has exited; the worker will notice on its
@@ -357,6 +365,9 @@ fn describe(request: &Request) -> String {
             nntp_proto::ArticleSpec::MessageId(id) => format!("fetching {id}"),
             nntp_proto::ArticleSpec::Current => "fetching the current article".to_owned(),
         },
+        Request::Post { draft } => {
+            format!("posting to {}", draft.newsgroups().join(", "))
+        }
         Request::Shutdown => "shutting down".to_owned(),
     }
 }

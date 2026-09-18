@@ -26,6 +26,7 @@
 
 pub mod cli;
 pub mod commands;
+pub mod compose;
 pub mod config;
 pub mod logging;
 pub mod readstate;

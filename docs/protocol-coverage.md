@@ -32,7 +32,7 @@ divergence it found is noted under `GROUP`.
 | `HEAD` | ✅ | |
 | `BODY` | ✅ | |
 | `STAT` | ✅ | Article number `0` is reported as "not applicable" rather than as article zero. |
-| `POST` | 🚫 v0.1 | Planned for v0.2. |
+| `POST` | ✅ | The two-step exchange, dot-stuffed. The draft is validated before `POST` is sent, so a server that counts refused offers is not given one for a missing `Subject`. `440`/`441` are reported with the server's own text and leave the connection usable. |
 | `IHAVE` | 🚫 | Transit command, not used by readers. |
 
 ### Information (§7)

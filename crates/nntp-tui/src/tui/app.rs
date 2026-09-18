@@ -6,6 +6,7 @@
 //! bottom of this file drive the whole reader without a terminal or a socket.
 
 use std::collections::{HashSet, VecDeque};
+use std::path::PathBuf;
 
 use nntp_proto::{ArticleSpec, GroupSummary, OverviewRecord, Range, ThreadNode};
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -95,6 +96,22 @@ pub struct ArticleView {
     /// Only that one is *present*: nothing here verifies anything, and a reader implying
     /// otherwise would be worse than one that stays quiet.
     pub signed: bool,
+
+    /// The article's own message-id, for the `References` chain of a follow-up.
+    pub message_id: Option<nntp_proto::MessageId>,
+    /// The chain it already carries, oldest first.
+    pub references: Vec<nntp_proto::MessageId>,
+    /// Where a follow-up should go: `Followup-To` if the author set one, otherwise the
+    /// groups the article was posted to.
+    ///
+    /// Resolved here rather than at the point of composing, because it is a fact about the
+    /// article and RFC 5536 §3.2.6 is easy to get wrong twice.
+    pub followup_groups: Vec<String>,
+    /// Whether `Followup-To: poster` asked for a mail reply rather than a posting.
+    ///
+    /// This reader cannot send mail, so a follow-up is refused rather than quietly posted
+    /// to a group the author asked it not to go to.
+    pub followup_to_poster: bool,
 }
 
 impl ArticleView {
@@ -146,6 +163,25 @@ impl ArticleView {
             body.push("(no text in this article)".to_owned());
         }
 
+        // RFC 5536 §3.2.6: Followup-To names where replies go, and the reserved value
+        // `poster` means "mail me instead, do not post".
+        let followup_to = article.headers.get_decoded("Followup-To");
+        let followup_to_poster = followup_to
+            .as_deref()
+            .is_some_and(|value| value.trim().eq_ignore_ascii_case("poster"));
+
+        let groups_header = if followup_to_poster {
+            None
+        } else {
+            followup_to.or_else(|| article.headers.get_decoded("Newsgroups"))
+        };
+        let followup_groups = groups_header
+            .unwrap_or_default()
+            .split(',')
+            .map(|group| group.trim().to_owned())
+            .filter(|group| !group.is_empty())
+            .collect();
+
         Self {
             number: article.number,
             subject: article.subject(),
@@ -155,8 +191,25 @@ impl ArticleView {
             body,
             attachments,
             signed: article.is_signed(),
+            message_id: article.message_id(),
+            references: article.references(),
+            followup_groups,
+            followup_to_poster,
         }
     }
+}
+
+/// An article the user has asked to write.
+///
+/// Carries the text the editor should open with. Everything the reader knows how to fill
+/// in — who from, which group, what it answers, what it quotes — is filled in here, so the
+/// editor opens on something closer to finished than to blank.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ComposeRequest {
+    /// The text to open the editor on.
+    pub template: String,
+    /// What is being written, for the status line: `a new article` or `a follow-up`.
+    pub what: &'static str,
 }
 
 /// One line of the article pane.
@@ -184,6 +237,12 @@ pub struct App {
     pub focus: Pane,
     /// What is covering the layout.
     pub overlay: Overlay,
+    /// First visible line of the overlay.
+    ///
+    /// The key list outgrew a 24-line terminal, which is still the size of a great many
+    /// of them. An overlay that silently cuts off the bottom third of the help is worse
+    /// than no help.
+    pub overlay_scroll: usize,
 
     /// Every group the server carries.
     pub groups: Vec<GroupRow>,
@@ -256,6 +315,24 @@ pub struct App {
     /// Recent messages, newest first.
     pub messages: VecDeque<String>,
 
+    /// A composing session the run loop has not started yet.
+    ///
+    /// The state machine decides *what* to compose and pre-fills it; running an editor is
+    /// IO and belongs to the run loop, which is the only part that owns the terminal
+    /// (ADR-0008). Taken with [`Self::take_compose`].
+    pub compose: Option<ComposeRequest>,
+    /// The draft file behind the article currently being posted.
+    ///
+    /// Held until the server accepts it. Anything else — a rejection, a dropped
+    /// connection, a crash — leaves the file where it is, which is how a draft survives.
+    pub posting: Option<PathBuf>,
+    /// Who articles are posted as.
+    ///
+    /// Per server rather than global, because an identity is: the address you post from on
+    /// a private server is rarely the one you post from on a public one. Set by the run
+    /// loop from the resolved server, the same way [`Self::cancel`] is.
+    pub from: Option<String>,
+
     /// How many requests are outstanding, for the spinner.
     pub inflight: usize,
     /// Raised to abandon the response the worker is reading.
@@ -293,6 +370,7 @@ impl App {
         Self {
             focus: Pane::Groups,
             overlay: Overlay::None,
+            overlay_scroll: 0,
             groups: Vec::new(),
             group_cursor: 0,
             filter: String::new(),
@@ -317,6 +395,9 @@ impl App {
             status: "connecting…".to_owned(),
             error: None,
             messages: VecDeque::new(),
+            compose: None,
+            posting: None,
+            from: None,
             inflight: 0,
             cancel: Cancel::new(),
             spinner: 0,
@@ -651,6 +732,18 @@ impl App {
                 self.focus = Pane::Body;
             }
 
+            Event::Posted { text } => {
+                self.inflight = self.inflight.saturating_sub(1);
+                // The draft file goes only now, and the run loop is what removes it: the
+                // article exists somewhere other than this machine, so the copy here is
+                // the one thing nobody needs any more.
+                if let Some(path) = self.posting.take() {
+                    crate::compose::discard(&path);
+                }
+                self.status = format!("posted: {text}");
+                self.note(format!("posted: {text}"));
+            }
+
             Event::Progress(message) => self.status = message,
 
             Event::Cancelled { context } => {
@@ -659,6 +752,7 @@ impl App {
                 // about the connection is there because the next request will visibly
                 // reconnect, and a reconnection nobody explained looks like a fault.
                 self.status = format!("{context} cancelled");
+                self.report_unsent_draft();
                 self.note(format!(
                     "{context} cancelled; the connection was dropped and will be remade \
                      on the next request"
@@ -670,6 +764,7 @@ impl App {
                 let text = format!("{context}: {message}");
                 self.error = Some(text.clone());
                 self.note(text);
+                self.report_unsent_draft();
             }
 
             Event::Disconnected(reason) => {
@@ -677,6 +772,7 @@ impl App {
                 self.inflight = 0;
                 self.error = Some(format!("disconnected: {reason}"));
                 self.note(format!("disconnected: {reason}"));
+                self.report_unsent_draft();
             }
 
             Event::Stopped => {
@@ -759,6 +855,8 @@ impl App {
             KeyCode::Char('c') => self.catch_up(),
             KeyCode::Char('t') => self.toggle_threading(),
             KeyCode::Char('z') => self.toggle_fold_under_cursor(),
+            KeyCode::Char('w') => self.start_article(),
+            KeyCode::Char('f') => self.start_follow_up(),
 
             _ => self.dirty = false,
         }
@@ -786,24 +884,70 @@ impl App {
 
     fn overlay_key(&mut self, key: KeyEvent) -> Vec<Request> {
         match key.code {
-            KeyCode::Esc | KeyCode::Char('q') | KeyCode::Enter => self.overlay = Overlay::None,
+            KeyCode::Esc | KeyCode::Char('q') | KeyCode::Enter => self.close_overlay(),
             KeyCode::Char('?') | KeyCode::F(1) => {
-                self.overlay = if self.overlay == Overlay::Help {
-                    Overlay::None
+                if self.overlay == Overlay::Help {
+                    self.close_overlay();
                 } else {
-                    Overlay::Help
-                };
+                    self.overlay = Overlay::Help;
+                    self.overlay_scroll = 0;
+                }
             }
             KeyCode::Char('m') => {
-                self.overlay = if self.overlay == Overlay::Messages {
-                    Overlay::None
+                if self.overlay == Overlay::Messages {
+                    self.close_overlay();
                 } else {
-                    Overlay::Messages
-                };
+                    self.overlay = Overlay::Messages;
+                    self.overlay_scroll = 0;
+                }
             }
+
+            // The overlay scrolls with the same keys as everything else, because a list
+            // that is taller than the terminal and does not scroll is a list with a
+            // hidden bottom half.
+            KeyCode::Down | KeyCode::Char('j') => self.scroll_overlay(1),
+            KeyCode::Up | KeyCode::Char('k') => self.scroll_overlay(-1),
+            KeyCode::PageDown => self.scroll_overlay(self.overlay_page()),
+            KeyCode::PageUp => self.scroll_overlay(-self.overlay_page()),
+            KeyCode::Home | KeyCode::Char('g') => self.overlay_scroll = 0,
+            KeyCode::End | KeyCode::Char('G') => self.overlay_scroll = usize::MAX,
+
             _ => self.dirty = false,
         }
         Vec::new()
+    }
+
+    fn close_overlay(&mut self) {
+        self.overlay = Overlay::None;
+        self.overlay_scroll = 0;
+    }
+
+    fn overlay_page(&self) -> isize {
+        // The overlay is a little shorter than the pane it covers; one line of overlap
+        // keeps a reader's place across a page.
+        self.body_height.saturating_sub(2).max(1) as isize
+    }
+
+    /// Scrolls the overlay, clamped by the renderer rather than here.
+    ///
+    /// The state machine does not know how many lines the overlay has — that depends on
+    /// wrapping, which depends on the width. `usize::MAX` therefore means "the end", and
+    /// [`crate::tui::ui`] brings it back inside the text it just laid out.
+    fn scroll_overlay(&mut self, delta: isize) {
+        if delta < 0 {
+            self.overlay_scroll = self.overlay_scroll.saturating_sub(delta.unsigned_abs());
+        } else {
+            self.overlay_scroll = self.overlay_scroll.saturating_add(delta.unsigned_abs());
+        }
+    }
+
+    /// Reports where the overlay actually ended up, once the renderer has clamped it.
+    ///
+    /// The only thing the renderer tells the state machine, and it exists so that `End`
+    /// does not leave the scroll position at `usize::MAX` for the next key press to
+    /// subtract from.
+    pub fn set_overlay_scroll(&mut self, scroll: usize) {
+        self.overlay_scroll = scroll;
     }
 
     fn filter_key(&mut self, key: KeyEvent) -> Vec<Request> {
@@ -945,6 +1089,153 @@ impl App {
         } else {
             format!("showing all {} articles", self.articles.len())
         };
+    }
+
+    /// `w`: write a new article in the selected group.
+    fn start_article(&mut self) {
+        let Some(from) = self.posting_identity() else {
+            return;
+        };
+        let Some(group) = self.group.as_ref().map(|summary| summary.name.to_string()) else {
+            self.status = "select a group first".to_owned();
+            return;
+        };
+
+        let mut draft = nntp_proto::Draft::default();
+        draft.set_header("From", from);
+        draft.set_header("Newsgroups", group.clone());
+        draft.set_header("Subject", "");
+
+        self.compose = Some(ComposeRequest {
+            template: template_for(&draft),
+            what: "a new article",
+        });
+        self.status = format!("composing an article for {group}…");
+    }
+
+    /// `f`: follow up to the article on screen.
+    fn start_follow_up(&mut self) {
+        let Some(from) = self.posting_identity() else {
+            return;
+        };
+        let Some(article) = self.article.as_ref() else {
+            self.status = "open an article to follow up to".to_owned();
+            return;
+        };
+
+        if article.followup_to_poster {
+            // RFC 5536 §3.2.6. Posting anyway would put the reply exactly where the author
+            // asked it not to go, and this reader cannot send the mail that was asked for.
+            self.status = "Followup-To: poster — the author asked for a mail reply".to_owned();
+            self.note(
+                "this article asks for replies by mail rather than to the group; \
+                 nothing was composed"
+                    .to_owned(),
+            );
+            return;
+        }
+
+        let groups = if article.followup_groups.is_empty() {
+            self.group
+                .as_ref()
+                .map(|summary| vec![summary.name.to_string()])
+                .unwrap_or_default()
+        } else {
+            article.followup_groups.clone()
+        };
+
+        if groups.is_empty() {
+            self.status = "no group to follow up in".to_owned();
+            return;
+        }
+
+        let draft = nntp_proto::Draft::follow_up(
+            &nntp_proto::FollowUp {
+                message_id: article.message_id.as_ref(),
+                references: &article.references,
+                subject: &article.subject,
+                author: &article.author,
+                newsgroups: groups.clone(),
+                body: &article.body.join("\n"),
+            },
+            &from,
+        );
+
+        self.compose = Some(ComposeRequest {
+            template: template_for(&draft),
+            what: "a follow-up",
+        });
+        self.status = format!("composing a follow-up to {}…", groups.join(", "));
+    }
+
+    /// Who to post as, or a message saying why nothing can be posted.
+    fn posting_identity(&mut self) -> Option<String> {
+        match self.from.as_ref().filter(|from| !from.trim().is_empty()) {
+            Some(from) => Some(from.clone()),
+            None => {
+                // Naming the key is the difference between a dead end and a fix: there is
+                // no sensible default for somebody's name and address.
+                self.status = "set `from` for this server to post".to_owned();
+                self.note(
+                    "posting needs an identity: add `from = \"Your Name <you@example.org>\"` \
+                     under this server in the configuration file"
+                        .to_owned(),
+                );
+                None
+            }
+        }
+    }
+
+    /// Takes the composing session the run loop should start, if there is one.
+    pub fn take_compose(&mut self) -> Option<ComposeRequest> {
+        self.compose.take()
+    }
+
+    /// Applies whatever came back from the editor.
+    ///
+    /// `None` means the editor was abandoned or could not be run; the caller reports why.
+    /// A draft with problems goes back to the user as messages rather than to the server
+    /// as a `441`, and the draft file stays where it is.
+    pub fn on_composed(&mut self, composed: Option<(String, PathBuf)>) -> Vec<Request> {
+        self.dirty = true;
+
+        let Some((text, path)) = composed else {
+            self.status = "nothing was posted".to_owned();
+            return Vec::new();
+        };
+
+        let draft = nntp_proto::Draft::parse(&text);
+        let problems = draft.problems();
+        if !problems.is_empty() {
+            self.status = format!("the article was not sent: {} problem(s)", problems.len());
+            for problem in &problems {
+                self.note(format!("draft: {problem}"));
+            }
+            self.note(format!("the draft is at {}", path.display()));
+            return Vec::new();
+        }
+
+        self.posting = Some(path);
+        self.status = format!("posting to {}…", draft.newsgroups().join(", "));
+        self.inflight += 1;
+
+        vec![Request::Post {
+            draft: Box::new(draft),
+        }]
+    }
+
+    /// Says where the draft is, when a posting did not go through.
+    ///
+    /// The file is left alone — it is only removed once the server has taken the article —
+    /// so this is the part that makes it findable. Reported once: the path repeated on
+    /// every subsequent failure would bury the reason.
+    fn report_unsent_draft(&mut self) {
+        if let Some(path) = self.posting.take() {
+            self.note(format!(
+                "the article was not posted; the draft is at {}",
+                path.display()
+            ));
+        }
     }
 
     /// `t`: group the article list into conversations, or show it flat again.
@@ -1274,6 +1565,22 @@ impl App {
     }
 }
 
+/// The text an editor opens on.
+///
+/// Headers, a blank line, then the body — the shape of an article, so that somebody who
+/// knows what one looks like can edit it without being told anything. No instructions, no
+/// comment lines to strip: a comment syntax would be one more thing to get wrong, and a
+/// stray instruction line posted to a group is worse than a blank template.
+fn template_for(draft: &nntp_proto::Draft) -> String {
+    let mut text = String::new();
+    for (name, value) in &draft.headers {
+        text.push_str(&format!("{name}: {value}\n"));
+    }
+    text.push('\n');
+    text.push_str(&draft.body);
+    text
+}
+
 /// `n` with the right noun after it.
 ///
 /// "1 replies folded" is the kind of detail that makes an interface feel unfinished.
@@ -1348,6 +1655,13 @@ mod tests {
     fn record(number: u64, subject: &str) -> OverviewRecord {
         let line = format!("{number}\t{subject}\ta@x\t\t<{number}@x>\t\t10\t1");
         OverviewRecord::parse(line.as_bytes(), &OverviewFmt::standard()).unwrap()
+    }
+
+    /// An article with the given header block and body.
+    fn article_with_headers(headers: &str, body: &str) -> nntp_proto::Article {
+        let block =
+            nntp_proto::DataBlock::parse(format!("{headers}\r\n{body}\r\n.\r\n").as_bytes());
+        nntp_proto::Article::from_block(&block)
     }
 
     /// A record that replies to the given article numbers.
@@ -2440,6 +2754,211 @@ mod tests {
             .filter_map(|row| app.articles.get(row.index).map(|r| (r.number, row.depth)))
             .collect();
         assert_eq!(shape, vec![(1, 0), (2, 1)]);
+    }
+
+    /// An app with an identity, so posting is possible at all.
+    fn app_that_can_post() -> App {
+        let mut app = app_with_a_thread();
+        app.from = Some("A Poster <poster@example.org>".to_owned());
+        app
+    }
+
+    #[test]
+    fn writing_an_article_pre_fills_what_the_reader_already_knows() {
+        let mut app = app_that_can_post();
+
+        app.on_key(key(KeyCode::Char('w')));
+
+        let request = app.take_compose().expect("a composing session");
+        assert!(
+            request
+                .template
+                .contains("From: A Poster <poster@example.org>")
+        );
+        assert!(request.template.contains("Newsgroups: misc.test"));
+        assert!(request.template.contains("Subject:"));
+        // Headers, a blank line, then the body: the shape of an article.
+        assert!(request.template.contains("\n\n"), "{:?}", request.template);
+    }
+
+    #[test]
+    fn posting_without_an_identity_says_which_key_to_set() {
+        // A guessed From is how articles end up signed `user@localhost`.
+        let mut app = app_with_a_thread();
+        app.from = None;
+
+        app.on_key(key(KeyCode::Char('w')));
+
+        assert!(app.take_compose().is_none());
+        assert!(app.status.contains("from"), "{}", app.status);
+        assert!(
+            app.messages.iter().any(|m| m.contains("configuration")),
+            "{:?}",
+            app.messages
+        );
+    }
+
+    #[test]
+    fn a_follow_up_quotes_the_article_and_carries_its_references() {
+        let mut app = app_that_can_post();
+        app.on_event(Event::Article(Box::new(article_with_headers(
+            "Message-ID: <parent@example.org>\r\n\
+             References: <root@example.org>\r\n\
+             Newsgroups: misc.test\r\n\
+             From: Original Poster <op@example.org>\r\n\
+             Subject: the question\r\n",
+            "What do you think?",
+        ))));
+
+        app.on_key(key(KeyCode::Char('f')));
+
+        let request = app.take_compose().expect("a composing session");
+        assert!(
+            request.template.contains("Subject: Re: the question"),
+            "{}",
+            request.template
+        );
+        assert!(
+            request
+                .template
+                .contains("References: <root@example.org> <parent@example.org>"),
+            "{}",
+            request.template
+        );
+        assert!(request.template.contains("Newsgroups: misc.test"));
+        assert!(
+            request.template.contains("> What do you think?"),
+            "{}",
+            request.template
+        );
+        assert!(request.template.contains("wrote:"), "{}", request.template);
+    }
+
+    #[test]
+    fn a_follow_up_goes_where_followup_to_says() {
+        let mut app = app_that_can_post();
+        app.on_event(Event::Article(Box::new(article_with_headers(
+            "Message-ID: <parent@example.org>\r\n\
+             Newsgroups: misc.test,comp.lang.rust\r\n\
+             Followup-To: misc.test\r\n\
+             From: op@example.org\r\n\
+             Subject: crossposted\r\n",
+            "Body.",
+        ))));
+
+        app.on_key(key(KeyCode::Char('f')));
+
+        let request = app.take_compose().expect("a composing session");
+        assert!(
+            request.template.contains("Newsgroups: misc.test\n"),
+            "a crosspost must follow up only where the author asked: {}",
+            request.template
+        );
+        assert!(
+            !request.template.contains("comp.lang.rust"),
+            "{}",
+            request.template
+        );
+    }
+
+    #[test]
+    fn followup_to_poster_is_refused_rather_than_posted_to_the_group() {
+        // RFC 5536 §3.2.6: the author asked for mail. This reader cannot send mail, and
+        // posting anyway would put the reply exactly where it was asked not to go.
+        let mut app = app_that_can_post();
+        app.on_event(Event::Article(Box::new(article_with_headers(
+            "Message-ID: <parent@example.org>\r\n\
+             Newsgroups: misc.test\r\n\
+             Followup-To: poster\r\n\
+             From: op@example.org\r\n\
+             Subject: mail me\r\n",
+            "Body.",
+        ))));
+
+        app.on_key(key(KeyCode::Char('f')));
+
+        assert!(app.take_compose().is_none());
+        assert!(app.status.contains("poster"), "{}", app.status);
+    }
+
+    #[test]
+    fn following_up_with_nothing_open_says_so() {
+        let mut app = app_that_can_post();
+        app.on_key(key(KeyCode::Char('f')));
+
+        assert!(app.take_compose().is_none());
+        assert!(app.status.contains("open an article"), "{}", app.status);
+    }
+
+    #[test]
+    fn a_composed_article_becomes_a_post_request() {
+        let mut app = app_that_can_post();
+
+        let requests = app.on_composed(Some((
+            "From: A Poster <poster@example.org>\n\
+             Newsgroups: misc.test\n\
+             Subject: Testing\n\
+             \n\
+             Hello.\n"
+                .to_owned(),
+            PathBuf::from("/tmp/draft.article"),
+        )));
+
+        assert_eq!(requests.len(), 1);
+        assert!(matches!(requests.first(), Some(Request::Post { .. })));
+        assert_eq!(app.inflight, 1);
+    }
+
+    #[test]
+    fn a_draft_with_problems_is_reported_and_not_sent() {
+        // The problems belong in front of the user, not in a 441 after a round trip.
+        let mut app = app_that_can_post();
+
+        let requests = app.on_composed(Some((
+            "Subject: no From, no Newsgroups\n\nBody.\n".to_owned(),
+            PathBuf::from("/tmp/draft.article"),
+        )));
+
+        assert!(requests.is_empty());
+        assert_eq!(app.inflight, 0);
+        assert!(
+            app.messages.iter().any(|m| m.contains("From")),
+            "{:?}",
+            app.messages
+        );
+        assert!(
+            app.messages.iter().any(|m| m.contains("draft.article")),
+            "the draft's path must be findable: {:?}",
+            app.messages
+        );
+    }
+
+    #[test]
+    fn a_failed_posting_says_where_the_draft_is() {
+        let mut app = app_that_can_post();
+        app.on_composed(Some((
+            "From: a@x\nNewsgroups: misc.test\nSubject: s\n\nBody.\n".to_owned(),
+            PathBuf::from("/tmp/draft.article"),
+        )));
+
+        app.on_event(Event::Failed {
+            context: "posting to misc.test".to_owned(),
+            message: "441 no colon-space in \"From\" header".to_owned(),
+        });
+
+        assert!(
+            app.messages.iter().any(|m| m.contains("draft.article")),
+            "{:?}",
+            app.messages
+        );
+        assert_eq!(app.inflight, 0);
+    }
+
+    #[test]
+    fn an_abandoned_composition_posts_nothing() {
+        let mut app = app_that_can_post();
+        assert!(app.on_composed(None).is_empty());
+        assert_eq!(app.inflight, 0);
     }
 
     #[test]

@@ -266,6 +266,125 @@ fn a_reply_is_threaded_under_the_article_it_answers() {
 }
 
 #[test]
+fn composes_a_follow_up_and_posts_it() {
+    // #11 end to end, minus the editor: the state machine pre-fills the follow-up, the
+    // worker offers it, and the fake server says what it received. What the editor would
+    // do — hand back edited text — is done here directly, because a test that spawns an
+    // editor tests the editor.
+    let mut harness = Harness::new(serve(ServerConfig::new()));
+    harness.app.from = Some("A Tester <tester@example.org>".to_owned());
+    harness.settle("the group list", |app| !app.groups.is_empty());
+
+    harness.press(KeyCode::Char('/'));
+    harness.type_text("misc.test");
+    harness.press(KeyCode::Enter);
+    harness.press(KeyCode::Enter);
+    harness.settle("the article list", |app| !app.articles.is_empty());
+
+    // Open the oldest article and follow up to it.
+    harness.app.article_cursor = 0;
+    harness.press(KeyCode::Enter);
+    harness.settle("the article", |app| app.article.is_some());
+
+    harness.press(KeyCode::Char('f'));
+    let request = harness
+        .app
+        .take_compose()
+        .expect("a follow-up should have been prepared");
+    assert!(
+        request.template.contains("Subject: Re: "),
+        "{}",
+        request.template
+    );
+    assert!(
+        request.template.contains("References: <root@test.invalid>"),
+        "the parent's message-id must be in the chain: {}",
+        request.template
+    );
+
+    // What the editor hands back.
+    let edited = format!("{}My answer.\n", request.template);
+    for outgoing in harness
+        .app
+        .on_composed(Some((edited, PathBuf::from("unused-draft"))))
+    {
+        harness.requests.send(outgoing).expect("send");
+    }
+
+    harness.settle("the posting", |app| {
+        app.messages
+            .iter()
+            .any(|message| message.contains("posted"))
+    });
+
+    let posted = harness._server.posted();
+    assert_eq!(posted.len(), 1, "{:?}", harness.app.messages);
+    assert_eq!(
+        posted[0].header("From").as_deref(),
+        Some("A Tester <tester@example.org>")
+    );
+    assert_eq!(posted[0].header("Newsgroups").as_deref(), Some("misc.test"));
+    assert!(
+        posted[0].header("References").is_some(),
+        "the reply must thread under its parent for everybody else too"
+    );
+    assert!(posted[0].body_text().contains("My answer."));
+    assert!(
+        posted[0].body_text().contains('>'),
+        "the parent should be quoted: {}",
+        posted[0].body_text()
+    );
+    assert_eq!(harness.app.inflight, 0);
+}
+
+#[test]
+fn a_rejected_article_reports_the_servers_words_and_keeps_the_draft() {
+    let mut harness = Harness::new(
+        TestServer::with(
+            Corpus::sample(),
+            ServerConfig::new().quirks(Quirks {
+                refuse_post: Some("this group is moderated".to_owned()),
+                ..Quirks::default()
+            }),
+        )
+        .expect("start the server"),
+    );
+    harness.app.from = Some("A Tester <tester@example.org>".to_owned());
+    harness.settle("the group list", |app| !app.groups.is_empty());
+
+    for outgoing in harness.app.on_composed(Some((
+        "From: A Tester <tester@example.org>\n\
+         Newsgroups: misc.test\n\
+         Subject: Will be refused\n\
+         \n\
+         Body.\n"
+            .to_owned(),
+        PathBuf::from("/tmp/the-draft.article"),
+    ))) {
+        harness.requests.send(outgoing).expect("send");
+    }
+
+    harness.settle("the rejection", |app| {
+        app.messages
+            .iter()
+            .any(|message| message.contains("moderated"))
+    });
+
+    assert!(
+        harness
+            .app
+            .messages
+            .iter()
+            .any(|message| message.contains("the-draft.article")),
+        "the draft must still be findable: {:?}",
+        harness.app.messages
+    );
+    // The connection survived a refusal, so the reader is still usable.
+    assert!(harness.app.connected);
+    assert_eq!(harness.app.inflight, 0);
+}
+
+#[test]
 fn opens_a_group_and_then_an_article() {
     let mut harness = Harness::new(serve(ServerConfig::new()));
     harness.settle("the group list", |app| !app.groups.is_empty());

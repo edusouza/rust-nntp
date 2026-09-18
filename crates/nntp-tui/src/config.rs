@@ -51,6 +51,14 @@ pub struct ServerConfig {
     /// Whether and how to encrypt the connection.
     pub security: SecurityConfig,
 
+    /// Who to post as: the `From` header of anything written on this server.
+    ///
+    /// Per server, because an identity is. There is deliberately no default — a guess
+    /// assembled from the login name and the machine's host name is how articles end up
+    /// signed `user@localhost`, and a reader that will not post until told who you are is
+    /// better than one that posts as somebody who does not exist.
+    pub from: Option<String>,
+
     /// Username for `AUTHINFO USER`.
     pub username: Option<String>,
 
@@ -106,6 +114,7 @@ impl Default for ServerConfig {
             host: String::new(),
             port: None,
             security: SecurityConfig::default(),
+            from: None,
             username: None,
             password: None,
             password_command: None,
@@ -410,6 +419,10 @@ read_timeout_secs = 60
 write_timeout_secs = 30
 
 # A second server, to show that several can coexist.
+# Who your articles are posted as. There is no default: a guess would put somebody
+# else's address on your posts.
+# from = "Your Name <you@example.org>"
+
 [servers.local-test]
 host = "127.0.0.1"
 port = 1119

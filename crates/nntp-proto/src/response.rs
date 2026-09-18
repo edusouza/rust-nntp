@@ -245,6 +245,12 @@ pub mod codes {
     pub const NO_SUCH_ARTICLE_NUMBER: ResponseCode = ResponseCode::new(423);
     /// No article with that message-id.
     pub const NO_SUCH_ARTICLE_ID: ResponseCode = ResponseCode::new(430);
+    /// The article was accepted for posting.
+    pub const ARTICLE_POSTED: ResponseCode = ResponseCode::new(240);
+    /// Posting is not permitted on this connection.
+    pub const POSTING_NOT_PERMITTED: ResponseCode = ResponseCode::new(440);
+    /// The article was offered and refused. The text is usually the only explanation.
+    pub const POSTING_FAILED: ResponseCode = ResponseCode::new(441);
     /// Authentication required.
     pub const AUTH_REQUIRED: ResponseCode = ResponseCode::new(480);
     /// Authentication failed or rejected.

@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use crate::config::ServerConfig;
 use crate::corpus::Corpus;
-use crate::session::{Outcome, Session};
+use crate::session::{Outcome, Postbox, PostedArticle, Session};
 #[cfg(feature = "tls")]
 use crate::tls::SelfSignedIdentity;
 
@@ -23,6 +23,7 @@ const ACCEPT_POLL: Duration = Duration::from_millis(10);
 pub struct TestServer {
     address: SocketAddr,
     stop: Arc<AtomicBool>,
+    postbox: Postbox,
     accept_loop: Option<JoinHandle<()>>,
     #[cfg(feature = "tls")]
     identity: Option<SelfSignedIdentity>,
@@ -151,6 +152,7 @@ impl TestServer {
         listener.set_nonblocking(true)?;
 
         let stop = Arc::new(AtomicBool::new(false));
+        let postbox: Postbox = Arc::new(std::sync::Mutex::new(Vec::new()));
 
         #[cfg(feature = "tls")]
         let (identity, mode, tls_config) = match tls {
@@ -166,6 +168,7 @@ impl TestServer {
             let shared = Arc::new(Shared {
                 corpus,
                 config,
+                postbox: Arc::clone(&postbox),
                 #[cfg(feature = "tls")]
                 mode,
                 #[cfg(feature = "tls")]
@@ -180,10 +183,27 @@ impl TestServer {
         Ok(Self {
             address,
             stop,
+            postbox,
             accept_loop: Some(accept_loop),
             #[cfg(feature = "tls")]
             identity,
         })
+    }
+
+    /// Everything clients have posted, oldest first.
+    ///
+    /// As the server received it: a test can therefore check the bytes on the wire rather
+    /// than what the client believes it sent, which is the only way to catch a
+    /// dot-stuffing mistake.
+    ///
+    /// A poisoned mutex — a session thread panicked while holding it — yields an empty
+    /// list rather than a panic here, so the test that called this fails on its own
+    /// assertion instead of on a second panic during teardown.
+    pub fn posted(&self) -> Vec<PostedArticle> {
+        self.postbox
+            .lock()
+            .map(|posted| posted.clone())
+            .unwrap_or_default()
     }
 
     /// The address the server is listening on.
@@ -228,6 +248,7 @@ impl Drop for TestServer {
 struct Shared {
     corpus: Corpus,
     config: ServerConfig,
+    postbox: Postbox,
     #[cfg(feature = "tls")]
     mode: TlsMode,
     #[cfg(feature = "tls")]
@@ -285,6 +306,7 @@ fn serve(mut stream: TcpStream, shared: &Arc<Shared>) {
     let _ = stream.set_nodelay(true);
 
     let mut session = Session::new(&shared.corpus, &shared.config);
+    session.set_postbox(Arc::clone(&shared.postbox));
 
     #[cfg(feature = "tls")]
     if shared.mode == TlsMode::Implicit {

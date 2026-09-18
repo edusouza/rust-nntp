@@ -198,6 +198,8 @@ while something is outstanding.
 | `g` / `G` | first / last |
 | `Enter` | open the group or article under the cursor |
 | `n` / `p` | next / previous article, opening it |
+| `w` | write a new article in the selected group |
+| `f` | follow up to the article on screen |
 | `u` | show only unread articles, or everything again |
 | `t` | group the list into conversations, or show it flat |
 | `z` | fold the replies under the cursor away, or bring them back |
@@ -281,6 +283,47 @@ Two things worth knowing, because they are visible:
 `Esc` keeps its other meanings when nothing is outstanding, and always belongs to the
 filter while you are typing one.
 
+### Posting
+
+`w` writes a new article in the selected group; `f` follows up to the one on screen. Both
+open your editor on a pre-filled article — headers, a blank line, then the body — and offer
+what you save. Quitting without changing anything abandons the post.
+
+First tell the reader who you are, under the server in the configuration file:
+
+```toml
+[servers.es]
+host = "news.eternal-september.org"
+from = "Your Name <you@example.org>"
+```
+
+There is no default on purpose. A `From` guessed from your login name and your machine's
+host name is how articles end up signed `user@localhost`.
+
+The editor is `$VISUAL`, then `$EDITOR`, then `vi` (or `notepad` on Windows). Arguments in
+the variable work — `EDITOR="code --wait"`, `EDITOR="emacsclient -c"` — as long as the path
+itself has no spaces in it.
+
+**What is filled in for a follow-up:** one `Re: ` (never a second), the `References` chain
+so your reply threads properly in everybody else's reader, `Followup-To` in place of
+`Newsgroups` when the author set one, and the parent quoted with its signature dropped. An
+article marked `Followup-To: poster` is *not* composed: the author asked to be answered by
+mail, which this reader cannot send.
+
+**Your draft is never lost.** It is written under
+`~/.local/share/nntp-tui/drafts/` before the editor opens and removed only once the server
+has accepted the article. If the post is refused, the connection drops, or the reader dies,
+the file stays and the message pane (`m`) says where it is.
+
+**What is checked before anything is sent:** `From`, `Newsgroups` and `Subject` present and
+non-empty, a body that is not just whitespace, and no `Path`, `Xref`, `Lines` or `Bytes` —
+those are the server's to set. Everything wrong is reported at once, so one trip back to
+the editor is enough. If the server still refuses, its own message is shown as it arrived;
+that is usually the only explanation there is.
+
+Accented subjects are sent as RFC 2047 encoded words and a non-ASCII body gets the MIME
+headers that describe it, so what you type is what the other end reads.
+
 ### Threads
 
 The article list is grouped into conversations, with replies indented under what they
@@ -357,7 +400,7 @@ Two instances of the reader against the same server will have the last one to ex
 
 ### What it does not do yet
 
-Posting and a disk cache are v0.2 or later; see the
+A disk cache and server-side group filtering are v0.3; see the
 [roadmap](https://github.com/edusouza/rust-nntp/issues/3). There is no subscription list
 yet, so the group list shows everything the server carries, and it is re-fetched on every
 start.

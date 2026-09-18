@@ -46,6 +46,12 @@ pub struct Quirks {
     /// empty group.
     pub reject_open_ended_ranges: bool,
 
+    /// Refuse every article offered to `POST` with `441` and this text.
+    ///
+    /// The refusal a client has to survive: the article was read in full and then turned
+    /// down, so the connection is fine and the draft must not be lost.
+    pub refuse_post: Option<String>,
+
     /// Close the connection after this many commands, mid-session.
     pub close_after_commands: Option<usize>,
 

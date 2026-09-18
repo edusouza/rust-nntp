@@ -61,6 +61,14 @@ pub enum Request {
         /// Which article.
         spec: ArticleSpec,
     },
+    /// Offer an article to the server.
+    Post {
+        /// The article, already validated by the state machine.
+        ///
+        /// Boxed because it is much larger than every other request, and a channel's
+        /// message size is the size of its largest variant.
+        draft: Box<nntp_proto::Draft>,
+    },
     /// Close the connection and stop the worker.
     Shutdown,
 }
@@ -109,6 +117,11 @@ pub enum Event {
     },
     /// An article arrived.
     Article(Box<nntp_proto::Article>),
+    /// The server accepted an article.
+    Posted {
+        /// The server's own success text, which often carries the message-id it assigned.
+        text: String,
+    },
     /// Progress on a long operation, for the status bar.
     Progress(String),
     /// A request the user abandoned.

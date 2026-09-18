@@ -6,9 +6,9 @@ use chrono::{DateTime, Utc};
 use nntp_proto::block::DataBlock;
 use nntp_proto::response::codes;
 use nntp_proto::{
-    ActiveEntry, Article, ArticleSpec, Capabilities, Command, GroupName, GroupSummary, ListKeyword,
-    ListResult, MessageId, NewsgroupEntry, OverviewFmt, OverviewRecord, Range, RangeOrId,
-    ResponseCode, StatusLine, Wildmat, date,
+    ActiveEntry, Article, ArticleSpec, Capabilities, Command, Draft, GroupName, GroupSummary,
+    ListKeyword, ListResult, MessageId, NewsgroupEntry, OverviewFmt, OverviewRecord, Range,
+    RangeOrId, ResponseCode, StatusLine, Wildmat, date,
 };
 
 use crate::connection::Connection;
@@ -654,6 +654,88 @@ impl<S: Read + Write> Client<S> {
             return Err(ClientError::from_status("HELP", &line));
         }
         Ok(self.connection.read_block()?.to_text())
+    }
+
+    /// Whether this connection can post at all, and why not if it cannot.
+    ///
+    /// `Ok(())` is not a promise the server will take any particular article — only that
+    /// offering one is not pointless. The greeting's `200`/`201` is the primary signal
+    /// (RFC 3977 §5.1.1) and `CAPABILITIES` the secondary; a server that says neither is
+    /// given the benefit of the doubt, because a reader that refuses to try is worse than
+    /// one that relays a refusal.
+    ///
+    /// # Errors
+    ///
+    /// [`ClientError::PostingNotAllowed`] with the reason.
+    pub fn check_can_post(&self) -> Result<()> {
+        if !self.greeting.posting_allowed {
+            return Err(ClientError::PostingNotAllowed {
+                reason: "the server greeted with 201, posting prohibited".to_owned(),
+            });
+        }
+
+        // An empty capability list means CAPABILITIES was never answered, which is not the
+        // same as being answered without POST.
+        if !self.capabilities.is_empty() && !self.capabilities.has_post() {
+            return Err(ClientError::PostingNotAllowed {
+                reason: "the server does not advertise POST".to_owned(),
+            });
+        }
+
+        Ok(())
+    }
+
+    /// Posts an article (RFC 3977 §6.3.1).
+    ///
+    /// The two-step exchange: `POST`, then the article as a data block only once the
+    /// server has answered `340`. Sending the article with the command would mean offering
+    /// it to a server that has just said it will not take one.
+    ///
+    /// The draft is validated before anything is written, so a missing `Newsgroups` is a
+    /// message in front of the user rather than a `441` after a round trip; and the lines
+    /// are dot-stuffed on the way out, so a body line beginning with `.` survives.
+    ///
+    /// Returns the server's own success text, which some servers use to report the
+    /// message-id they assigned.
+    ///
+    /// # Errors
+    ///
+    /// [`ClientError::PostingNotAllowed`] before anything is sent;
+    /// [`ClientError::Proto`] wrapping [`nntp_proto::ProtoError::UnpostableDraft`] if the
+    /// draft is incomplete; [`ClientError::PostingRejected`] carrying the server's own
+    /// words if it refuses the article; and connection failures.
+    pub fn post(&mut self, draft: &Draft) -> Result<String> {
+        self.check_can_post()?;
+
+        // Encoded first: a draft that cannot be encoded must not cost a POST command, and
+        // a server that counts refused offers should not be given one for our mistake.
+        let lines = draft.to_lines()?;
+
+        let line = self.connection.command(&Command::Post)?;
+        if line.code != codes::SEND_ARTICLE {
+            return Err(match line.code {
+                codes::POSTING_NOT_PERMITTED => ClientError::PostingNotAllowed {
+                    reason: line.text.clone(),
+                },
+                _ => ClientError::from_status("POST", &line),
+            });
+        }
+
+        self.connection.send_block(&lines)?;
+
+        let line = self.connection.read_status()?;
+        if line.code == codes::ARTICLE_POSTED {
+            tracing::info!(text = %line.text, "article posted");
+            return Ok(line.text);
+        }
+
+        Err(match line.code {
+            codes::POSTING_NOT_PERMITTED | codes::POSTING_FAILED => ClientError::PostingRejected {
+                code: line.code,
+                text: line.text,
+            },
+            _ => ClientError::from_status("POST", &line),
+        })
     }
 
     /// Sends `QUIT` and consumes the client.

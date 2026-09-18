@@ -489,3 +489,147 @@ fn a_connection_refused_is_an_error_not_a_hang() {
     let error = connector::connect(&options).unwrap_err();
     assert!(error.is_connection_fatal());
 }
+
+// -- posting ----------------------------------------------------------------------------
+
+/// A draft that is complete enough to be accepted.
+fn draft(body: &str) -> nntp_proto::Draft {
+    nntp_proto::Draft::parse(&format!(
+        "From: A Poster <poster@example.org>\n\
+         Newsgroups: misc.test\n\
+         Subject: A test posting\n\
+         \n\
+         {body}\n"
+    ))
+}
+
+#[test]
+fn posts_an_article_and_the_server_receives_what_was_sent() {
+    let server = TestServer::start().unwrap();
+    let mut client = connect(&server);
+
+    let text = client.post(&draft("Hello from the test suite.")).unwrap();
+    assert!(text.contains("received"), "{text}");
+
+    let posted = server.posted();
+    assert_eq!(posted.len(), 1);
+    assert_eq!(
+        posted[0].header("Subject").as_deref(),
+        Some("A test posting")
+    );
+    assert_eq!(posted[0].header("Newsgroups").as_deref(), Some("misc.test"));
+    assert_eq!(posted[0].body_text(), "Hello from the test suite.");
+}
+
+#[test]
+fn a_body_line_beginning_with_a_dot_arrives_intact() {
+    // The classic NNTP bug: without dot-stuffing the article is truncated at this line and
+    // the sender cannot tell, because the server answers 240 either way.
+    let server = TestServer::start().unwrap();
+    let mut client = connect(&server);
+
+    client
+        .post(&draft(
+            ".signature is not a terminator\nand this line follows it",
+        ))
+        .unwrap();
+
+    let posted = server.posted();
+    assert_eq!(
+        posted[0].body_text(),
+        ".signature is not a terminator\nand this line follows it"
+    );
+}
+
+#[test]
+fn a_refused_article_reports_the_servers_own_words_and_keeps_the_connection() {
+    // 441 is usually the only explanation there will be, and the connection is still
+    // usable: dropping it would cost a reconnection for a mistake about to be fixed.
+    let server = TestServer::with(
+        Corpus::sample(),
+        ServerConfig::new().quirks(Quirks {
+            refuse_post: Some("no colon-space in \"From\" header".to_owned()),
+            ..Quirks::default()
+        }),
+    )
+    .unwrap();
+    let mut client = connect(&server);
+
+    let error = client.post(&draft("Body.")).unwrap_err();
+
+    match &error {
+        ClientError::PostingRejected { code, text } => {
+            assert_eq!(code.as_u16(), 441);
+            assert!(text.contains("colon-space"), "{text}");
+        }
+        other => panic!("expected a rejection, got {other:?}"),
+    }
+    assert!(!error.is_connection_fatal(), "the connection is still fine");
+
+    // And the proof that it is: the next command works.
+    let group = client
+        .select_group(&GroupName::parse("misc.test").unwrap())
+        .unwrap();
+    assert_eq!(group.name.as_str(), "misc.test");
+}
+
+#[test]
+fn a_server_that_greeted_without_posting_is_not_offered_an_article() {
+    // Refused here rather than after a round trip, and without a POST command: a server
+    // that counts refused offers should not be given one for something already known.
+    let server = TestServer::with(
+        Corpus::sample(),
+        ServerConfig::new().greeting(GreetingMode::NoPosting),
+    )
+    .unwrap();
+    let mut client = connect(&server);
+
+    let error = client.post(&draft("Body.")).unwrap_err();
+
+    assert!(
+        matches!(error, ClientError::PostingNotAllowed { .. }),
+        "{error:?}"
+    );
+    assert!(server.posted().is_empty());
+}
+
+#[test]
+fn an_incomplete_draft_never_reaches_the_server() {
+    let server = TestServer::start().unwrap();
+    let mut client = connect(&server);
+
+    let incomplete = nntp_proto::Draft::parse("Subject: no From, no Newsgroups\n\nBody.\n");
+    let error = client.post(&incomplete).unwrap_err();
+
+    assert!(error.to_string().contains("From"), "{error}");
+    assert!(server.posted().is_empty(), "nothing was offered");
+}
+
+#[test]
+fn a_non_ascii_article_arrives_as_encoded_words_and_utf8() {
+    let server = TestServer::start().unwrap();
+    let mut client = connect(&server);
+
+    let draft = nntp_proto::Draft::parse(
+        "From: Åsa <asa@example.se>\n\
+         Newsgroups: misc.test\n\
+         Subject: Uma pergunta sobre ação\n\
+         \n\
+         Está tudo bem?\n",
+    );
+    client.post(&draft).unwrap();
+
+    let posted = server.posted();
+    let subject = posted[0].header("Subject").unwrap();
+    assert!(subject.is_ascii(), "{subject}");
+    assert_eq!(
+        nntp_proto::mime::decode_header_value(subject.as_bytes()),
+        "Uma pergunta sobre ação"
+    );
+    assert_eq!(
+        posted[0].header("Content-Type").as_deref(),
+        Some("text/plain; charset=utf-8"),
+        "an 8-bit body without this is a guess at the other end"
+    );
+    assert_eq!(posted[0].body_text(), "Está tudo bem?");
+}

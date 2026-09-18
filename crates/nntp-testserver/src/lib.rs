@@ -56,7 +56,7 @@ pub mod tls;
 pub use config::{CapabilityProfile, Credentials, GreetingMode, Quirks, ServerConfig};
 pub use corpus::{Article, Corpus, Group, Posting};
 pub use server::{TestServer, TlsMode};
-pub use session::{Flow, Outcome, Session};
+pub use session::{Flow, Outcome, Postbox, PostedArticle, Session};
 #[cfg(feature = "tls")]
 pub use tls::SelfSignedIdentity;
 
