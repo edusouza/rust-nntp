@@ -9,6 +9,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Releases carry binaries.** A `v*.*.*` tag now builds `nntp-tui` for Linux, both macOS
+  architectures and Windows, and publishes a GitHub Release with the archives and a
+  `SHA256SUMS` beside them. The release notes are the changelog section for that version —
+  written by hand, not generated from commit subjects.
+
+  The workflow refuses to release a tag that disagrees with `Cargo.toml`, to invent a tag
+  that does not exist, or to publish an empty release page, because each of those is a
+  release mistake that is cheaper to prevent than to undo. `workflow_dispatch` takes a tag
+  name so that `v0.1.0`, tagged before any of this existed, can still be given its release.
+
+## [0.2.0] — 2026-09-18
+
+Writing, threading, and everything the reader could parse but never send. The read-only
+reader of v0.1.0 can now answer a post, group a conversation, and fill its article list
+while the fetch is still running.
+
+### Added
+
 - **The commands that were parsed but never issued now have client methods** ([#16]). Six
   of them had wire grammar in `nntp-proto` and tests to match, and nothing that could
   actually send one — an honest state to be in, and not one to stay in. The coverage matrix
@@ -524,7 +542,8 @@ records what was checked, against which server, on what date ([#4]).
   `forbid`den workspace-wide, which rules out `std::env::set_var` in a test — and that
   turned out to be the right constraint: the tests it forced are better ones.
 
-[Unreleased]: https://github.com/edusouza/rust-nntp/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/edusouza/rust-nntp/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/edusouza/rust-nntp/releases/tag/v0.2.0
 [0.1.0]: https://github.com/edusouza/rust-nntp/releases/tag/v0.1.0
 [#3]: https://github.com/edusouza/rust-nntp/issues/3
 [#4]: https://github.com/edusouza/rust-nntp/issues/4

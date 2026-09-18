@@ -95,6 +95,26 @@ Long results are streamed rather than delivered whole. An overview fetch sends o
 carries the `FetchToken` the interface minted for that fetch, so records from a fetch the
 user has superseded are dropped instead of merged into the current list.
 
+## Releases
+
+A tag matching `v*.*.*` builds `nntp-tui` for Linux, both macOS architectures and Windows,
+and publishes a GitHub Release with the archives and a `SHA256SUMS` beside them
+([`.github/workflows/release.yml`](../.github/workflows/release.yml)).
+
+Three things the workflow refuses to do, each of which is a release mistake somebody has
+made before:
+
+- **Release a tag that disagrees with `Cargo.toml`.** A `v0.3.0` tag on a `0.2.0` manifest
+  ships a binary whose `--version` contradicts the page it was downloaded from.
+- **Invent a tag.** `gh release create --verify-tag` refuses a tag that does not exist,
+  which is what a typo in the manual input would otherwise create.
+- **Publish empty notes.** The release body is the `CHANGELOG.md` section for that version;
+  a missing section fails the job rather than producing a release page that says nothing.
+
+`workflow_dispatch` takes a tag name, so a tag pushed before the workflow existed can still
+be given its release. Only `nntp-tui` is published: `nntp-testserver` is a testing tool, and
+a release asset is a promise to keep something working for whoever downloads it.
+
 ## Error handling
 
 - `nntp-proto` returns `ProtoError`: a byte sequence that could not be interpreted, or a
