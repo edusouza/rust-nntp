@@ -199,6 +199,7 @@ fn parse_args() -> Result<Option<Args>, String> {
                 quirks.line_delay = (millis > 0).then(|| std::time::Duration::from_millis(millis));
             }
             "--no-overview-fmt" => quirks.no_overview_fmt = true,
+            "--no-list-wildmat" => quirks.no_list_wildmat = true,
             "--reject-open-ranges" => quirks.reject_open_ended_ranges = true,
             "--bare-lf" => quirks.bare_lf = true,
             other => return Err(format!("unexpected argument {other:?}")),
@@ -239,6 +240,7 @@ OPTIONS:
         --line-delay <MS>    Pause this long before each line of a multi-line block, so a
                              response takes long enough to be worth cancelling
         --no-overview-fmt    Refuse LIST OVERVIEW.FMT, as some servers do
+        --no-list-wildmat    Refuse a wildmat on LIST, as some servers do
         --reject-open-ranges Refuse an OVER range with an open upper bound
         --bare-lf            Terminate lines with LF instead of CRLF
     -h, --help               Print this help

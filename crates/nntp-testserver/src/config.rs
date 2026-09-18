@@ -71,6 +71,13 @@ pub struct Quirks {
     /// despite what the capability list said.
     pub over_advertised_but_missing: bool,
 
+    /// Answer `501` to any `LIST` variant given a wildmat.
+    ///
+    /// RFC 3977 §7.6.3 makes the pattern optional *for the server too*, and servers that
+    /// refuse one exist. A client that narrows its group list with a wildmat must not be
+    /// left showing nothing when it meets one.
+    pub no_list_wildmat: bool,
+
     /// Pause for this long before each line of a multi-line block.
     ///
     /// A full-feed `LIST ACTIVE` takes tens of seconds on a real server, which is the

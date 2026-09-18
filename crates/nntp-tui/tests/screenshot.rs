@@ -25,7 +25,7 @@ use nntp_proto::{
 use nntp_tui::config::UiConfig;
 use nntp_tui::readstate::ReadStore;
 use nntp_tui::tui::app::App;
-use nntp_tui::tui::protocol::{Event, GroupRow};
+use nntp_tui::tui::protocol::{Event, GroupRow, GroupScope};
 use nntp_tui::tui::ui;
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
@@ -51,6 +51,15 @@ fn group(name: &str, low: u64, high: u64, description: &str) -> GroupRow {
     }
 }
 
+/// A group list as the worker delivers one: everything the server carries.
+fn groups_arrived(rows: Vec<GroupRow>) -> Event {
+    Event::Groups {
+        rows,
+        scope: GroupScope::everything(),
+        filtered_locally: false,
+    }
+}
+
 fn record(number: u64, subject: &str, from: &str, references: &str) -> OverviewRecord {
     let line = format!(
         "{number}\t{subject}\t{from}\tWed, 17 Sep 2026 08:00:00 +0000\t<{number}@example.org>\t{references}\t1830\t12"
@@ -71,7 +80,7 @@ fn representative_app() -> App {
         encrypted: true,
     });
 
-    app.on_event(Event::Groups(vec![
+    app.on_event(groups_arrived(vec![
         group("comp.lang.c", 1, 18342, "Discussion about C"),
         group(
             "comp.lang.rust",

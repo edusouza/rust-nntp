@@ -6,6 +6,8 @@
 use std::io::{BufRead, BufReader, Read, Write};
 use std::sync::{RwLock, RwLockReadGuard};
 
+use nntp_proto::Wildmat;
+
 use crate::config::{CapabilityProfile, GreetingMode, ServerConfig};
 use crate::corpus::{Article, Corpus, Group};
 
@@ -743,12 +745,34 @@ impl<'a> Session<'a> {
             .first()
             .map_or_else(|| "ACTIVE".to_owned(), |k| k.to_ascii_uppercase());
 
+        // The three keywords below take an optional wildmat (RFC 3977 §7.6.3, §7.6.6 and
+        // RFC 2980 §2.1.2). Honouring it is the whole point of serving it: a fake that
+        // returned the full list regardless would let a client ship a pattern it never
+        // actually narrows anything with, and the bug would only appear against a real
+        // server with a real group list.
+        let pattern = match args.get(1) {
+            Some(argument)
+                if matches!(keyword.as_str(), "ACTIVE" | "NEWSGROUPS" | "ACTIVE.TIMES") =>
+            {
+                if self.config.quirks.no_list_wildmat {
+                    return self.status(output, 501, "LIST does not take a pattern here");
+                }
+                match Wildmat::parse(argument) {
+                    Ok(pattern) => Some(pattern),
+                    Err(_) => return self.status(output, 501, "invalid wildmat"),
+                }
+            }
+            _ => None,
+        };
+        let keeps = |name: &str| pattern.as_ref().is_none_or(|pattern| pattern.matches(name));
+
         match keyword.as_str() {
             "ACTIVE" => {
                 let lines: Vec<Vec<u8>> = self
                     .corpus()
                     .groups()
                     .iter()
+                    .filter(|group| keeps(&group.name))
                     .map(|group| {
                         let (low, high) = group.watermarks();
                         format!("{} {} {} {}", group.name, high, low, group.posting.flag())
@@ -763,6 +787,7 @@ impl<'a> Session<'a> {
                     .corpus()
                     .groups()
                     .iter()
+                    .filter(|group| keeps(&group.name))
                     .map(|group| {
                         let mut line = group.name.clone().into_bytes();
                         line.push(b'\t');
@@ -778,6 +803,7 @@ impl<'a> Session<'a> {
                     .corpus()
                     .groups()
                     .iter()
+                    .filter(|group| keeps(&group.name))
                     .map(|group| {
                         format!("{} {} tester@test.invalid", group.name, group.created).into_bytes()
                     })
@@ -1394,6 +1420,61 @@ mod tests {
     fn lists_descriptions_separated_by_a_tab() {
         let transcript = default_conversation("LIST NEWSGROUPS\r\nQUIT\r\n");
         assert!(transcript.contains("misc.test\tFor testing purposes only\r\n"));
+    }
+
+    #[test]
+    fn a_wildmat_narrows_the_group_list() {
+        let transcript = default_conversation("LIST ACTIVE comp.*\r\nQUIT\r\n");
+        assert!(transcript.contains("comp.lang.rust 4242 4237 y\r\n"));
+        // Anchored at the start: `de.comp.test` contains "comp." and does not match.
+        assert!(!transcript.contains("de.comp.test"), "{transcript}");
+        assert!(!transcript.contains("misc.test"), "{transcript}");
+    }
+
+    #[test]
+    fn a_wildmat_narrows_descriptions_and_creation_times_too() {
+        let descriptions = default_conversation("LIST NEWSGROUPS misc.*\r\nQUIT\r\n");
+        assert!(descriptions.contains("misc.test\tFor testing purposes only\r\n"));
+        assert!(!descriptions.contains("comp.lang.rust"), "{descriptions}");
+
+        let times = default_conversation("LIST ACTIVE.TIMES misc.*\r\nQUIT\r\n");
+        assert!(times.contains("misc.test "), "{times}");
+        assert!(!times.contains("comp.lang.rust"), "{times}");
+    }
+
+    #[test]
+    fn the_last_matching_pattern_decides_which_groups_are_listed() {
+        let transcript = default_conversation("LIST ACTIVE *test*,!de.*\r\nQUIT\r\n");
+        assert!(transcript.contains("misc.test "), "{transcript}");
+        assert!(!transcript.contains("de.comp.test"), "{transcript}");
+    }
+
+    #[test]
+    fn a_server_can_be_told_to_refuse_a_wildmat() {
+        // The quirk exists because servers that refuse one exist, and a client that
+        // narrows its group list has to survive meeting one.
+        let config = ServerConfig::new().quirks(Quirks {
+            no_list_wildmat: true,
+            ..Quirks::default()
+        });
+        let refused = converse(&config, "LIST ACTIVE comp.*\r\nQUIT\r\n");
+        assert!(refused.contains("501"), "{refused}");
+
+        // Without a pattern the same server answers normally.
+        let accepted = converse(&config, "LIST ACTIVE\r\nQUIT\r\n");
+        assert!(
+            accepted.contains("comp.lang.rust 4242 4237 y\r\n"),
+            "{accepted}"
+        );
+    }
+
+    #[test]
+    fn an_unusable_wildmat_is_refused_rather_than_ignored() {
+        // Ignoring it would answer a question the client did not ask, with the whole
+        // catalogue.
+        let transcript = default_conversation("LIST ACTIVE caf\u{e9}*\r\nQUIT\r\n");
+        assert!(transcript.contains("501"), "{transcript}");
+        assert!(!transcript.contains("comp.lang.rust 4242"), "{transcript}");
     }
 
     #[test]

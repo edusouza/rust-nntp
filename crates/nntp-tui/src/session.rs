@@ -240,6 +240,7 @@ mod tests {
         security = "implicit-tls"
         username = "bob"
         password_command = "pass show news"
+        subscriptions = ["comp.lang.*"]
     "#;
 
     #[test]
@@ -320,6 +321,30 @@ mod tests {
             target.server.password_command, None,
             "the password went along"
         );
+        // Subscriptions belong to the server too: they name that server's groups, and the
+        // article numbers behind them mean nothing anywhere else.
+        assert!(
+            target.server.subscriptions.is_empty(),
+            "the subscriptions went along"
+        );
+    }
+
+    #[test]
+    fn naming_the_server_carries_its_subscriptions_too() {
+        // The counterpart for subscriptions: `--server es --host 127.0.0.1` means "those
+        // settings, this machine", and the groups are part of those settings.
+        let target = resolve(
+            &config(CONFIGURED),
+            &ServerArgs {
+                server: Some("es".to_owned()),
+                host: Some("127.0.0.1".to_owned()),
+                no_tls: true,
+                ..args()
+            },
+        )
+        .unwrap();
+
+        assert_eq!(target.server.subscriptions, ["comp.lang.*"]);
     }
 
     #[test]

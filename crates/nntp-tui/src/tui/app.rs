@@ -8,14 +8,14 @@
 use std::collections::{HashSet, VecDeque};
 use std::path::PathBuf;
 
-use nntp_proto::{ArticleSpec, GroupSummary, OverviewRecord, Range, ThreadNode};
+use nntp_proto::{ArticleSpec, GroupSummary, OverviewRecord, Range, ThreadNode, Wildmat};
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use nntp_client::Cancel;
 
 use crate::config::UiConfig;
 use crate::readstate::ReadStore;
-use crate::tui::protocol::{Event, FetchToken, GroupRow, Request};
+use crate::tui::protocol::{Event, FetchToken, GroupRow, GroupScope, Request};
 
 /// How many messages to keep for the message pane.
 const LOG_CAPACITY: usize = 200;
@@ -252,6 +252,16 @@ pub struct App {
     pub filter: String,
     /// Whether the filter is being typed.
     pub editing_filter: bool,
+    /// The patterns this server is subscribed to, from the configuration.
+    ///
+    /// Empty means the whole catalogue. Set by the run loop, like [`Self::from`], because
+    /// it belongs to the server rather than to the interface.
+    pub subscriptions: Vec<Wildmat>,
+    /// Which groups the list on screen was fetched with.
+    ///
+    /// Kept so that reloading asks for the same thing again: a user who has searched past
+    /// their subscriptions and pressed `r` wants the search back, not the subscriptions.
+    pub group_scope: GroupScope,
 
     /// The selected group, once the server has confirmed it.
     pub group: Option<GroupSummary>,
@@ -381,6 +391,8 @@ impl App {
             group_cursor: 0,
             filter: String::new(),
             editing_filter: false,
+            subscriptions: Vec::new(),
+            group_scope: GroupScope::everything(),
             group: None,
             articles: Vec::new(),
             article_cursor: 0,
@@ -421,7 +433,40 @@ impl App {
     /// The requests to send when the interface starts.
     pub fn initial_requests(&mut self) -> Vec<Request> {
         self.inflight += 1;
-        vec![Request::LoadGroups]
+        self.group_scope = GroupScope::Subscribed(self.subscriptions.clone());
+        vec![Request::LoadGroups {
+            scope: self.group_scope.clone(),
+        }]
+    }
+
+    /// Asks the server for groups matching whatever is in the filter box.
+    ///
+    /// The deliberate counterpart to `/`: that narrows what has been fetched, this fetches
+    /// something else. It costs a round trip and, with no filter text, the server's whole
+    /// catalogue — so it is bound to a key of its own and says what it is doing, rather
+    /// than happening whenever a filter finds nothing.
+    fn search_groups(&mut self) -> Vec<Request> {
+        let scope = if self.filter.trim().is_empty() {
+            GroupScope::everything()
+        } else {
+            match Wildmat::containing(self.filter.trim()) {
+                Ok(pattern) => GroupScope::Search(pattern),
+                // A wildmat is printable ASCII without spaces; a filter box is not. Saying
+                // which text cannot be sent is more use than a bare refusal.
+                Err(_) => {
+                    self.status = format!(
+                        "{:?} cannot be sent as a pattern: no spaces or accents",
+                        self.filter.trim()
+                    );
+                    return Vec::new();
+                }
+            }
+        };
+
+        self.status = format!("asking the server for {}…", scope.describe());
+        self.inflight += 1;
+        self.group_scope = scope.clone();
+        vec![Request::LoadGroups { scope }]
     }
 
     /// Indices into [`Self::groups`] that pass the filter, in order.
@@ -639,10 +684,40 @@ impl App {
                 self.note(format!("connected: {greeting}"));
             }
 
-            Event::Groups(groups) => {
+            Event::Groups {
+                rows,
+                scope,
+                filtered_locally,
+            } => {
                 self.inflight = self.inflight.saturating_sub(1);
-                self.status = format!("{} groups", groups.len());
-                self.groups = groups;
+                // An empty answer to a narrowed fetch is the one case where a count on its
+                // own misleads: nothing is wrong with the server, the patterns simply match
+                // nothing it carries, and saying so has to come with the way out.
+                self.status = match (&scope, rows.len()) {
+                    (GroupScope::Subscribed(patterns), 0) if !patterns.is_empty() => {
+                        "no group matches your subscriptions; press S to search the server"
+                            .to_owned()
+                    }
+                    (GroupScope::Subscribed(patterns), count) if !patterns.is_empty() => {
+                        format!("{count} subscribed groups")
+                    }
+                    (GroupScope::Search(pattern), 0) => {
+                        format!("no group matches {}", pattern.as_str())
+                    }
+                    (GroupScope::Search(pattern), count) => {
+                        format!("{count} groups matching {}", pattern.as_str())
+                    }
+                    (GroupScope::Subscribed(_), count) => format!("{count} groups"),
+                };
+                if filtered_locally {
+                    self.note(
+                        "this server will not narrow LIST itself, so the whole group list \
+                         was fetched and filtered here"
+                            .to_owned(),
+                    );
+                }
+                self.groups = rows;
+                self.group_scope = scope;
                 self.group_cursor = 0;
             }
 
@@ -915,6 +990,7 @@ impl App {
             KeyCode::Char('z') => self.toggle_fold_under_cursor(),
             KeyCode::Char('w') => self.start_article(),
             KeyCode::Char('f') => self.start_follow_up(),
+            KeyCode::Char('S') => return self.search_groups(),
 
             _ => self.dirty = false,
         }
@@ -1556,9 +1632,11 @@ impl App {
     fn refresh(&mut self) -> Vec<Request> {
         match self.focus {
             Pane::Groups => {
-                self.status = "reloading groups…".to_owned();
+                self.status = format!("reloading {}…", self.group_scope.describe());
                 self.inflight += 1;
-                vec![Request::LoadGroups]
+                vec![Request::LoadGroups {
+                    scope: self.group_scope.clone(),
+                }]
             }
             Pane::Articles | Pane::Body => {
                 let Some(summary) = &self.group else {
@@ -1672,6 +1750,15 @@ mod tests {
 
     use super::*;
 
+    /// A group list as the worker delivers one: everything the server carries.
+    fn groups_arrived(rows: Vec<GroupRow>) -> Event {
+        Event::Groups {
+            rows,
+            scope: GroupScope::everything(),
+            filtered_locally: false,
+        }
+    }
+
     /// A read-state store that is never saved: these tests exercise the state machine,
     /// which by design never writes the file (ADR-0008).
     fn store() -> ReadStore {
@@ -1698,6 +1785,10 @@ mod tests {
             status: PostingStatus::Permitted,
             description: Some(format!("about {name}")),
         }
+    }
+
+    fn wildmat(pattern: &str) -> Wildmat {
+        Wildmat::parse(pattern).expect("a valid pattern")
     }
 
     fn some_groups() -> Vec<GroupRow> {
@@ -1758,7 +1849,7 @@ mod tests {
     /// Drives an app through to a group with articles listed.
     fn app_with_articles() -> App {
         let mut app = app();
-        app.on_event(Event::Groups(some_groups()));
+        app.on_event(groups_arrived(some_groups()));
         app.on_event(Event::GroupOpened(Box::new(summary("misc.test", 1, 3, 3))));
         deliver_overview(
             &mut app,
@@ -1935,7 +2026,7 @@ mod tests {
     fn the_group_list_reports_unread_counts_from_the_read_state() {
         let mut app = app();
         app.read.mark_range_read("comp.lang.rust", 1, 7);
-        app.on_event(Event::Groups(some_groups()));
+        app.on_event(groups_arrived(some_groups()));
 
         let groups = some_groups();
         // comp.lang.rust spans 1..10 with 7 read.
@@ -1970,14 +2061,168 @@ mod tests {
     #[test]
     fn asks_for_the_group_list_on_start_up() {
         let mut app = app();
-        assert_eq!(app.initial_requests(), vec![Request::LoadGroups]);
+        assert_eq!(
+            app.initial_requests(),
+            vec![Request::LoadGroups {
+                scope: GroupScope::everything()
+            }]
+        );
         assert_eq!(app.inflight, 1);
+    }
+
+    #[test]
+    fn the_first_fetch_asks_only_for_the_subscribed_groups() {
+        let mut app = app();
+        app.subscriptions = vec![wildmat("comp.lang.*"), wildmat("misc.test")];
+
+        assert_eq!(
+            app.initial_requests(),
+            vec![Request::LoadGroups {
+                scope: GroupScope::Subscribed(vec![wildmat("comp.lang.*"), wildmat("misc.test")])
+            }]
+        );
+    }
+
+    #[test]
+    fn searching_the_server_turns_the_filter_into_a_wildmat() {
+        // The `/` box is a substring match, so the pattern it becomes is the wildmat
+        // spelling of the same thing. Anything else would find a different set of groups
+        // from the one the user was just looking at.
+        let mut app = app();
+        app.subscriptions = vec![wildmat("misc.*")];
+        app.filter = "rust".to_owned();
+
+        let requests = app.on_key(key(KeyCode::Char('S')));
+
+        assert_eq!(
+            requests,
+            vec![Request::LoadGroups {
+                scope: GroupScope::Search(wildmat("*rust*"))
+            }]
+        );
+        assert_eq!(app.inflight, 1);
+        assert!(app.status.contains("*rust*"), "{}", app.status);
+    }
+
+    #[test]
+    fn searching_with_an_empty_filter_asks_for_the_whole_catalogue() {
+        // The way out of a subscription list that turned out to be too narrow, without
+        // editing a configuration file and restarting.
+        let mut app = app();
+        app.subscriptions = vec![wildmat("misc.*")];
+
+        assert_eq!(
+            app.on_key(key(KeyCode::Char('S'))),
+            vec![Request::LoadGroups {
+                scope: GroupScope::everything()
+            }]
+        );
+    }
+
+    #[test]
+    fn a_filter_that_cannot_be_a_wildmat_is_refused_rather_than_mangled() {
+        // A filter box holds anything a keyboard can produce; a wildmat is printable
+        // ASCII with no spaces. Sending a mangled pattern would quietly search for the
+        // wrong thing.
+        let mut app = app();
+        app.filter = "two words".to_owned();
+
+        assert!(app.on_key(key(KeyCode::Char('S'))).is_empty());
+        assert_eq!(app.inflight, 0, "nothing was sent, so nothing is in flight");
+        assert!(app.status.contains("two words"), "{}", app.status);
+    }
+
+    #[test]
+    fn a_capital_s_while_typing_a_filter_is_filter_text() {
+        // Every printable key belongs to the filter while it is open; a search that fired
+        // mid-word would be worse than one that needs Enter first.
+        let mut app = app();
+        app.on_key(key(KeyCode::Char('/')));
+        let requests = app.on_key(key(KeyCode::Char('S')));
+
+        assert!(requests.is_empty());
+        assert_eq!(app.filter, "S");
+    }
+
+    #[test]
+    fn reloading_asks_for_what_is_on_screen_rather_than_the_subscriptions() {
+        // Having searched past their subscriptions, a reader pressing `r` wants that
+        // search again. Falling back to the subscriptions would make the list they are
+        // looking at disappear under them.
+        let mut app = app();
+        app.subscriptions = vec![wildmat("misc.*")];
+        app.filter = "rust".to_owned();
+        app.on_key(key(KeyCode::Char('S')));
+        // The worker echoes the scope it answered, and that is what the list on screen
+        // was fetched with — which is why the interface takes the scope from the event
+        // rather than from the request it sent.
+        app.on_event(Event::Groups {
+            rows: some_groups(),
+            scope: GroupScope::Search(wildmat("*rust*")),
+            filtered_locally: false,
+        });
+
+        assert_eq!(
+            app.on_key(key(KeyCode::Char('r'))),
+            vec![Request::LoadGroups {
+                scope: GroupScope::Search(wildmat("*rust*"))
+            }]
+        );
+    }
+
+    #[test]
+    fn subscriptions_that_match_nothing_say_how_to_look_further() {
+        // The failure this whole feature can produce: a typo in a subscription, an empty
+        // reader, and no hint that the groups are there but unasked for.
+        let mut app = app();
+        app.on_event(Event::Groups {
+            rows: Vec::new(),
+            scope: GroupScope::Subscribed(vec![wildmat("comp.lang.rst")]),
+            filtered_locally: false,
+        });
+
+        assert!(app.groups.is_empty());
+        assert!(app.status.contains('S'), "{}", app.status);
+        assert!(app.status.contains("subscription"), "{}", app.status);
+    }
+
+    #[test]
+    fn a_search_that_finds_nothing_says_what_it_looked_for() {
+        let mut app = app();
+        app.on_event(Event::Groups {
+            rows: Vec::new(),
+            scope: GroupScope::Search(wildmat("*rust*")),
+            filtered_locally: false,
+        });
+
+        assert!(app.status.contains("*rust*"), "{}", app.status);
+    }
+
+    #[test]
+    fn filtering_done_here_instead_of_at_the_server_is_said_out_loud() {
+        // It means the whole catalogue crossed the network anyway, so the subscriptions
+        // did not buy the thing they were configured to buy. Silence would leave a slow
+        // start-up with no explanation.
+        let mut app = app();
+        app.on_event(Event::Groups {
+            rows: some_groups(),
+            scope: GroupScope::Subscribed(vec![wildmat("comp.lang.*")]),
+            filtered_locally: true,
+        });
+
+        assert!(
+            app.messages
+                .iter()
+                .any(|message| message.contains("filtered")),
+            "{:?}",
+            app.messages
+        );
     }
 
     #[test]
     fn shows_the_groups_it_is_given() {
         let mut app = app();
-        app.on_event(Event::Groups(some_groups()));
+        app.on_event(groups_arrived(some_groups()));
 
         assert_eq!(app.groups.len(), 4);
         assert_eq!(app.visible_groups().len(), 4);
@@ -1992,7 +2237,7 @@ mod tests {
     fn the_cursor_clamps_instead_of_wrapping() {
         // Holding a key down should stop at the end, not jump back to the top.
         let mut app = app();
-        app.on_event(Event::Groups(some_groups()));
+        app.on_event(groups_arrived(some_groups()));
 
         for _ in 0..10 {
             app.on_key(key(KeyCode::Down));
@@ -2008,7 +2253,7 @@ mod tests {
     #[test]
     fn vim_and_arrow_keys_agree() {
         let mut app = app();
-        app.on_event(Event::Groups(some_groups()));
+        app.on_event(groups_arrived(some_groups()));
 
         app.on_key(key(KeyCode::Char('j')));
         assert_eq!(app.group_cursor, 1);
@@ -2023,7 +2268,7 @@ mod tests {
     #[test]
     fn page_keys_move_by_a_screenful() {
         let mut app = app();
-        app.on_event(Event::Groups(some_groups()));
+        app.on_event(groups_arrived(some_groups()));
         app.set_pane_heights(3, 10);
 
         app.on_key(key(KeyCode::PageDown));
@@ -2086,7 +2331,7 @@ mod tests {
         // The filter must still be clearable, which is what Esc is for the rest of the
         // time.
         let mut app = app();
-        app.on_event(Event::Groups(some_groups()));
+        app.on_event(groups_arrived(some_groups()));
         app.filter = "misc".to_owned();
         assert_eq!(app.inflight, 0);
 
@@ -2101,7 +2346,7 @@ mod tests {
         // Even with a request outstanding: the user is typing, and Esc there means "never
         // mind this filter".
         let mut app = app();
-        app.on_event(Event::Groups(some_groups()));
+        app.on_event(groups_arrived(some_groups()));
         app.initial_requests();
         app.on_key(key(KeyCode::Char('/')));
         app.on_key(key(KeyCode::Char('x')));
@@ -2142,7 +2387,7 @@ mod tests {
     #[test]
     fn filtering_narrows_the_list_by_name_or_description() {
         let mut app = app();
-        app.on_event(Event::Groups(some_groups()));
+        app.on_event(groups_arrived(some_groups()));
 
         app.on_key(key(KeyCode::Char('/')));
         assert!(app.editing_filter);
@@ -2166,7 +2411,7 @@ mod tests {
         // filter that left several groups could not be used to pick one of them without
         // pressing Enter first.
         let mut app = app();
-        app.on_event(Event::Groups(some_groups()));
+        app.on_event(groups_arrived(some_groups()));
 
         app.on_key(key(KeyCode::Char('/')));
         for character in "lang".chars() {
@@ -2200,7 +2445,7 @@ mod tests {
     #[test]
     fn the_page_and_home_keys_work_while_typing_a_filter_too() {
         let mut app = app();
-        app.on_event(Event::Groups(some_groups()));
+        app.on_event(groups_arrived(some_groups()));
         app.on_key(key(KeyCode::Char('/')));
 
         app.on_key(key(KeyCode::End));
@@ -2222,7 +2467,7 @@ mod tests {
         // The other half of the fix: a filter that could not contain the letter `j` would
         // be a worse bug than the one this replaced.
         let mut app = app();
-        app.on_event(Event::Groups(some_groups()));
+        app.on_event(groups_arrived(some_groups()));
         app.on_key(key(KeyCode::Char('/')));
         app.on_key(key(KeyCode::Char('j')));
         app.on_key(key(KeyCode::Char('k')));
@@ -2236,7 +2481,7 @@ mod tests {
         // Narrowing the list can leave the cursor pointing at a different group than the
         // one it was on, so it goes back to the top rather than somewhere arbitrary.
         let mut app = app();
-        app.on_event(Event::Groups(some_groups()));
+        app.on_event(groups_arrived(some_groups()));
         app.on_key(key(KeyCode::Char('/')));
         app.on_key(key(KeyCode::Down));
         assert_eq!(app.group_cursor, 1);
@@ -2251,7 +2496,7 @@ mod tests {
         // focus to the article list. With the filter open the arrows must keep moving the
         // group cursor regardless, or they would move something the user cannot see.
         let mut app = app();
-        app.on_event(Event::Groups(some_groups()));
+        app.on_event(groups_arrived(some_groups()));
         app.on_key(key(KeyCode::Char('/')));
 
         app.on_event(Event::GroupOpened(Box::new(summary("misc.test", 1, 3, 3))));
@@ -2272,7 +2517,7 @@ mod tests {
     #[test]
     fn filtering_is_case_insensitive() {
         let mut app = app();
-        app.on_event(Event::Groups(some_groups()));
+        app.on_event(groups_arrived(some_groups()));
         app.filter = "RUST".to_owned();
         assert_eq!(app.visible_groups().len(), 1);
     }
@@ -2280,7 +2525,7 @@ mod tests {
     #[test]
     fn backspace_widens_the_filter_again() {
         let mut app = app();
-        app.on_event(Event::Groups(some_groups()));
+        app.on_event(groups_arrived(some_groups()));
         app.on_key(key(KeyCode::Char('/')));
         for character in "misc".chars() {
             app.on_key(key(KeyCode::Char(character)));
@@ -2296,7 +2541,7 @@ mod tests {
     #[test]
     fn escape_abandons_a_filter_being_typed() {
         let mut app = app();
-        app.on_event(Event::Groups(some_groups()));
+        app.on_event(groups_arrived(some_groups()));
         app.on_key(key(KeyCode::Char('/')));
         app.on_key(key(KeyCode::Char('x')));
         app.on_key(key(KeyCode::Esc));
@@ -2309,7 +2554,7 @@ mod tests {
     #[test]
     fn escape_clears_an_applied_filter() {
         let mut app = app();
-        app.on_event(Event::Groups(some_groups()));
+        app.on_event(groups_arrived(some_groups()));
         app.filter = "misc".to_owned();
         app.on_key(key(KeyCode::Esc));
         assert!(app.filter.is_empty());
@@ -2319,7 +2564,7 @@ mod tests {
     fn the_cursor_stays_in_range_when_a_filter_shrinks_the_list() {
         // Otherwise the cursor points past the end and the selected group is None.
         let mut app = app();
-        app.on_event(Event::Groups(some_groups()));
+        app.on_event(groups_arrived(some_groups()));
         app.on_key(key(KeyCode::Char('G')));
         assert_eq!(app.group_cursor, 3);
 
@@ -2334,7 +2579,7 @@ mod tests {
     #[test]
     fn opening_a_group_asks_for_its_newest_articles() {
         let mut app = app();
-        app.on_event(Event::Groups(some_groups()));
+        app.on_event(groups_arrived(some_groups()));
         let requests = app.on_key(key(KeyCode::Enter));
 
         assert_eq!(
@@ -2352,7 +2597,7 @@ mod tests {
     #[test]
     fn opening_an_empty_group_sends_nothing() {
         let mut app = app();
-        app.on_event(Event::Groups(some_groups()));
+        app.on_event(groups_arrived(some_groups()));
         app.on_key(key(KeyCode::Char('G')));
         assert_eq!(
             app.selected_group().map(|g| g.name.as_str()),
@@ -2755,7 +3000,7 @@ mod tests {
         app.on_key(key(KeyCode::Char('z')));
         assert_eq!(app.article_rows().len(), 2);
 
-        app.on_event(Event::Groups(some_groups()));
+        app.on_event(groups_arrived(some_groups()));
         app.focus = Pane::Groups;
         app.on_key(key(KeyCode::Enter));
         app.on_event(Event::GroupOpened(Box::new(summary("misc.test", 1, 4, 4))));
@@ -3191,7 +3436,9 @@ mod tests {
         app.focus = Pane::Groups;
         assert_eq!(
             app.on_key(key(KeyCode::Char('r'))),
-            vec![Request::LoadGroups]
+            vec![Request::LoadGroups {
+                scope: GroupScope::everything()
+            }]
         );
 
         app.focus = Pane::Articles;
@@ -3227,7 +3474,7 @@ mod tests {
     fn an_overlay_swallows_navigation_keys() {
         // Otherwise the list scrolls invisibly behind the help.
         let mut app = app();
-        app.on_event(Event::Groups(some_groups()));
+        app.on_event(groups_arrived(some_groups()));
         app.on_key(key(KeyCode::Char('?')));
 
         app.on_key(key(KeyCode::Down));

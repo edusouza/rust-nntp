@@ -62,6 +62,23 @@ pub fn run(config: &Config, target: Target) -> anyhow::Result<()> {
     // into the worker, since the worker has no use for it.
     let from = target.server.from.clone();
 
+    // Which groups to ask for. Parsed here rather than in the state machine because a
+    // pattern that cannot be sent is a configuration problem, and this is the last place
+    // that can still report one on ordinary stderr before the terminal is taken over.
+    // `Config::validate` has already refused an unusable pattern, so this only warns.
+    let subscriptions: Vec<nntp_proto::Wildmat> = target
+        .server
+        .subscriptions
+        .iter()
+        .filter_map(|pattern| match nntp_proto::Wildmat::parse(pattern) {
+            Ok(pattern) => Some(pattern),
+            Err(error) => {
+                tracing::warn!(%pattern, %error, "ignoring an unusable subscription");
+                None
+            }
+        })
+        .collect();
+
     // The flag the interface raises and the worker watches. Created here because both
     // sides need it and it outlives neither on its own.
     let cancel = nntp_client::Cancel::new();
@@ -83,6 +100,7 @@ pub fn run(config: &Config, target: Target) -> anyhow::Result<()> {
     let mut app = App::new(&config.ui, read_state);
     app.cancel = cancel;
     app.from = from;
+    app.subscriptions = subscriptions;
     for problem in read_problems {
         app.note(problem.to_string());
         tracing::warn!(%problem, "read state");

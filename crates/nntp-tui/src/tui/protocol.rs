@@ -5,7 +5,9 @@
 //! Keeping the vocabulary in its own module makes the boundary explicit: anything that is
 //! not in here cannot cross it.
 
-use nntp_proto::{ArticleSpec, GroupName, GroupSummary, OverviewRecord, PostingStatus, Range};
+use nntp_proto::{
+    ArticleSpec, GroupName, GroupSummary, OverviewRecord, PostingStatus, Range, Wildmat,
+};
 
 /// Identifies one overview fetch, so its results can be told from another's.
 ///
@@ -31,11 +33,64 @@ impl FetchToken {
     }
 }
 
+/// Which groups to ask the server for.
+///
+/// The reader has two ways of narrowing a group list and they are deliberately different
+/// things. The `/` box filters what has already been fetched, instantly and without the
+/// network. This decides what is fetched at all, which costs a round trip and — on a
+/// full-feed server — several megabytes, so it is never something the interface does
+/// behind the user's back.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GroupScope {
+    /// The groups this server is subscribed to.
+    ///
+    /// An empty list means the whole catalogue, which is what an unconfigured reader asks
+    /// for and what every reader did before subscriptions existed.
+    Subscribed(Vec<Wildmat>),
+    /// One pattern the user asked for, ignoring the subscriptions.
+    ///
+    /// How somebody reaches a group outside their subscriptions without having to edit a
+    /// configuration file and restart.
+    Search(Wildmat),
+}
+
+impl GroupScope {
+    /// Everything the server carries.
+    pub const fn everything() -> Self {
+        Self::Subscribed(Vec::new())
+    }
+
+    /// The patterns to send, in order. Empty means "do not narrow the response".
+    pub fn patterns(&self) -> Vec<&Wildmat> {
+        match self {
+            Self::Subscribed(patterns) => patterns.iter().collect(),
+            Self::Search(pattern) => vec![pattern],
+        }
+    }
+
+    /// Whether this scope asks for less than the whole catalogue.
+    pub fn is_narrowed(&self) -> bool {
+        !self.patterns().is_empty()
+    }
+
+    /// What this fetch is asking for, as a noun phrase: "fetching …", "reloading …".
+    pub fn describe(&self) -> String {
+        match self {
+            Self::Subscribed(patterns) if patterns.is_empty() => "the group list".to_owned(),
+            Self::Subscribed(_) => "the subscribed groups".to_owned(),
+            Self::Search(pattern) => format!("groups matching {}", pattern.as_str()),
+        }
+    }
+}
+
 /// Something the user interface wants done.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Request {
     /// Fetch the group list, with descriptions if the server will give them.
-    LoadGroups,
+    LoadGroups {
+        /// Which groups to ask for.
+        scope: GroupScope,
+    },
     /// Select a group and fetch the newest `count` overview records from it.
     OpenGroup {
         /// The group to select.
@@ -86,7 +141,18 @@ pub enum Event {
         encrypted: bool,
     },
     /// The group list arrived.
-    Groups(Vec<GroupRow>),
+    Groups {
+        /// The groups, in the order the server listed them.
+        rows: Vec<GroupRow>,
+        /// What was asked for, echoed so the interface labels the list it is showing
+        /// rather than the one it last requested.
+        scope: GroupScope,
+        /// Whether the server refused the pattern and the filtering was done here.
+        ///
+        /// Worth saying out loud: it means the whole catalogue crossed the network
+        /// anyway, so the subscriptions did not buy what they were configured to buy.
+        filtered_locally: bool,
+    },
     /// A group was selected.
     GroupOpened(Box<GroupSummary>),
     /// Part of an overview fetch arrived.

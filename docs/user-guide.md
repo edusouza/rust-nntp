@@ -104,6 +104,9 @@ Notes worth reading once:
 - **A private certificate authority** goes in `extra_ca_file`. There is no way to disable
   certificate verification; see
   [ADR-0007](adr/0007-rustls-for-tls.md) for why.
+- **`subscriptions` decides which groups are fetched at all.** Without it the reader asks
+  for the server's whole catalogue, which on a full feed is several megabytes and tens of
+  seconds before anything can be read. See below.
 
 The `[ui]` table holds the reader's preferences, all optional:
 
@@ -116,6 +119,47 @@ overview_chunk = 500          # overview records per round trip
 threaded = true               # group the article list into conversations
 date_format = "%Y-%m-%d %H:%M"
 ```
+
+### Subscriptions: fetching a handful of groups instead of all of them
+
+Most people read a few hierarchies. Saying so turns the first fetch of every session from
+several megabytes into a small one, because the *server* does the filtering:
+
+```toml
+[servers.eternal-september]
+host = "news.eternal-september.org"
+subscriptions = ["comp.lang.*", "misc.test", "news.software.readers"]
+```
+
+These are wildmat patterns (RFC 3977 §4.2), not substrings:
+
+| Pattern | Matches |
+| --- | --- |
+| `comp.lang.*` | every group under `comp.lang` |
+| `misc.test` | that group and nothing else |
+| `comp.os.linux.?` | one character where the `?` is |
+| `!comp.os.*` | *removes* what it matches from everything before it |
+
+The last pattern that matches a group decides, so
+`["comp.*", "!comp.os.*", "comp.os.linux.*"]` means every `comp` group except `comp.os`,
+except that `comp.os.linux` is back in. A pattern is anchored at both ends: `comp.*` does
+not match `de.comp.test`.
+
+Subscriptions are per server, because a subscription is — and because article numbers only
+mean anything on the server that issued them.
+
+Two things they are deliberately not:
+
+- **They are not the `/` filter.** `/` narrows the list already on screen, instantly and
+  without the network. `subscriptions` decides what is fetched at all.
+- **They are not a cage.** Press `S` in the reader to ask the server for groups matching
+  whatever is in the filter box — with the box empty, for everything it carries. The pane
+  header says which of the three lists you are looking at: a bare count for the whole
+  catalogue, `n subscribed`, or `n found` after a search.
+
+If the server refuses the pattern — RFC 3977 leaves it optional for the server too — the
+reader fetches the whole list and filters it here, and says so in the message pane. The
+groups still appear; the saving does not.
 
 Command-line flags override the configured server field by field. **Naming the server is
 what carries its credentials somewhere else**: `--host` on its own points the reader at
@@ -130,8 +174,12 @@ nntp-tui --server es groups --host 127.0.0.1 --port 1119 --no-tls
 ## Reading from the command line
 
 ```sh
-# Every group the server carries, with watermarks and posting status.
+# The groups you are subscribed to — or every group the server carries, if you have
+# configured no subscriptions.
 nntp-tui groups
+
+# Everything the server carries, whatever your subscriptions say.
+nntp-tui groups --pattern '*'
 
 # Group descriptions, narrowed to a hierarchy.
 nntp-tui groups --descriptions --pattern 'comp.lang.*'
@@ -148,6 +196,10 @@ nntp-tui article '<abc123@example.org>' --part headers
 nntp-tui article '<abc123@example.org>' --part body
 nntp-tui article '<abc123@example.org>' --raw
 ```
+
+`groups` applies the server's `subscriptions` when no `--pattern` is given, for the same
+reason the reader does, and says so on stderr — so a pipe still sees group names only, and
+somebody looking for a group they are not subscribed to is told why it is missing.
 
 `groups` counts are shown as `≤6` on purpose: `LIST ACTIVE` reports watermarks, and
 expiry and cancellation leave gaps, so the span is an upper bound rather than a count.
@@ -208,7 +260,8 @@ while something is outstanding.
 | `z` | fold the replies under the cursor away, or bring them back |
 | `M` | mark the article under the cursor read, or unread if it was read |
 | `c` | catch up: mark the whole group read |
-| `/` | filter groups by name or description |
+| `/` | filter the groups already fetched, by name or description |
+| `S` | ask the server for groups matching the filter — past your subscriptions |
 | `↑` `↓` `PageUp` `PageDown` `Home` `End` while filtering | move through what the filter left, without leaving the filter |
 | `Esc` | stop a request in progress; otherwise clear the filter or close an overlay |
 | `r` | reload the focused pane |
@@ -414,7 +467,6 @@ Two instances of the reader against the same server will have the last one to ex
 
 ### What it does not do yet
 
-A disk cache and server-side group filtering are v0.3; see the
-[roadmap](https://github.com/edusouza/rust-nntp/issues/3). There is no subscription list
-yet, so the group list shows everything the server carries, and it is re-fetched on every
-start.
+A disk cache is v0.3; see the [roadmap](https://github.com/edusouza/rust-nntp/issues/3).
+The group list is re-fetched on every start — `subscriptions` makes that fetch small, but
+nothing is kept between sessions except your read state.
