@@ -59,6 +59,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`--host` no longer carries another server's credentials.** With an account configured,
+  `nntp-tui --host 127.0.0.1 --no-tls` used that account's username and password against
+  `127.0.0.1` — the configured server was picked up implicitly and only the host was
+  replaced. The plaintext guard refused to send the password, which is the only reason it
+  did not leave the machine; over `--tls` it would have gone to whatever host was named.
+
+  A password is given for one host, and typing another host's name is not permission to
+  offer it there. `--host` without `--server` now starts from nothing. Naming the server —
+  `--server es --host 127.0.0.1` — still carries its settings, because that is somebody
+  saying "those settings, this machine", and it is the documented way to reproduce a
+  problem locally.
+
+  Found by pointing the reader at the local fake server with a real account in the
+  configuration file.
+
 - **The reader takes connection flags without naming a subcommand.** `nntp-tui --host
   127.0.0.1 --port 1119 --no-tls` answered `error: unexpected argument '--host' found`:
   the flags belonged to the `tui` subcommand alone, even though the reader is what runs

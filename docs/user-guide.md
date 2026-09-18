@@ -117,8 +117,11 @@ threaded = true               # group the article list into conversations
 date_format = "%Y-%m-%d %H:%M"
 ```
 
-Command-line flags override the configured server field by field, so this uses the
-credentials from `es` against a server on your own machine:
+Command-line flags override the configured server field by field. **Naming the server is
+what carries its credentials somewhere else**: `--host` on its own points the reader at
+another machine and takes no username or password with it, because a password is given for
+one host and typing another host's name is not permission to offer it there. So this uses
+the credentials from `es` against a server on your own machine:
 
 ```sh
 nntp-tui --server es groups --host 127.0.0.1 --port 1119 --no-tls
